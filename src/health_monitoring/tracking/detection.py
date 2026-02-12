@@ -17,9 +17,9 @@ def postprocess_tracking_results(tracking_results, aspect_ratio):
         classes = tracking_results[0].boxes.cls.cpu().numpy().astype(int)
 
         if len(ids_list) != len(classes):
-            print(ids_list)
-            print(classes)
-            raise ValueError
+            #print(ids_list)
+            #print(classes)
+            raise ValueError("Num of IDS does not match num of detections")
 
         xywh_boxes = tracking_results[0].boxes.xywh.cpu().numpy()
         xyxy_boxes = tracking_results[0].boxes.xyxy.cpu().numpy()
@@ -44,14 +44,14 @@ def postprocess_tracking_results(tracking_results, aspect_ratio):
         ids_list = []
         classes = np.array([], dtype=int)
         boxes_centers = np.array([], dtype=int)
-        normalized_boxes_centers = np.array([], dtype=int)
-        scaled_normalized_boxes_centers = np.array([], dtype=int)
+        normalized_boxes_centers = np.array([], dtype=np.float32)
+        scaled_normalized_boxes_centers = np.array([], dtype=np.float32)
         boxes_corner1 = np.array([], dtype=int)
         boxes_corner2 = np.array([], dtype=int)
 
     # Missed Tracking warning
-    if tracking_results[0].boxes.id is None and tracking_results[0].boxes is not None and len(tracking_results[0].boxes.cls) > 0:
-        print(f"WARNING: {len(tracking_results[0].boxes.cls)} detections, but no IDS assigned.")
+    # if tracking_results[0].boxes.id is None and tracking_results[0].boxes is not None and len(tracking_results[0].boxes.cls) > 0:
+    #     print(f"WARNING: {len(tracking_results[0].boxes.cls)} detections, but no IDS assigned.")
 
     return_args = (
         ids_list,
