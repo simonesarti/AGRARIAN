@@ -364,7 +364,8 @@ def main():
         danger_identification_process,
         annotation_process,
         video_writer_process,
-        notification_writer_process
+        notification_writer_process,
+        video_storage_process,
     ]
 
     try:
