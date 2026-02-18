@@ -8,6 +8,9 @@ from ultralytics import YOLO
 from src.health_monitoring.processes.messages import TrackingResult
 from src.shared.processes.messages import CombinedFrameTelemetryQueueObject
 from src.shared.processes.constants import *
+
+from src.health_monitoring.anomaly_detection.running_history import EntityRunningHistory, CameraRunningHistory
+
 from time import time, sleep
 import logging
 
@@ -66,6 +69,7 @@ class TrackerWorker(mp.Process):
         self.error_event = error_event
 
         self.tracking_args = tracking_args
+        
 
         self.queue_get_timeout = queue_get_timeout
         self.queue_put_timeout = queue_put_timeout
@@ -80,6 +84,9 @@ class TrackerWorker(mp.Process):
         
         logger.info("Animal tracking process started.")
         poison_pill_received = False
+
+        running_entities_history = EntityRunningHistory()
+        running_camera_history = CameraRunningHistory()
 
         try:
 
