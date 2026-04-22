@@ -172,14 +172,14 @@ class AnomalyDetectionWorker(mp.Process):
                 # iteration completed correctly, move on to process next frame
 
         except Exception as e:
-            logger.critical(f"An unexpected critical error happened in the animal tracking process: {e}")
+            logger.critical(f"An unexpected critical error happened in the animal anomaly detection process: {e}")
             self.error_event.set()
             logger.warning("Error event set: force-stopping the application")
 
         finally:
 
             logger.info(
-                "Animal tracking process terminated successfully. "
+                "Animal anomaly detection process terminated successfully. "
                 f"Poison pill received: {poison_pill_received}. "
                 f"Error event: {self.error_event.is_set()}."
             )
