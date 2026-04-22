@@ -173,7 +173,7 @@ class AnnotationWorker(mp.Process):
                 # Check if alert should be sent
                 since_last_alert = (previous_step_results.timestamp - last_alert_received_timestamp)
                 cooldown_has_passed = since_last_alert > self.cooldown
-                alert_exist = len(previous_step_results.danger_types) > 0
+                alert_exist = len(previous_step_results.alert_msg) > 0
 
                 send_alert = cooldown_has_passed and alert_exist
                 if send_alert:
@@ -298,13 +298,9 @@ if __name__ == "__main__":
             num_classes=2,
             classes_names=["goat", "sheep"],
             classes=[random.randint(0,1) for _ in range(num_animals)],
-            boxes_centers=boxes_centers,
             boxes_corner1=boxes_corner1,
             boxes_corner2=boxes_corner2,
-            safety_radius_pixels=random.randint(10, 100),
-            danger_mask=np.random.randint(0,random.choice([1,2]),size=(720,1080), dtype=np.uint8),
-            intersection_mask=np.random.randint(0,random.choice([1,2]),size=(720,1080), dtype=np.uint8),
-            danger_types="danger" if random.random()>0.5 else "",
+            danger_types="anomaly" if random.random()>0.5 else "",
             timestamp=ts,
             original_wh=(1920,1080),
         )
