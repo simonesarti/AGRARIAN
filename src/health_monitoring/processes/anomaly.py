@@ -4,6 +4,7 @@ from queue import Full as QueueFullException
 
 from ultralytics import YOLO
 
+from src.health_monitoring.processes.messages import TrackingResult, AnomalyInferenceResults
 from src.shared.processes.constants import *
 from time import time, sleep
 import logging
@@ -25,16 +26,24 @@ if not logger.handlers:  # Avoid duplicate handlers
 
 class AnomalyDetectorWrapper:
 
-    def __init__(self, model, predict_args):
-        self.anomaly_detector = model
+    def __init__(self, predict_args):
+        
         self.predict_args = predict_args
+        # self.anomaly_detector = self._instantiate()
 
-    def predict(self, args):
-        logger.info(f"Predict args: {self.predict_args}")
-        anomaly_results = self.anomaly_detector(
-            # args
-        )
-        return anomaly_results
+    # TODO: IMPLEMENT
+    def _instantiate(self):
+        pass
+    
+    # TODO: IMPLEMENT
+    def _make_data(self):
+        pass
+
+    # TODO: IMPLEMENT
+    def predict(self, window):
+        data = self._make_data(window)
+        labels = self.model(data)
+        return data.ids, labels
 
 
 class AnomalyDetectionWorker(mp.Process):
@@ -42,7 +51,7 @@ class AnomalyDetectionWorker(mp.Process):
     AnomalyDetectionWorker is a standalone process that:
     - Instantiates the anomaly dection model once during initialization
     - Stores 'anomaly_detection_args' for consistent use
-    - Processes incoming tracks and sends back results
+    - Processes incoming tracks and sends back results (ids: list[int] and associated anomaly status:list[bool])
     - Shuts down when it receives a poison pill, forwarding the termination signal to the next process in the sequence
     """
 
@@ -51,7 +60,7 @@ class AnomalyDetectionWorker(mp.Process):
             input_queue: mp.Queue,
             result_queue: mp.Queue,
             error_event: mp.Event,
-            tracking_args,
+            anomaly_detection_args: dict,
             queue_get_timeout: float = MODELS_QUEUE_GET_TIMEOUT,
             queue_put_timeout: float = MODELS_QUEUE_PUT_TIMEOUT,
             poison_pill_timeout: float = POISON_PILL_TIMEOUT,
@@ -63,7 +72,7 @@ class AnomalyDetectionWorker(mp.Process):
 
         self.error_event = error_event
 
-        self.tracking_args = tracking_args
+        self.anomaly_detection_args = anomaly_detection_args
 
         self.queue_get_timeout = queue_get_timeout
         self.queue_put_timeout = queue_put_timeout
@@ -73,37 +82,34 @@ class AnomalyDetectionWorker(mp.Process):
 
     def run(self):
         """
-        Main loop of the process: initializes the tracker and processes frames.
+        Main loop of the process: initializes the anomaly detector and processes frames.
         """
         
-        logger.info("Animal tracking process started.")
+        logger.info("Animal anomaly detection process started.")
         poison_pill_received = False
-
 
         try:
 
-            # instantiate the tracking model
-            tracking_model_checkpoint = self.tracking_args.pop("model_checkpoint")
-            model = YOLO(tracking_model_checkpoint, task="detect")
-            tracker = TrackerWrapper(model=model, predict_args=self.tracking_args)
-            logger.info("Animal tracking model loaded.")
-
-            # prepare tracking classes names and number
-            classes_names = model.names  # list of class names
-            num_classes = len(classes_names)
+            # instantiate the anomaly tracking model
+            anomaly_detector = AnomalyDetectorWrapper(predict_args=self.anomaly_detection_args)
+            logger.info("Animal anomaly detection model loaded.")
 
             while not self.error_event.is_set():
+
+                # ==========================================
+                #  DATA FETCHING
+                # ==========================================
 
                 iter_start = time()
 
                 try:
-                    # frame_telemetry_object is either a CombinedFrameTelemetryQueueObject or the POISON_PILL
-                    frame_telemetry_object: CombinedFrameTelemetryQueueObject | str = self.input_queue.get(timeout=self.queue_get_timeout)
+                    # tracking_object is either a TrackingResult or the POISON_PILL
+                    tracking_object: TrackingResult | str = self.input_queue.get(timeout=self.queue_get_timeout)
                 except QueueEmptyException:
                     logger.debug(f"Input queue timed out. Upstream producer may be stalled. Retrying...")
                     continue  # Go back and try to get again
 
-                if isinstance(frame_telemetry_object, str) and frame_telemetry_object == POISON_PILL:
+                if isinstance(tracking_object, str) and tracking_object == POISON_PILL:
                     poison_pill_received = True
                     logger.info("Found sentinel value on queue.")
                     try:
@@ -121,39 +127,31 @@ class AnomalyDetectionWorker(mp.Process):
 
                 get_time = time() - iter_start
 
+                # ==========================================
+                #  PROCESSING
+                # ==========================================
+
+                assert isinstance(tracking_object, TrackingResult)
+
                 # Perform tracking using stored arguments
                 predict_start = time()
-                (
-                    ids_list, 
-                    classes, 
-                    _, 
-                    _, 
-                    scalenorm_boxes_centers, 
-                    boxes_corner1, 
-                    boxes_corner2,
-                ) = tracker.predict(frame_telemetry_object.frame)
-                
+                entities_ids, entities_status = anomaly_detector.predict() 
                 predict_time = time() - predict_start
 
-                result = TrackingResult(
-                    frame_id=frame_telemetry_object.frame_id,
-                    frame=frame_telemetry_object.frame,
-                    classes_names=classes_names,
-                    num_classes=num_classes,
-                    classes=classes,
-                    boxes_corner1=boxes_corner1,
-                    boxes_corner2=boxes_corner2,
-                    scalenorm_boxes_centers=scalenorm_boxes_centers,
-                    objects_ids=ids_list,
-                    timestamp=frame_telemetry_object.timestamp,
-                    original_wh=frame_telemetry_object.original_wh,
+                result = AnomalyInferenceResults(
+                    ids=entities_ids,
+                    status=entities_status,
                 )
+
+                # ==========================================
+                #  RESULT PROPAGATION
+                # ==========================================
 
                 # put result in output queue
                 append_start = time()
                 try:
                     self.result_queue.put(result, timeout=self.queue_put_timeout)
-                    logger.debug("Put tracking results on output queue")
+                    logger.debug("Put anomaly detection results on output queue")
                 except QueueFullException:
                     logger.error(
                         f"Failed to put tracking results on output queue: queue is full. "
@@ -165,7 +163,7 @@ class AnomalyDetectionWorker(mp.Process):
                 iter_time = time()-iter_start
 
                 logger.debug(
-                    f"frame {frame_telemetry_object.frame_id} processed in {iter_time * 1000:.2f} ms, "
+                    f"frame {tracking_object.frame_id} processed in {iter_time * 1000:.2f} ms, "
                     f"of which --> "
                     f"GET: {get_time * 1000:.2f} ms, "
                     f"PREDICT: {predict_time * 1000:.2f} ms, "
