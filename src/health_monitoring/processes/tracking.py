@@ -9,8 +9,6 @@ from src.health_monitoring.processes.messages import TrackingResult
 from src.shared.processes.messages import CombinedFrameTelemetryQueueObject
 from src.shared.processes.constants import *
 
-from src.health_monitoring.anomaly_detection.running_history import EntityRunningHistory, CameraRunningHistory
-
 from time import time, sleep
 import logging
 
@@ -32,7 +30,7 @@ class TrackerWrapper:
         self.tracker = model
         self.predict_args = predict_args
 
-    def predict(self, frame, aspect_ratio):
+    def predict(self, frame):
         logger.info(f"Predict args: {self.predict_args}")
         tracking_results = self.tracker.predict(source=frame, stream=False, persist=True, verbose=False, **self.predict_args)
         h,w,_ = frame.shape
@@ -55,6 +53,7 @@ class TrackerWorker(mp.Process):
             self,
             input_queue: mp.Queue,
             result_queue: mp.Queue,
+            model_queue: mp.Queue,
             error_event: mp.Event,
             tracking_args,
             queue_get_timeout: float = MODELS_QUEUE_GET_TIMEOUT,
@@ -65,15 +64,16 @@ class TrackerWorker(mp.Process):
 
         self.input_queue = input_queue
         self.result_queue = result_queue
+        self.model_queue = model_queue
 
         self.error_event = error_event
 
         self.tracking_args = tracking_args
         
-
         self.queue_get_timeout = queue_get_timeout
-        self.queue_put_timeout = queue_put_timeout
+        self.queue_put_timeout = queue_put_timeout / 2
         self.poison_pill_timeout = poison_pill_timeout
+        
 
         self.work_finished = mp.Event()
 
@@ -85,8 +85,7 @@ class TrackerWorker(mp.Process):
         logger.info("Animal tracking process started.")
         poison_pill_received = False
 
-        running_entities_history = EntityRunningHistory()
-        running_camera_history = CameraRunningHistory()
+        output_queues = [self.result_queue, self.model_queue]
 
         try:
 
@@ -102,6 +101,10 @@ class TrackerWorker(mp.Process):
 
             while not self.error_event.is_set():
 
+                # ==========================================
+                #  DATA FETCHING
+                # ==========================================
+
                 iter_start = time()
 
                 try:
@@ -114,20 +117,30 @@ class TrackerWorker(mp.Process):
                 if isinstance(frame_telemetry_object, str) and frame_telemetry_object == POISON_PILL:
                     poison_pill_received = True
                     logger.info("Found sentinel value on queue.")
-                    try:
-                        logger.info("Attempting to put sentinel value on output queue ...")
-                        self.result_queue.put(POISON_PILL, timeout=self.poison_pill_timeout)
-                        logger.info("Sentinel value has been passed on to the next process.")
-                    except Exception as e:
-                        logger.error(f"Error propagating Poison Pill: {e}")
-                        self.error_event.set()
-                        logger.warning(
-                            "Error event set: force-stop application since downstream processes "
-                            "are unable to receive the poison pill."
-                        )
+                    
+                    # propagate poison pill on both output queues
+                    for qid, output_queue in enumerate(output_queues,1):
+                        try:
+                            logger.info(f"Attempting to put sentinel value on output queue #{qid}...")
+                            output_queue.put(POISON_PILL, timeout=self.poison_pill_timeout)
+                            logger.info("Sentinel value has been passed on to the next process.")
+                        except Exception as e:
+                            logger.error(f"Error propagating Poison Pill: {e}")
+                            self.error_event.set()
+                            logger.warning(
+                                "Error event set: force-stop application since downstream processes "
+                                "are unable to receive the poison pill."
+                            )
+
                     break
 
                 get_time = time() - iter_start
+
+                # ==========================================
+                #  PROCESSING
+                # ==========================================
+
+                assert isinstance(frame_telemetry_object, CombinedFrameTelemetryQueueObject)
 
                 # Perform tracking using stored arguments
                 predict_start = time()
@@ -157,17 +170,24 @@ class TrackerWorker(mp.Process):
                     original_wh=frame_telemetry_object.original_wh,
                 )
 
-                # put result in output queue
+                # ==========================================
+                # RESULTS PROPAGATION
+                # ==========================================
+
+                # put result in both output queues
                 append_start = time()
-                try:
-                    self.result_queue.put(result, timeout=self.queue_put_timeout)
-                    logger.debug("Put tracking results on output queue")
-                except QueueFullException:
-                    logger.error(
-                        f"Failed to put tracking results on output queue: queue is full. "
-                        f"Consumer too slow or stuck?. "
-                        f"Skipping tracking results. "
-                    )
+                
+                for qid, output_queue in enumerate(output_queues, 1):
+                    try:
+                        output_queue.put(result, timeout=self.queue_put_timeout)
+                        logger.debug(f"Put tracking results on output queue #{qid}")
+                    except QueueFullException:
+                        logger.error(
+                            f"Failed to put tracking results on output queue #{qid}: queue is full. "
+                            f"Consumer too slow or stuck?. "
+                            f"Skipping tracking results. "
+                        )
+                
                 append_time = time() - append_start
 
                 iter_time = time()-iter_start

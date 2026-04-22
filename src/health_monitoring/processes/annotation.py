@@ -6,7 +6,7 @@ from time import time
 from src.danger_detection.output.frames import draw_count
 from src.health_monitoring.output.frames import draw_detections
 import cv2
-from src.health_monitoring.processes.messages import AnomalyDetectionResults
+from src.health_monitoring.processes.messages import CombinedAnomalyDetectionResults
 from src.shared.processes.messages import AnnotationResults
 from src.shared.processes.constants import *
 
@@ -30,8 +30,8 @@ def annotate_frame(
     classes: np.ndarray,
     boxes_corner1: np.ndarray,
     boxes_corner2: np.ndarray,
-    are_anomalous: np.ndarray,
-    ids: list[str] ,
+    are_anomalous: list[bool],
+    ids: list[int] ,
 ):
 
     # annotated_frame = frame.copy()  # copy of the original frame on which to draw
@@ -115,7 +115,7 @@ class AnnotationWorker(mp.Process):
 
                 try:
                     # previous_step_results is either a AnomalyDetectionResults or the poison_pill
-                    previous_step_results: AnomalyDetectionResults|str = self.input_queue.get(timeout=self.queue_get_timeout)
+                    previous_step_results: CombinedAnomalyDetectionResults|str = self.input_queue.get(timeout=self.queue_get_timeout)
                 except QueueEmptyException:
                     logger.debug("Input queue empty, retrying data fetch ... (previous process too slow or stuck?)")
                     continue    # Go back and try to read again from queue, also check the error event condition
@@ -142,7 +142,7 @@ class AnnotationWorker(mp.Process):
                 # ==========================================
                 # =============== DATA PROCESSING ==========
                 # ==========================================
-                assert isinstance(previous_step_results, AnomalyDetectionResults)
+                assert isinstance(previous_step_results, CombinedAnomalyDetectionResults)
 
                 processing_start_time = time()
 
@@ -292,7 +292,7 @@ if __name__ == "__main__":
         boxes_corner1= boxes_centers - 15
         boxes_corner2 = boxes_centers + 15
 
-        return AnomalyDetectionResults(
+        return CombinedAnomalyDetectionResults(
             frame_id=int(ts*100),
             frame=np.zeros((720,1080,3), dtype=np.uint8),
             num_classes=2,

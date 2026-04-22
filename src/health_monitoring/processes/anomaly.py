@@ -8,6 +8,9 @@ from src.shared.processes.constants import *
 from time import time, sleep
 import logging
 
+from src.health_monitoring.anomaly_detection.running_history import EntityRunningHistory, CameraRunningHistory
+
+
 # ================================================================
 
 logger = logging.getLogger("main.anomaly_detector")
@@ -75,6 +78,7 @@ class AnomalyDetectionWorker(mp.Process):
         
         logger.info("Animal tracking process started.")
         poison_pill_received = False
+
 
         try:
 

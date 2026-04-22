@@ -33,9 +33,22 @@ class TrackingResult:
     original_wh: tuple[int, int]
 
 
+@dataclass
+class AnomalyInferenceResults:
+    """
+    A dataclass to store the model predictions
+    
+    ids (list[str]): the list of entity ids present in the frame
+    status (list[bool]): a boolean array specifying, for each entity, wheter it behaved anomalously in the window
+
+    """
+    ids: list[int]
+    status: list[bool]
+    
+
 
 @dataclass
-class AnomalyDetectionResults:
+class CombinedAnomalyDetectionResults:
     """
     A dataclass combining raw and anomaly detecion data to highlight anomalous entities.
 
@@ -48,8 +61,8 @@ class AnomalyDetectionResults:
         boxes_corner1 (np.ndarray): An array of the top-left corner coordinates of each bounding box.
         boxes_corner2 (np.ndarray): An array of the bottom-right corner coordinates of each bounding box.
         safety_radius_pixels (int): The defined safety radius in pixels.
-        are_anomalous (np.ndarray): a boolean array specifying, for each entity, wheter it behaved anomalously in the window
-        ids (list[str]): the list of entity ids present in the frame
+        are_anomalous (list[bool]): a boolean array specifying, for each entity, wheter it behaved anomalously in the window
+        ids (list[int]): the list of entity ids present in the frame
         alerts_msg (str): A string describing the type of anomaly
         timestamp (float): The timestamp of reception (of the frame).
         original_wh tuple(int, int): The original shape of the image
@@ -61,8 +74,8 @@ class AnomalyDetectionResults:
     classes: np.ndarray
     boxes_corner1: np.ndarray
     boxes_corner2: np.ndarray
-    are_anomalous: np.ndarray
-    ids: list[str]
+    are_anomalous: list[bool]
+    ids: list[int]
     alert_msg: str
     timestamp: float
     original_wh: tuple[int, int]
