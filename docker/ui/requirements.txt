@@ -1,7 +1,0 @@
-matplotlib
-numpy
-opencv-python-headless
-Pillow
-streamlit
-websockets
-websocket-client
