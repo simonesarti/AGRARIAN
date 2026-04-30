@@ -88,7 +88,7 @@ def initialize_services() -> bool:
             ping_interval=WEBSOCKET_PING_INTERVAL,
             ping_timeout=WEBSOCKET_PING_TIMEOUT,
         )
-        st.session_state.ws_thread = st.session_state.websocket_receiver.start()
+        st.session_state.websocket_receiver.start()
         logger.info(
             f"Websocket client initialized and started. "
             f"Waiting for alerts from {WEBSOCKET_URL}"
@@ -154,10 +154,10 @@ def update_metrics():
         logger.debug(f"last alert UTC time: {st.session_state.last_alert_timestamp}")
 
         # compute time difference in UTC time
-        seconds_passed = int(current_time - st.session_state.last_alert_timestamp)
-        logger.info(f"seconds passed: {seconds_passed}")
-        minutes_passed = seconds_passed // 60
-        seconds_passed = seconds_passed % 60
+        total_seconds = int(current_time - st.session_state.last_alert_timestamp)
+        logger.info(f"seconds passed: {total_seconds}")
+        minutes_passed = total_seconds // 60
+        seconds_passed = total_seconds % 60
 
         # Convert time to local timestamp for displaying
         last_alert_local = (
@@ -170,11 +170,11 @@ def update_metrics():
         logger.info(f"last alert local time {last_alert_local}")
 
         if minutes_passed >= 1:
-            text = f"Alert received {minutes_passed}:{seconds_passed} minutes ago ({last_alert_local})"
+            text = f"Alert received {minutes_passed}:{seconds_passed:02d} minutes ago ({last_alert_local})"
         else:
             text = f"Alert received {seconds_passed} seconds ago ({last_alert_local})"
 
-        if seconds_passed > ALERTS_BOX_COLOR_TIMEDIFF:
+        if total_seconds > ALERTS_BOX_COLOR_TIMEDIFF:
             st.warning(text)  # yellow if older
         else:
             st.error(text)  # red if very recent

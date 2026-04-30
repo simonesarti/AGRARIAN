@@ -22,10 +22,11 @@ NETWORK=""
 BUILD="false"
 
 
-WEBRTC_HOST="0.0.0.0"
-WEBRTC_PORT="8889"
-WEBRTC_STREAM_NAME="annot"
-WEBRTC_STUN_SERVER="stun:stun.l.google.com:19302"
+STREAM_PROTOCOL="webrtc"
+STREAM_HOST="0.0.0.0"
+STREAM_PORT=""           # resolved after arg parsing based on protocol
+STREAM_NAME="annot"
+STREAM_STUN_SERVER="stun:stun.l.google.com:19302"
 
 WEBSOCKET_HOST="0.0.0.0"
 WEBSOCKET_PORT="8443"
@@ -58,11 +59,12 @@ GENERAL OPTIONS:
     --network NETWORK               Connect to specific Docker network
     -b, --build                     Build image before running
 
-WEBRTC & WEBSOCKET OPTIONS:
-    --webrtc-host HOST              WebRTC Host (default: $WEBRTC_HOST)
-    --webrtc-port PORT              WebRTC Port (default: $WEBRTC_PORT)
-    --stream-name NAME              Stream name (default: $WEBRTC_STREAM_NAME)
-    --stun-server SERVER            STUN server (default: $WEBRTC_STUN_SERVER)
+STREAM & WEBSOCKET OPTIONS:
+    --stream-protocol PROTO         Stream protocol: webrtc or hls (default: webrtc)
+    --stream-host HOST              Stream server host (default: $STREAM_HOST)
+    --stream-port PORT              Stream server port (default: 8889 for webrtc, 8888 for hls)
+    --stream-name NAME              Stream name (default: $STREAM_NAME)
+    --stun-server SERVER            STUN server, webrtc only (default: $STREAM_STUN_SERVER)
     --ws-host HOST                  WebSocket Host (default: $WEBSOCKET_HOST)
     --ws-port PORT                  WebSocket Port (default: $WEBSOCKET_PORT)
 
@@ -86,11 +88,12 @@ while [[ $# -gt 0 ]]; do
         --network) NETWORK="$2"; shift 2 ;;
         -b|--build) BUILD="true"; shift ;;
 
-        # WebRTC Mappings
-        --webrtc-host) WEBRTC_HOST="$2"; shift 2 ;;
-        --webrtc-port) WEBRTC_PORT="$2"; shift 2 ;;
-        --stream-name) WEBRTC_STREAM_NAME="$2"; shift 2 ;;
-        --stun-server) WEBRTC_STUN_SERVER="$2"; shift 2 ;;
+        # Stream Mappings
+        --stream-protocol) STREAM_PROTOCOL="$2"; shift 2 ;;
+        --stream-host) STREAM_HOST="$2"; shift 2 ;;
+        --stream-port) STREAM_PORT="$2"; shift 2 ;;
+        --stream-name) STREAM_NAME="$2"; shift 2 ;;
+        --stun-server) STREAM_STUN_SERVER="$2"; shift 2 ;;
 
         # WebSocket Mappings
         --ws-host) WEBSOCKET_HOST="$2"; shift 2 ;;
@@ -116,6 +119,21 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Validate protocol
+if [[ "$STREAM_PROTOCOL" != "webrtc" && "$STREAM_PROTOCOL" != "hls" ]]; then
+    echo "Invalid stream protocol: $STREAM_PROTOCOL. Must be 'webrtc' or 'hls'."
+    exit 1
+fi
+
+# Resolve default port based on protocol if not explicitly set
+if [[ -z "$STREAM_PORT" ]]; then
+    if [[ "$STREAM_PROTOCOL" == "hls" ]]; then
+        STREAM_PORT="8888"
+    else
+        STREAM_PORT="8889"
+    fi
+fi
 
 
 # Build image if requested
@@ -171,11 +189,14 @@ fi
 
 # --- Construct Docker Environment Flags ---
 
-# WebRTC Environment Variables
-DOCKER_CMD="$DOCKER_CMD -e WEBRTC_HOST=$WEBRTC_HOST"
-DOCKER_CMD="$DOCKER_CMD -e WEBRTC_PORT=$WEBRTC_PORT"
-DOCKER_CMD="$DOCKER_CMD -e WEBRTC_STREAM_NAME=$WEBRTC_STREAM_NAME"
-DOCKER_CMD="$DOCKER_CMD -e WEBRTC_STUN_SERVER=$WEBRTC_STUN_SERVER"
+# Stream Environment Variables
+DOCKER_CMD="$DOCKER_CMD -e STREAM_PROTOCOL=$STREAM_PROTOCOL"
+DOCKER_CMD="$DOCKER_CMD -e STREAM_HOST=$STREAM_HOST"
+DOCKER_CMD="$DOCKER_CMD -e STREAM_PORT=$STREAM_PORT"
+DOCKER_CMD="$DOCKER_CMD -e STREAM_NAME=$STREAM_NAME"
+if [[ "$STREAM_PROTOCOL" == "webrtc" ]]; then
+    DOCKER_CMD="$DOCKER_CMD -e STREAM_STUN_SERVER=$STREAM_STUN_SERVER"
+fi
 
 # WebSocket Environment Variables
 DOCKER_CMD="$DOCKER_CMD -e WEBSOCKET_HOST=$WEBSOCKET_HOST"
@@ -225,10 +246,13 @@ echo "  Network:              ${NETWORK:-default}"
 echo "  Environment File:     ${ENV_FILE:-none}"
 echo "  Build Image:          $BUILD"
 echo "------------------------------------------------"
-echo "WEBRTC & WEBSOCKET:"
-echo "  WebRTC Host/Port:     $WEBRTC_HOST:$WEBRTC_PORT"
-echo "  Stream Name:          $WEBRTC_STREAM_NAME"
-echo "  STUN Server:          $WEBRTC_STUN_SERVER"
+echo "STREAM & WEBSOCKET:"
+echo "  Stream Protocol:      $STREAM_PROTOCOL"
+echo "  Stream Host/Port:     $STREAM_HOST:$STREAM_PORT"
+echo "  Stream Name:          $STREAM_NAME"
+if [[ "$STREAM_PROTOCOL" == "webrtc" ]]; then
+echo "  STUN Server:          $STREAM_STUN_SERVER"
+fi
 echo "  WebSocket:            $WEBSOCKET_HOST:$WEBSOCKET_PORT"
 echo "  WS Reconnect Delay:   ${WEBSOCKET_RECONNECTION_DELAY}s"
 echo "------------------------------------------------"
