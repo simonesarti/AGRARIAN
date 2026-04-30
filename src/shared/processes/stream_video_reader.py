@@ -106,13 +106,16 @@ class StreamVideoReader(mp.Process):
         Set up video capture with appropriate settings for video streams.
         """
         cap = cv2.VideoCapture(self.video_stream_url)
-        # timeout for opening source
-        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.connect_open_timeout_s * 1000)
-        # timeout for reading frame
-        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.frame_read_timeout_s * 1000)
-        # Reduce buffer for lower latency
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
-        
+
+        if not cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.connect_open_timeout_s * 1000):
+            raise ConnectionError("Failed to set CAP_PROP_OPEN_TIMEOUT_MSEC: blocking behavior on connection is undefined")
+
+        if not cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.frame_read_timeout_s * 1000):
+            raise ConnectionError("Failed to set CAP_PROP_READ_TIMEOUT_MSEC: blocking behavior on cap.read() is undefined")
+
+        # CAP_PROP_BUFFERSIZE is a no-op for RTSP/FFmpeg backend; buffer is managed by FFmpeg internally
+        # cap.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
+
         return cap
 
     def run(self):
@@ -154,7 +157,8 @@ class StreamVideoReader(mp.Process):
                     if cap is None or not cap.isOpened():
                         raise ConnectionError(f"VideoCapture is either not open or not functional for {self.video_stream_url}")
                     logger.info("VideoCapture Object setup complete and stream is open")
-                    consecutive_connection_failures = 0 # Reset on success
+                    consecutive_connection_failures = 0
+                    consecutive_read_failures = 0
                 
                 except Exception as e:
                     total_connection_failures += 1
@@ -231,10 +235,10 @@ class StreamVideoReader(mp.Process):
                     # which is only intended to process 16:9 images
                     frame_height, frame_width, _ = frame.shape
                     aspect_ratio = frame_width/frame_height
-                    if not abs(aspect_ratio - self.expected_aspect_ratio) < 1e-6:     # tolerance
+                    if not abs(aspect_ratio - self.expected_aspect_ratio) < 1.0e-2:     # tolerance: accounts for encoder padding (e.g. 1920x1088)
                         logger.error(
                             f"Application expects frame with aspect ratio (W/H)={self.expected_aspect_ratio} "
-                            f"but got frame of size W/H = {frame_width}{frame_width} = {aspect_ratio}."
+                            f"but got frame of size W/H = {frame_width}/{frame_height} = {aspect_ratio}."
                             f"Shutting down the application ..."
                         )
                         self.error_event.set()
