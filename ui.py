@@ -43,7 +43,7 @@ ALERTS_REFRESH = float(os.getenv("ALERTS_REFRESH", 1.0))
 ALERTS_BOX_COLOR_TIMEDIFF = float(os.getenv("ALERTS_BOX_COLOR_TIMEDIFF", 5.0))
 ALERTS_MAX_DISPLAYED = int(os.getenv("ALERTS_MAX_DISPLAYED", 5))
 
-LOGO = "assets/leonardo.png"
+LOGO = os.getenv("LOGO", "assets/leonardo.png")
 LOGO_WIDTH = int(os.getenv("LOGO_WIDTH", 200))
 HTML_HEIGHT = int(os.getenv("HTML_HEIGHT", 600))
 ALERT_HEIGHT = int(os.getenv("ALERT_HEIGHT", 600))
