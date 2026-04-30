@@ -6,7 +6,8 @@ import datetime
 import os
 from time import time
 from src.ui.alert_receiver import AlertReceiver
-from src.ui.video_player import get_video_player
+from src.ui.webrtc_video_player import get_video_player as get_webrtc_player
+from src.ui.hls_video_player import get_video_player as get_hls_player
 
 # ================================================================
 # Logging Configuration
@@ -26,10 +27,11 @@ logger = logging.getLogger("ui")
 # Application constants
 # ================================================================
 
-WEBRTC_HOST = os.getenv("WEBRTC_HOST", "0.0.0.0")
-WEBRTC_PORT = int(os.getenv("WEBRTC_PORT", 8889))
-WEBRTC_STREAM_NAME = os.getenv("WEBRTC_STREAM_NAME", "annot")
-WEBRTC_STUN_SERVER = os.getenv("WEBRTC_STUN_SERVER", "stun:stun.l.google.com:19302")
+STREAM_PROTOCOL = os.getenv("STREAM_PROTOCOL", "webrtc")
+STREAM_HOST = os.getenv("STREAM_HOST", "0.0.0.0")
+STREAM_PORT = int(os.getenv("STREAM_PORT", 8889))
+STREAM_NAME = os.getenv("STREAM_NAME", "annot")
+STREAM_STUN_SERVER = os.getenv("STREAM_STUN_SERVER", "stun:stun.l.google.com:19302")
 
 WEBSOCKET_HOST = os.getenv("WEBSOCKET_HOST", "0.0.0.0")
 WEBSOCKET_PORT = int(os.getenv("WEBSOCKET_PORT", 8443))
@@ -46,7 +48,7 @@ LOGO_WIDTH = int(os.getenv("LOGO_WIDTH", 200))
 HTML_HEIGHT = int(os.getenv("HTML_HEIGHT", 600))
 ALERT_HEIGHT = int(os.getenv("ALERT_HEIGHT", 600))
 
-WEBRTC_URL = f"http://{WEBRTC_HOST}:{WEBRTC_PORT}"
+STREAM_URL = f"http://{STREAM_HOST}:{STREAM_PORT}"
 WEBSOCKET_URL = f"ws://{WEBSOCKET_HOST}:{WEBSOCKET_PORT}"
 
 
@@ -54,40 +56,33 @@ WEBSOCKET_URL = f"ws://{WEBSOCKET_HOST}:{WEBSOCKET_PORT}"
 # initialization
 # ================================================================
 
-def initialize_services(
-        ws_host: str,
-        ws_port: int,
-        webrtc_host: str, 
-        webrtc_port: int,
-        webrtc_stream: str, 
-        webrtc_stun: str,
-) -> bool:
+def initialize_services() -> bool:
     """Initialize all services automatically"""
-    
+
     initialized = False
 
     if 'services_initialized' not in st.session_state:
-        
+
         st.session_state.services_initialized = True
-        
+
         # Initialize session state
         st.session_state.alerts_display_dequeue = deque(maxlen=ALERTS_MAX_DISPLAYED)
         st.session_state.total_alerts = 0
         st.session_state.last_alert_timestamp = None
 
-        # Initialize WebRTC config
-        webrtc_config = {
-            'host': webrtc_host,
-            'port': webrtc_port,
-            'stream': webrtc_stream,
-            'stun': webrtc_stun,
+        stream_config = {
+            'protocol': STREAM_PROTOCOL,
+            'url': STREAM_URL,
+            'name': STREAM_NAME,
         }
-        logger.info(f"WebRTC configured as follows: {webrtc_config}")
-        
+        if STREAM_PROTOCOL == "webrtc":
+            stream_config['stun'] = STREAM_STUN_SERVER
+        logger.info(f"Stream configured as follows: {stream_config}")
+
         # Start WEBSOCKET receiver
         st.session_state.websocket_receiver = AlertReceiver(
-            host=ws_host,
-            port=ws_port,
+            host=WEBSOCKET_HOST,
+            port=WEBSOCKET_PORT,
             shared_dequeue=st.session_state.alerts_display_dequeue,
             reconnection_delay=WEBSOCKET_RECONNECTION_DELAY,
             ping_interval=WEBSOCKET_PING_INTERVAL,
@@ -203,35 +198,32 @@ def main():
     )
 
     # Initialize services (returns True only on first initialization / main loop)
-    initialized = initialize_services(
-        ws_host=WEBRTC_HOST,
-        ws_port=WEBSOCKET_PORT,
-        webrtc_host=WEBRTC_HOST,
-        webrtc_port=WEBRTC_PORT,
-        webrtc_stream=WEBRTC_STREAM_NAME,
-        webrtc_stun=WEBRTC_STUN_SERVER,
-    )
+    initialized = initialize_services()
 
     # Main content
     left_col, right_col = st.columns([3, 2])
-    
+
     with left_col:
         st.header("🎥 Live Video Stream")
-        
-        # Only create WebRTC component on startup
+
+        # Only build the player HTML on startup
         if initialized:
-            # Create an HTML component able to receive a WebRTC video stream
-            html_video_player = get_video_player(
-                webrtc_url=WEBRTC_URL,
-                stream_name=WEBRTC_STREAM_NAME,
-                stun_server=WEBRTC_STUN_SERVER,
-            )
-            # Store the HTML in session state
-            st.session_state.webrtc_html = html_video_player
-            logger.info(f"WebRTC component rendered")
+            if STREAM_PROTOCOL == "webrtc":
+                html_video_player = get_webrtc_player(
+                    webrtc_url=STREAM_URL,
+                    stream_name=STREAM_NAME,
+                    stun_server=STREAM_STUN_SERVER,
+                )
+            else:
+                html_video_player = get_hls_player(
+                    hls_url=STREAM_URL,
+                    stream_name=STREAM_NAME,
+                )
+            st.session_state.stream_html = html_video_player
+            logger.info(f"Stream component rendered (protocol: {STREAM_PROTOCOL})")
 
         # Render the component using cached state
-        components.html(st.session_state.webrtc_html, height=HTML_HEIGHT)
+        components.html(st.session_state.stream_html, height=HTML_HEIGHT)
     
     with right_col:
         st.header("🚨 Alert Feed")
@@ -244,25 +236,27 @@ def main():
 
         st.subheader("Video stream configuration")
         st.text_input(
-            "WebRTC stream URL",
-            value=WEBRTC_URL,
-            help="The WebRTC stream URL from media server",
+            "Protocol",
+            value=STREAM_PROTOCOL.upper(),
             disabled=True,
         )
-
         st.text_input(
-            "WebRTC stream name",
-            value=WEBRTC_STREAM_NAME,
-            help="The WebRTC stream name",
+            "Stream URL",
+            value=STREAM_URL,
+            help="The stream server URL",
             disabled=True,
         )
-
         st.text_input(
-            "WebRTC STUN server",
-            value=WEBRTC_STUN_SERVER,
-            help="Enter the WebRTC STUN server address",
+            "Stream name",
+            value=STREAM_NAME,
             disabled=True,
         )
+        if STREAM_PROTOCOL == "webrtc":
+            st.text_input(
+                "STUN server",
+                value=STREAM_STUN_SERVER,
+                disabled=True,
+            )
 
         st.subheader("Alerts stream configuration")
         st.text_input(

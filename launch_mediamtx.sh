@@ -11,6 +11,7 @@ docker run -d \
   -p "8554:8554/tcp" \
   -p "1935:1935/tcp" \
   -p "8889:8889/tcp" \
+  -p "8888:8888/tcp" \
   -v "$(pwd)/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
   bluenviron/mediamtx:latest /mediamtx.yml
 
