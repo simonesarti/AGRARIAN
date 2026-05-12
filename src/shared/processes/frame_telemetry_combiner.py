@@ -8,12 +8,12 @@ from collections import deque
 from queue import Empty as QueueEmptyException
 from queue import Full as QueueFullException
 from time import time
-from typing import Optional
+from typing import Literal, Optional
 
 import multiprocessing as mp
 from aiomqtt import Client, TLSParameters
 from aiomqtt.exceptions import MqttError
-from pydantic import BaseModel, PositiveFloat, PositiveInt, field_validator
+from pydantic import BaseModel, PositiveFloat, PositiveInt, Field
 
 from src.shared.processes.constants import (
     FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
@@ -58,10 +58,10 @@ class FrameTelemetryCombinerConfig(BaseModel):
     # MQTT connection
     mqtt_protocol: str = MQTT
     mqtt_broker_host: str = TELEMETRY_LISTENER_HOST
-    mqtt_broker_port: int = TELEMETRY_LISTENER_PORT
+    mqtt_broker_port: int = Field(default=TELEMETRY_LISTENER_PORT, ge=1, le=65535)
     mqtt_username: Optional[str] = None
     mqtt_password: Optional[str] = None
-    mqtt_qos_level: int = TELEMETRY_LISTENER_QOS_LEVEL
+    mqtt_qos_level: Literal[0, 1, 2] = TELEMETRY_LISTENER_QOS_LEVEL
     mqtt_max_msg_wait_s: PositiveFloat = TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT
     mqtt_reconnect_delay_s: PositiveFloat = TELEMETRY_LISTENER_RECONNECT_DELAY
     mqtt_ca_certs_path: Optional[str] = None          # required for MQTTS
@@ -80,13 +80,6 @@ class FrameTelemetryCombinerConfig(BaseModel):
 
     # Shutdown
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
-
-    @field_validator('mqtt_qos_level')
-    @classmethod
-    def must_be_valid_qos(cls, v: int) -> int:
-        if v not in (0, 1, 2):
-            raise ValueError(f"QoS level must be 0, 1, or 2, got {v}")
-        return v
 
 
 
