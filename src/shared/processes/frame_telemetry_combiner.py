@@ -1,140 +1,371 @@
-import multiprocessing as mp
+import asyncio
 import logging
-import time
+import multiprocessing
+import multiprocessing.synchronize
+import ssl
+import threading
+from collections import deque
 from queue import Empty as QueueEmptyException
 from queue import Full as QueueFullException
-from collections import deque
-from src.shared.processes.messages import FrameQueueObject, TelemetryQueueObject, CombinedFrameTelemetryQueueObject
+from time import time
 from typing import Optional
 
-from src.shared.processes.constants import *
+import multiprocessing as mp
+from aiomqtt import Client, TLSParameters
+from aiomqtt.exceptions import MqttError
+from pydantic import BaseModel, field_validator
+
+from src.shared.processes.constants import (
+    FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
+    FRAMETELCOMB_MAX_TIME_DIFF,
+    FRAMETELCOMB_QUEUE_GET_TIMEOUT,
+    FRAMETELCOMB_QUEUE_PUT_TIMEOUT,
+    MQTT,
+    MQTTS,
+    POISON_PILL,
+    POISON_PILL_TIMEOUT,
+    TELEMETRY_LISTENER_CERT_VALIDATION,
+    TELEMETRY_LISTENER_HOST,
+    TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES,
+    TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT,
+    TELEMETRY_LISTENER_PORT,
+    TELEMETRY_LISTENER_QOS_LEVEL,
+    TELEMETRY_LISTENER_RECONNECT_DELAY,
+    TELEMETRY_LISTENER_TEMPLATE_TELEMETRY,
+    TELEMETRY_LISTENER_TOPICS_TO_SUBSCRIBE,
+    TELEMETRY_LISTENER_TOPICS_TO_TELEMETRY_MAPPING,
+)
+from src.shared.processes.frame_buffer import FrameBuffer
+from src.shared.processes.messages import CombinedSlotMetadata, FrameSlotMetadata, TelemetryQueueObject
 
 
 # ================================================================
 
-logger = logging.getLogger("main.combiner")
+logger = logging.getLogger("main.frame_telemetry_combiner")
 
 if not logger.handlers:  # Avoid duplicate handlers
-    video_handler = logging.FileHandler('./logs/combiner.log', mode='w')
-    video_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-    logger.addHandler(video_handler)
+    _handler = logging.FileHandler('./logs/frame_telemetry_combiner.log', mode='w')
+    _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logger.addHandler(_handler)
     logger.setLevel(logging.DEBUG)
 
 # ================================================================
 
 
+class FrameTelemetryCombinerConfig(BaseModel):
+    """Configuration for FrameTelemetryCombiner."""
+
+    # MQTT connection
+    mqtt_protocol: str = MQTT
+    mqtt_broker_host: str = TELEMETRY_LISTENER_HOST
+    mqtt_broker_port: int = TELEMETRY_LISTENER_PORT
+    mqtt_username: Optional[str] = None
+    mqtt_password: Optional[str] = None
+    mqtt_qos_level: int = TELEMETRY_LISTENER_QOS_LEVEL
+    mqtt_max_msg_wait_s: float = TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT
+    mqtt_reconnect_delay_s: float = TELEMETRY_LISTENER_RECONNECT_DELAY
+    mqtt_ca_certs_path: Optional[str] = None          # required for MQTTS
+    mqtt_cert_validation: Optional[int] = TELEMETRY_LISTENER_CERT_VALIDATION
+    mqtt_max_incoming_messages: int = TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES
+
+    # Telemetry–frame timestamp matching
+    telemetry_buffer_max_size: int = FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE
+    max_time_diff_s: float = FRAMETELCOMB_MAX_TIME_DIFF
+
+    # Input queue
+    queue_get_timeout: float = FRAMETELCOMB_QUEUE_GET_TIMEOUT
+
+    # Output queue
+    queue_put_timeout: float = FRAMETELCOMB_QUEUE_PUT_TIMEOUT
+
+    # Shutdown
+    poison_pill_timeout: float = POISON_PILL_TIMEOUT
+
+    @field_validator(
+        'mqtt_max_msg_wait_s',
+        'mqtt_reconnect_delay_s',
+        'max_time_diff_s',
+        'queue_get_timeout',
+        'queue_put_timeout',
+        'poison_pill_timeout',
+    )
+    @classmethod
+    def must_be_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"must be positive, got {v}")
+        return v
+
+    @field_validator('mqtt_qos_level')
+    @classmethod
+    def must_be_valid_qos(cls, v: int) -> int:
+        if v not in (0, 1, 2):
+            raise ValueError(f"QoS level must be 0, 1, or 2, got {v}")
+        return v
+
+    @field_validator('telemetry_buffer_max_size', 'mqtt_max_incoming_messages')
+    @classmethod
+    def must_be_positive_int(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"must be a positive integer, got {v}")
+        return v
+
+
 class FrameTelemetryCombiner(mp.Process):
     """
-    A multiprocessing Process that combines frames with telemetry data based on timestamps.
+    Second process in the pipeline.
 
-    One frame at a time (from oldest, FIFO):
-    - Takes frame and its id from frame_queue (multiprocessing Queue)
-    - searches in the telemetry_queue (multiprocessing Queue) the telemetry values that best match based
-    on the timestamp (max_time_diff_s sets the max time difference allowed).
-    Telemetry values are delivered in order of timestamp
-    - if no match is found, the matching telemetry value must be set to None in the output object
-    - if match is found,removes all the older telemetry values from the queue to free space
-    - outputs combined data to output_queues combining frame and telemetry (ensuring the data is put on all queues,
-    either on all or none, list of multiprocessing Queue objects)
+    Consumes video frames from StreamVideoReader via shared memory (FrameBuffer +
+    lightweight metadata queue) while concurrently collecting MQTT telemetry in a
+    background thread. For each frame, the best-matching telemetry entry is found by
+    timestamp and the combined result is written to the output FrameBuffer for the next
+    process to consume.
 
-    The process can shut-down via a global ErrorEvent being set (hard shutdown),
-    or via POISON-PILL (sequential shutdown).
-    If the process stops due to error_event, it's not necessary to propagate the poison pill since all processes will
-    stop at the same time.
+    The MQTT thread and the frame loop run in the same OS process:
+    - MQTT thread: asyncio.run() inside a threading.Thread; updates a deque of
+      TelemetryQueueObject snapshots, protected by a threading.Lock.
+    - Frame loop (main thread): reads metadata from input_meta_queue, retrieves the
+      frame from input_frame_buffer, matches telemetry from the deque, writes the
+      frame to output_frame_buffer, and queues CombinedSlotMetadata downstream.
 
+    MQTT is treated as non-critical: if the MQTT thread crashes, the frame loop
+    continues and produces combined results with telemetry=None rather than stopping
+    the pipeline.
+
+    Termination:
+    - Clean shutdown: POISON_PILL received from the input metadata queue is propagated
+      to the output metadata queue so downstream processes flush and stop in order.
+    - Error shutdown: if error_event is set by any process, the frame loop and the
+      MQTT thread stop immediately without flushing.
+
+    Frame drop policy: if no output buffer slot is free (consumer too slow) or the
+    output metadata queue is full, the current frame is discarded.
     """
 
     def __init__(
             self,
-            frame_queue: mp.Queue,
-            telemetry_queue: mp.Queue,
-            output_queues: list[mp.Queue],
-            error_event: mp.Event,
-            telemetry_buffer_max_size: int = FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
-            max_time_diff_s: float = FRAMETELCOMB_MAX_TIME_DIFF,
-            queue_get_timeout: float = FRAMETELCOMB_QUEUE_GET_TIMEOUT,
-            queue_put_max_retries: int = FRAMETELCOMB_QUEUE_PUT_MAX_RETRIES,
-            queue_put_backoff: float = FRAMETELCOMB_QUEUE_PUT_BACKOFF,
-            poison_pill_backoff: float = POISON_PILL_TIMEOUT,
+            input_meta_queue: mp.Queue,
+            input_frame_buffer: FrameBuffer,
+            output_meta_queue: mp.Queue,
+            output_frame_buffer: FrameBuffer,
+            error_event: multiprocessing.synchronize.Event,
+            config: FrameTelemetryCombinerConfig,
     ):
-        """
-        Initialize the FrameTelemetryCombiner process.
+        super().__init__(name="FrameTelemetryCombiner")
 
-        Args:
-            frame_queue: Queue containing FrameQueueObject instances
-            telemetry_queue: Queue containing TelemetryQueueObject instances
-            output_queues: List of queues to output CombinedFrameTelemetryQueueObject instances
-            error_event: Event to signal the process to stop
-            max_time_diff_s: Maximum time difference allowed for matching (seconds)
-        """
-        super().__init__()
+        # Input: frames arrive as lightweight metadata referencing input shared memory slots
+        self.input_meta_queue = input_meta_queue
+        self.input_frame_buffer = input_frame_buffer
 
-        # mp queues and events
-        self.frame_queue = frame_queue
-        self.telemetry_queue = telemetry_queue
-        self.output_queues = output_queues
+        # Output: combined result written to the next hop's shared memory
+        self.output_meta_queue = output_meta_queue
+        self.output_frame_buffer = output_frame_buffer
+
+        # Shared error event — set by any process on unexpected failure
         self.error_event = error_event
 
-        # local telemetry buffer for timestamp matching
-        self.telemetry_buffer = deque(maxlen=telemetry_buffer_max_size)
-        self.max_time_diff_s = max_time_diff_s
-
-        # queue get
-        self.queue_get_timeout = queue_get_timeout
-
-        # multi-queue put
-        self.queue_put_max_retries = queue_put_max_retries
-        self.queue_put_backoff = queue_put_backoff
-        self.poison_pill_backoff = poison_pill_backoff
+        self.config = config
 
         self.work_finished = mp.Event()
 
-    def _update_telemetry_buffer(self):
-        """Collect all available telemetry data from queue into buffer."""
-        logger.debug(f"initial telemetry buffer length: {len(self.telemetry_buffer)}")
-        while True:
+        # Threading objects are intentionally left as None here and created in run().
+        # mp.Process with 'spawn' start method pickles __init__ state to the child.
+        # threading.Event and threading.Lock are not picklable, so they must be
+        # created inside run() which executes in the child process.
+        self._mqtt_stop: Optional[threading.Event] = None
+        self._telemetry_deque: Optional[deque] = None
+        self._telemetry_lock: Optional[threading.Lock] = None
+        self._telemetry_state: Optional[dict] = None
+
+    # ================================================================
+    # MQTT background thread
+    # ================================================================
+
+    def _create_mqtt_client(self) -> Client:
+        """Build an aiomqtt Client from the config."""
+        tls_params = None
+        if self.config.mqtt_protocol == MQTTS:
+            # TLS is required for MQTTS; a CA certificate file must be provided
+            tls_params = TLSParameters(
+                ca_certs=self.config.mqtt_ca_certs_path,
+                cert_reqs=self.config.mqtt_cert_validation,
+            )
+        return Client(
+            hostname=self.config.mqtt_broker_host,
+            port=self.config.mqtt_broker_port,
+            tls_params=tls_params,
+            username=self.config.mqtt_username,
+            password=self.config.mqtt_password,
+            max_queued_incoming_messages=self.config.mqtt_max_incoming_messages,
+        )
+
+    async def _mqtt_process_messages(self, client: Client) -> None:
+        """
+        Inner async message loop.
+        Updates the rolling telemetry state on each message and appends a timestamped
+        snapshot to the shared deque so the frame loop can match it by timestamp.
+        """
+        while not (self._mqtt_stop.is_set() or self.error_event.is_set()):
+
+            # Wait for the next message for at most mqtt_max_msg_wait_s seconds.
+            # Using a timeout allows periodic checks of the stopping conditions.
+            # This does not catch MqttError — that propagates to the outer worker.
             try:
-                telemetry_obj: TelemetryQueueObject = self.telemetry_queue.get_nowait()
-                self.telemetry_buffer.append(telemetry_obj)
-            except QueueEmptyException:
+                async with asyncio.timeout(self.config.mqtt_max_msg_wait_s):
+                    message = await anext(client.messages)
+                    logger.debug(f"MQTT message received on topic {message.topic.value}")
+            except asyncio.TimeoutError:
+                # No message within timeout window — loop back to check stop conditions
                 logger.debug(
-                    "Telemetry queue emptied into the local buffer (if not empty already). "
-                    "Stopping fetch for matching to the current frame. "
-                    f"Buffer length: {len(self.telemetry_buffer)}"
+                    f"No MQTT messages received for {self.config.mqtt_max_msg_wait_s}s. "
+                    "Continuing to listen ..."
                 )
+                continue
+            except StopAsyncIteration:
+                # The async iterator closed (broker disconnected)
+                # Let this break the loop so the outer worker handles reconnection
+                logger.warning("MQTT client disconnected. Attempting to reconnect ...")
                 break
+
+            # ---------- message received ----------
+
+            topic = message.topic.value
+            try:
+                # 1. Decode and update rolling telemetry state
+                payload = message.payload.decode()
+                telemetry_key = TELEMETRY_LISTENER_TOPICS_TO_TELEMETRY_MAPPING.get(topic)
+                if not telemetry_key:
+                    logger.warning(f"MQTT message from unexpected topic '{topic}'. Skipped.")
+                    continue  # Ignore unmapped topics
+                self._telemetry_state[telemetry_key] = float(payload)
             except Exception as e:
-                logger.debug(
-                    f"Unexpected error in telemetry fetch: {e}. "
-                    f"Stopping fetch for matching to the current frame"
+                logger.error(
+                    f"Error processing MQTT message on topic '{topic}': {e}. "
+                    "Continuing to listen ..."
                 )
-                break
+                continue
+                # Continue to the next message: message-level error, connection still alive
+
+            # 2. Append a timestamped snapshot to the shared deque.
+            #    The lock is held only for the O(1) deque append.
+            snapshot = TelemetryQueueObject(
+                telemetry=self._telemetry_state.copy(),
+                timestamp=time()
+            )
+            with self._telemetry_lock:
+                self._telemetry_deque.append(snapshot)
+
+    async def _mqtt_subscriber_worker(self) -> None:
+        """
+        Async MQTT worker: connects, subscribes, and loops on messages.
+        A fresh client is created at every (re)connection attempt for clean state.
+        Reconnects automatically on MQTT-level, network, and TLS errors.
+        """
+        reconnect_str = f"Retrying in {self.config.mqtt_reconnect_delay_s} seconds ..."
+
+        # Use a non-blocking check to see if we should stop.
+        while not (self._mqtt_stop.is_set() or self.error_event.is_set()):
+
+            # Create MQTT client.
+            # The client is recreated as a clean object at every disconnection.
+            # Safer: discard potentially dirty old object states from reusing the same old client
+            client = self._create_mqtt_client()
+
+            try:
+                logger.info(
+                    f"MQTT: connecting to "
+                    f"{self.config.mqtt_broker_host}:{self.config.mqtt_broker_port} ..."
+                )
+
+                # The 'async with' context manager handles connection/disconnection
+                async with client:
+                    logger.info("MQTT: connected. Subscribing to topics ...")
+
+                    # Subscribe to all topics
+                    for topic in TELEMETRY_LISTENER_TOPICS_TO_SUBSCRIBE:
+                        await client.subscribe(topic=topic, qos=self.config.mqtt_qos_level)
+                        logger.info(
+                            f"MQTT: subscribed to '{topic}' (QoS {self.config.mqtt_qos_level})"
+                        )
+
+                    # Process messages using an async iterator.
+                    # The message task blocks until _mqtt_stop/error_event is set,
+                    # the connection drops, or an unhandled exception propagates.
+                    await asyncio.create_task(self._mqtt_process_messages(client))
+
+            except MqttError as e:
+                # Handles MQTT-specific errors (network disconnect, broker kicks client)
+                logger.error(f"MQTT error: {e}. {reconnect_str}")
+                await asyncio.sleep(self.config.mqtt_reconnect_delay_s)
+
+            except ConnectionRefusedError:
+                # Handles initial connection failures (broker port closed/down)
+                logger.error(f"MQTT connection refused. {reconnect_str}")
+                await asyncio.sleep(self.config.mqtt_reconnect_delay_s)
+
+            except ssl.SSLError as e:
+                # Handles errors during the TLS handshake (e.g., invalid certificate)
+                logger.error(f"MQTT TLS/SSL error: {e}. {reconnect_str}")
+                await asyncio.sleep(self.config.mqtt_reconnect_delay_s)
+
+            except Exception as e:
+                # Catch all other unexpected errors
+                logger.error(f"MQTT unexpected error: {e}. {reconnect_str}")
+                await asyncio.sleep(self.config.mqtt_reconnect_delay_s)
+
+    def _mqtt_thread_worker(self) -> None:
+        """
+        Entry point for the MQTT background thread.
+        Runs an asyncio event loop dedicated to MQTT message collection.
+
+        MQTT is non-critical: if this thread crashes, the frame loop continues
+        and will produce combined results with telemetry=None.
+        """
+        logger.info(f"MQTT background thread started (PID {self.pid})")
+        try:
+            # Start the asyncio event loop and run the main MQTT worker coroutine
+            asyncio.run(self._mqtt_subscriber_worker())
+        except Exception as e:
+            # If the thread crashes outside the worker loop
+            logger.critical(
+                f"MQTT background thread crashed fatally: {e}. "
+                "Processing will continue without telemetry."
+            )
+            # DO NOT set error_event — pipeline continues without telemetry
+        finally:
+            logger.info("MQTT background thread stopped.")
+
+    # ================================================================
+    # Telemetry timestamp matching
+    # ================================================================
 
     def _find_best_match(self, frame_timestamp: float) -> Optional[dict]:
         """
-        Find the best matching telemetry for the given frame timestamp.
-        Removes all older telemetry values from buffer if match is found.
-        Find the best matching telemetry for the given frame timestamp.
+        Find the best-matching telemetry entry for the given frame timestamp.
+        Prunes entries that are too old relative to frame_timestamp.
+
+        This method must be called while holding self._telemetry_lock so that
+        the MQTT thread cannot append to the deque concurrently with the search
+        and pruning operations.
 
         Args:
-            frame_timestamp: Timestamp of the frame to match
+            frame_timestamp: Timestamp of the frame to match.
 
         Returns:
-            Matched telemetry dict or None if no match within time threshold
+            Best-matching telemetry dict, or None if no entry within max_time_diff_s.
         """
-        if not self.telemetry_buffer:
-            logger.warning(f"No telemetry data available for matching at timestamp {frame_timestamp}")
+        if not self._telemetry_deque:
+            logger.warning(f"No telemetry available for matching at timestamp {frame_timestamp:.3f}")
             return None
 
         best_match = None
         best_diff = float('inf')
-        best_idx = -1  # Track index of the telemetry with timestamp closest to that of the frame
-        last_too_old_idx = -1  # Track oldest telemetry that is too old and should be removed
+        best_idx = -1       # Index of the entry with timestamp closest to the frame
+        last_too_old_idx = -1  # Last entry that is older than the matching window
 
-        min_valid_timestamp = frame_timestamp - self.max_time_diff_s
+        min_valid_timestamp = frame_timestamp - self.config.max_time_diff_s
 
         # Find closest telemetry by timestamp
-        for idx, telemetry_obj in enumerate(self.telemetry_buffer):
+        for idx, telemetry_obj in enumerate(self._telemetry_deque):
             time_diff = abs(telemetry_obj.timestamp - frame_timestamp)
 
             if time_diff < best_diff:
@@ -142,108 +373,68 @@ class FrameTelemetryCombiner(mp.Process):
                 best_match = telemetry_obj
                 best_idx = idx
 
-            # Track the last telemetry that's too old (before min_valid_timestamp)
+            # Track the last telemetry entry that is outside the match window (too old)
             if telemetry_obj.timestamp < min_valid_timestamp:
                 last_too_old_idx = idx
 
-            # Since telemetry is ordered by timestamp, if we're past the frame
-            # timestamp by too much, we can stop searching
-            if telemetry_obj.timestamp > frame_timestamp + self.max_time_diff_s:
+            # Since telemetry entries are ordered by arrival time, stop searching
+            # once we are past the frame timestamp by more than the allowed window
+            if telemetry_obj.timestamp > frame_timestamp + self.config.max_time_diff_s:
                 break
 
         # Remove old telemetry regardless of match success
         if last_too_old_idx >= 0:
-            # Remove all telemetry up to and including last_too_old_idx
             for _ in range(last_too_old_idx + 1):
-                self.telemetry_buffer.popleft()
+                self._telemetry_deque.popleft()
             logger.debug(
                 f"Removed {last_too_old_idx + 1} telemetry entries "
-                f"older than the maximum allowed time difference for matching ({self.max_time_diff_s} seconds)")
-
-            # Adjust best_idx if we removed items before it
+                f"older than the maximum allowed time difference for matching "
+                f"({self.config.max_time_diff_s} seconds)"
+            )
+            # Adjust best_idx since some entries were removed from the front
             if best_idx >= 0:
                 best_idx = best_idx - (last_too_old_idx + 1)
 
-        # Check if best match is within allowed time difference
-        if best_diff <= self.max_time_diff_s:
+        # Check if best match is within the allowed time difference
+        if best_diff <= self.config.max_time_diff_s:
             logger.debug(f"Found telemetry match with time diff: {best_diff:.4f}s")
-            # Remove all telemetry older than to the matched one (keep matched one)
+            # Remove all entries older than the matched one (keep the matched entry at front)
             removed_older = 0
             for _ in range(best_idx):
-                self.telemetry_buffer.popleft()
+                self._telemetry_deque.popleft()
                 removed_older += 1
-            logger.debug(f"Removed {removed_older} telemetries old than the best match from the buffer")
+            logger.debug(f"Removed {removed_older} telemetries older than the best match from the buffer")
             return best_match.telemetry
-
         else:
             logger.warning(
-                f"No telemetry match found within {self.max_time_diff_s} seconds "
-                f"(best diff: {best_diff:.4f}s). "
+                f"No telemetry match found within {self.config.max_time_diff_s} seconds "
+                f"(best diff: {best_diff:.4f}s)"
             )
             return None
 
-    def _output_to_all_queues(
-            self,
-            combined_obj: CombinedFrameTelemetryQueueObject|str,
-            backoff: float,         # different for poison pill and frame
-    ) -> bool:
-        """
-        Output combined data to all output queues (all or none).
+    # ================================================================
+    # Main frame-combination loop
+    # ================================================================
 
-        Args:
-            combined_obj: The combined object to output
-
-        Returns:
-            True if successfully output to all queues, False otherwise
-        """
-
-        if isinstance(combined_obj, str) and combined_obj == POISON_PILL:
-            obj_type = "poison pill"
-        else:
-            obj_type = f"frame {combined_obj.frame_id}"
-            if combined_obj.telemetry is not None:
-                obj_type += " + telemetry"
-
-        # Check if all queues have space (not full) before attempting to put
-        # This provides atomicity guarantee
-        for attempt in range(1, self.queue_put_max_retries+1):
-
-            all_have_space = all([not queue.full() for queue in self.output_queues])
-            if all_have_space:
-                # All queues have space, proceed with putting
-                for queue in self.output_queues:
-                    queue.put_nowait(combined_obj)
-
-                logger.debug(
-                    f"Successfully output [{obj_type}] "
-                    f"to all {len(self.output_queues)} processing queues")
-                return True
-
-            else:
-                # At least one queue is full, wait and retry
-                if attempt <= self.queue_put_max_retries:
-                    logger.debug(f"Some queues full, retrying ({attempt}/{self.queue_put_max_retries})...")
-                    time.sleep(backoff)
-
-        logger.warning(
-            f"Failed to output put [{obj_type}] to model queues: "
-            f"At least one queue full after {self.queue_put_max_retries} attempts. "
-            f"Discarding [{obj_type}]."
-        )
-
-        # if it's the poison pill we were unable to propagate, set the error event to force-stop the application
-        if isinstance(combined_obj, str) and combined_obj == POISON_PILL:
-            self.error_event.set()
-            logger.error(
-                "Error event set: could not propagate poison pill to all models queues."
-                "Force-stopping the application"
-
-            )
-        return False
-
-    def run(self):
-        """Main process loop."""
+    def run(self) -> None:
+        """Main process entry point."""
         logger.info("FrameTelemetryCombiner process started")
+
+        # Initialize threading primitives inside run() — they belong to this child process
+        self._mqtt_stop = threading.Event()
+        self._telemetry_deque = deque(maxlen=self.config.telemetry_buffer_max_size)
+        self._telemetry_lock = threading.Lock()
+        # Initial telemetry state: a copy of the template so all keys are present from the start
+        self._telemetry_state = TELEMETRY_LISTENER_TEMPLATE_TELEMETRY.copy()
+
+        # Start the MQTT collection thread.
+        # Daemon: automatically killed if the process exits before join() completes.
+        mqtt_thread = threading.Thread(
+            target=self._mqtt_thread_worker,
+            name="mqtt-collector",
+            daemon=True,
+        )
+        mqtt_thread.start()
 
         failed_matches = 0
         consecutive_failed_matches = 0
@@ -251,192 +442,238 @@ class FrameTelemetryCombiner(mp.Process):
 
         try:
 
-            # Process runs until the stop event is set
+            # Process runs until the error_event is set or a poison pill arrives
             while not self.error_event.is_set():
 
+                # ---- pull next frame metadata from the input queue ----
+                # Short timeout to allow periodic checks of error_event
                 try:
-                    # Try to get a frame, waiting for a short time if not available immediately
-                    frame_obj: FrameQueueObject = self.frame_queue.get(timeout=self.queue_get_timeout)
+                    meta = self.input_meta_queue.get(timeout=self.config.queue_get_timeout)
                 except QueueEmptyException:
-                    logger.debug("Frame queue is empty, retrying fetch ...")
+                    logger.debug("Input metadata queue empty. Waiting for frames ...")
                     continue
 
-                # if the object found is the poison pill, it must be propagated to following processes via
-                # their input queues. Must ensure that all downstream processes receive the pill
-                if isinstance(frame_obj, str) and frame_obj == POISON_PILL:
-                    logger.info("Found sentinel value on queue.")
+                # If the object found is the poison pill, stop the frame loop.
+                # The pill will be propagated downstream after the loop exits.
+                if isinstance(meta, str) and meta == POISON_PILL:
+                    logger.info("Poison pill received from upstream.")
                     poison_pill_received = True
-                    # internally handles setting of error_event if unable to propagate the poison pill to all queues
-                    # error_event causes clean shutdown of all processes
-                    self._output_to_all_queues(frame_obj, backoff=self.poison_pill_backoff)
                     break
 
-                # Collect available telemetry data into buffer
-                # stop when all have been collected and the queue is empty, or the local telemetry data buffer is full
-                self._update_telemetry_buffer()
+                assert isinstance(meta, FrameSlotMetadata)
 
-                # Find best matching telemetry
-                matched_telemetry = self._find_best_match(frame_obj.timestamp)
+                # ---- read frame from input shared memory and immediately release the slot ----
+                # release() is called right after read() so that the upstream producer
+                # can reuse the slot as quickly as possible
+                frame = self.input_frame_buffer.read(meta.slot_index)
+                self.input_frame_buffer.release(meta.slot_index)
+
+                # ---- find the best-matching telemetry by timestamp ----
+                # The lock must be held during the entire search+prune operation
+                # to prevent the MQTT thread from appending concurrently
+                with self._telemetry_lock:
+                    matched_telemetry = self._find_best_match(meta.timestamp)
 
                 if matched_telemetry is None:
                     failed_matches += 1
                     consecutive_failed_matches += 1
                     logger.debug(
+                        f"Frame {meta.frame_id}: no telemetry match. "
                         f"N. Consecutive failed matches: {consecutive_failed_matches}. "
                         f"N. Total failed matches: {failed_matches}. "
-                        f"Either the delay between frames and telemetry is too large, or telemetry collection has stopped."
+                        "Either the delay between frames and telemetry is too large, "
+                        "or telemetry collection has stopped."
                     )
                 else:
                     consecutive_failed_matches = 0
 
-                # Create combined object
-                combined_obj = CombinedFrameTelemetryQueueObject(
-                    frame_id=frame_obj.frame_id,
-                    frame=frame_obj.frame,
+                # ---- acquire an output slot and write the frame to output shared memory ----
+                out_slot = self.output_frame_buffer.acquire()
+                if out_slot is None:
+                    # No free output slot — the downstream consumer is too slow.
+                    # Drop this frame so the next one can be written when a slot is freed.
+                    logger.warning(
+                        f"No free slot in output frame buffer. "
+                        f"Frame {meta.frame_id} discarded. Consumer too slow?"
+                    )
+                    continue
+
+                self.output_frame_buffer.write(out_slot, frame)
+
+                # ---- put lightweight combined metadata on the output queue ----
+                out_meta = CombinedSlotMetadata(
+                    frame_id=meta.frame_id,
+                    timestamp=meta.timestamp,
+                    original_wh=meta.original_wh,
+                    slot_index=out_slot,
                     telemetry=matched_telemetry,
-                    timestamp=frame_obj.timestamp,
-                    original_wh=frame_obj.original_wh,
                 )
 
-                # Output to all queues (all or none = discard frame)
-                self._output_to_all_queues(combined_obj, backoff=self.queue_put_backoff)
+                # no need to sleep on failure since we already waited during the put timeout
+                try:
+                    self.output_meta_queue.put(out_meta, timeout=self.config.queue_put_timeout)
+                    logger.debug(
+                        f"Frame {meta.frame_id} → output slot {out_slot}, "
+                        f"telemetry={'matched' if matched_telemetry else 'None'}."
+                    )
+                except QueueFullException:
+                    # Return the output slot to the free pool since no metadata was queued —
+                    # the consumer will never know to release it otherwise
+                    self.output_frame_buffer.release(out_slot)
+                    logger.warning(
+                        f"Output metadata queue full. Frame {meta.frame_id} discarded. "
+                        "Consumer too slow or stopped?"
+                    )
+
+                # end of frame processing — move on to the next frame
+
+            # Propagate termination signal via poison pill on clean shutdown.
+            # Reaching here without error_event means the upstream sent a pill (expected end-of-stream).
+            # In case of error_event, all processes stop where they are, so no pill is needed.
+            # If sending the poison pill fails, set the error event to force-stop downstream processes.
+            if not self.error_event.is_set():
+                try:
+                    logger.info("Propagating poison pill to downstream process ...")
+                    self.output_meta_queue.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
+                    logger.info("Poison pill propagated to downstream.")
+                except Exception as e:
+                    logger.error(f"Failed to propagate poison pill: {e}")
+                    self.error_event.set()
+                    logger.warning(
+                        "Error event set: "
+                        "force-stopping downstream processes as poison pill could not be delivered."
+                    )
+            else:
+                # error event has been set: all processes will stop where they are
+                logger.info("Terminating and skipping poison pill propagation. Error event is set.")
 
         except Exception as e:
-            logger.critical(f"An unexpected critical error happened in the frame-telemetry combiner process: {e}")
+            logger.critical(f"Unexpected error in FrameTelemetryCombiner: {e}")
             self.error_event.set()
             logger.warning("Error event set: force-stopping the application")
 
         finally:
-            # log process conclusion
+
+            # Signal and wait for the MQTT background thread to finish
+            self._mqtt_stop.set()
+            mqtt_thread.join(timeout=self.config.mqtt_reconnect_delay_s + 1.0)
+            if mqtt_thread.is_alive():
+                # Daemon threads die automatically with the process, but log the anomaly
+                logger.warning(
+                    "MQTT thread did not stop within the allotted time. "
+                    "It will be killed when the process exits."
+                )
+
+            # Detach from shared memory in this process.
+            # The parent is responsible for calling unlink() after all processes have finished.
+            self.input_frame_buffer.close()
+            self.output_frame_buffer.close()
+
+            # Log process conclusion
             logger.info(
-                "FrameTelemetryCombiner process stopped gracefully. "
+                "FrameTelemetryCombiner process stopped. "
                 f"Poison pill received: {poison_pill_received}. "
                 f"Error event: {self.error_event.is_set()}."
             )
             self.work_finished.set()
 
 
-
 if __name__ == "__main__":
 
     import numpy as np
-    import random
-    from src.shared.processes.consumer import Consumer
-    from src.shared.processes.producer import Producer
+    from time import sleep
 
-    VSLOW = 1
-    SLOW = 10
-    FAST = 50
-    REAL = 30
-    FREAL = 40
+    FRAME_SHAPE = (720, 1280, 3)  # (H, W, C) — numpy convention
+    N_SLOTS = 3
+    N_FRAMES = 30
 
-    QUEUE_MAX = 3
-
-    def generate_frame_queue_object():
-        ts = time.time()
-        return FrameQueueObject(
-            frame_id=int(ts*100),
-            frame=np.random.randint(0, 256, size=(720, 1280, 3), dtype=np.uint8),
-            timestamp=ts,
-            original_wh=(1920, 1080),
-        )
-
-    def generate_telemetry_object():
-        return TelemetryQueueObject(
-            telemetry={
-                "latitude": random.uniform(-90.0, 90.0),       # degrees
-                "longitude": random.uniform(-180.0, 180.0),    # degrees
-                "rel_alt": random.uniform(0.0, 100.0),         # meters
-                "gb_yaw": random.uniform(0.0, 360.0),          # degrees
-            },
-            timestamp=time.time()
-        )
-
-    frame_queue = mp.Queue(maxsize=QUEUE_MAX)
-    telemetry_queue = mp.Queue(maxsize=QUEUE_MAX*10)
-    stop_event = mp.Event()
     error_event = mp.Event()
 
-    out1 = mp.Queue(maxsize=QUEUE_MAX)
-    out2 = mp.Queue(maxsize=QUEUE_MAX)
-    out3 = mp.Queue(maxsize=QUEUE_MAX)
-    out_queues = [out1, out2, out3]
+    input_meta_queue = mp.Queue(maxsize=N_SLOTS)
+    input_frame_buffer = FrameBuffer(frame_shape=FRAME_SHAPE, n_slots=N_SLOTS)
 
-    stream_reader = Producer(frame_queue, error_event, generate_frame_queue_object, frequency_hz=FREAL)
-    stream_reader.stop_with_poison = False
-    
-    telemetry_reader = Producer(telemetry_queue,error_event, generate_telemetry_object, frequency_hz=SLOW)
-    telemetry_reader.stop_with_poison = False   # telemetry reader without giving notice, it ismply stops and puts noting on output queue
+    output_meta_queue = mp.Queue(maxsize=N_SLOTS)
+    output_frame_buffer = FrameBuffer(frame_shape=FRAME_SHAPE, n_slots=N_SLOTS)
 
-    consumer1 = Consumer(out1, error_event, frequency_hz=FAST)
-    consumer2 = Consumer(out2, error_event, frequency_hz=FAST)
-    consumer3 = Consumer(out3, error_event, frequency_hz=FAST)
+    config = FrameTelemetryCombinerConfig(
+        mqtt_broker_host="127.0.0.1",
+        mqtt_broker_port=TELEMETRY_LISTENER_PORT,
+        mqtt_cert_validation=None,  # no TLS in test
+    )
 
-    combiner = FrameTelemetryCombiner(frame_queue, telemetry_queue, out_queues, error_event)
+    combiner = FrameTelemetryCombiner(
+        input_meta_queue=input_meta_queue,
+        input_frame_buffer=input_frame_buffer,
+        output_meta_queue=output_meta_queue,
+        output_frame_buffer=output_frame_buffer,
+        error_event=error_event,
+        config=config,
+    )
 
-    print("CONSUMERS STARTED")
-    consumer3.start()
-    consumer2.start()
-    consumer1.start()
+    def producer_loop():
+        """Push fake frames into the input shared memory buffer."""
+        frame_id = 0
+        for _ in range(N_FRAMES):
+            slot = input_frame_buffer.acquire()
+            if slot is not None:
+                frame = np.random.randint(0, 256, FRAME_SHAPE, dtype=np.uint8)
+                input_frame_buffer.write(slot, frame)
+                meta = FrameSlotMetadata(
+                    frame_id=frame_id,
+                    timestamp=time(),
+                    original_wh=(1920, 1080),
+                    slot_index=slot,
+                )
+                try:
+                    input_meta_queue.put(meta, timeout=1.0)
+                except Exception:
+                    input_frame_buffer.release(slot)
+            frame_id += 1
+            sleep(1 / 30)
+        # Signal end-of-stream
+        input_meta_queue.put(POISON_PILL)
 
-    time.sleep(3)
+    def consumer_loop():
+        """Drain the output queue and release output slots."""
+        frames_received = 0
+        while True:
+            try:
+                msg = output_meta_queue.get(timeout=5.0)
+            except Exception:
+                print("[Consumer] Timed out waiting for output. Stopping.")
+                break
+            if isinstance(msg, str) and msg == POISON_PILL:
+                output_meta_queue.put(POISON_PILL)  # re-queue for any additional downstream consumers
+                print(f"[Consumer] Poison pill received. {frames_received} frames processed.")
+                break
+            if error_event.is_set():
+                break
+            assert isinstance(msg, CombinedSlotMetadata)
+            output_frame_buffer.release(msg.slot_index)
+            frames_received += 1
+            print(
+                f"[Consumer] frame_id={msg.frame_id} "
+                f"slot={msg.slot_index} "
+                f"telemetry={'yes' if msg.telemetry else 'None'}"
+            )
 
-    print("COMBINER STARTED")
+    prod_thread = threading.Thread(target=producer_loop, daemon=True)
+    cons_thread = threading.Thread(target=consumer_loop, daemon=True)
+
+    print("[Main] Starting combiner ...")
     combiner.start()
+    sleep(0.5)  # let the combiner process fully start before feeding it
 
-    time.sleep(3)
+    print("[Main] Starting consumer ...")
+    cons_thread.start()
 
-    print("READERS STARTED")
-    stream_reader.start()
-    telemetry_reader.start()
+    print("[Main] Starting producer ...")
+    prod_thread.start()
 
-    time.sleep(3)
+    combiner.join()
+    prod_thread.join(timeout=5.0)
+    cons_thread.join(timeout=5.0)
 
-    # stop without telling via posion pill nor error event
-    print("TELEMETRY STOPPED")
-    telemetry_reader.stop()
-
-    time.sleep(3)
-
-    # stop without telling via posion pill nor error event
-    print("VIDEO STOPPED")
-    stream_reader.stop()
-
-    time.sleep(1)
-
-    print("POISON PILL")
-    frame_queue.put(POISON_PILL)    # option1
-    #print("ERROR EVENT")
-    #error_event.set()              # option2
-
-    processes = [stream_reader, telemetry_reader] + [combiner] + [consumer1, consumer2, consumer3]
-
-    while True:
-
-        # Check if everyone has finished their logic
-        all_finished = all(p.work_finished.is_set() for p in processes)
-
-        # Check if an error occurred anywhere
-        error_occurred = error_event.is_set()
-
-        if all_finished or error_occurred:
-            if error_occurred:
-                print("[Main] Error detected. Terminating chain.")
-            else:
-                print("[Main] All processes finished logic. Cleaning up.")
-            break
-
-        time.sleep(0.5)
-
-    print(f"[Main] Granting 5s for all processed to cleanly conclude their processing.")
-    time.sleep(5.0)
-    # The Sweep: Force everyone to join or die
-    for p in processes:
-        # If the logic is finished but the process is still 'alive',
-        # it is 100% stuck in the queue feeder thread.
-        if p.is_alive():
-            print(f"[Main] {p.name} is hanging in cleanup. Work Completed: {p.work_finished.is_set()}. Terminating.")
-            p.terminate()
-
-        p.join()
-        print(f"[Main] {p.name} joined.")
+    input_frame_buffer.unlink()
+    output_frame_buffer.unlink()
+    print("[Main] Done.")

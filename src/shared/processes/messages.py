@@ -3,6 +3,32 @@ from dataclasses import dataclass
 
 
 @dataclass
+class FrameSlotMetadata:
+    """
+    Lightweight message passed between pipeline processes via the metadata queue.
+    The actual frame lives in a FrameBuffer slot; only the slot index is carried here.
+    """
+    frame_id: int
+    timestamp: float
+    original_wh: tuple[int, int]
+    slot_index: int
+
+
+@dataclass
+class CombinedSlotMetadata:
+    """
+    Lightweight message combining a shared-memory frame reference with matched telemetry.
+    Passed between pipeline processes via the metadata queue.
+    The actual frame lives in a FrameBuffer slot; only the slot index is carried here.
+    """
+    frame_id: int
+    timestamp: float
+    original_wh: tuple[int, int]
+    slot_index: int
+    telemetry: dict | None
+
+
+@dataclass
 class FrameQueueObject:
     """
     A dataclass to represent a frame and its ID in a queue.

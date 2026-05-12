@@ -1,10 +1,14 @@
 import multiprocessing as mp
+import multiprocessing.synchronize
 import cv2
 import logging
 from time import time, sleep
 from queue import Full as QueueFullException
-from src.shared.processes.consumer import Consumer
-from src.shared.processes.messages import FrameQueueObject
+
+from pydantic import BaseModel, field_validator
+
+from src.shared.processes.frame_buffer import FrameBuffer
+from src.shared.processes.messages import FrameSlotMetadata
 from src.shared.processes.constants import (
     VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S,
     VIDEO_STREAM_READER_RECONNECT_DELAY,
@@ -12,7 +16,6 @@ from src.shared.processes.constants import (
     VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S,
     VIDEO_STREAM_READER_FRAME_RETRY_DELAY,
     VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES,
-    VIDEO_STREAM_READER_BUFFER_SIZE,
     VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO,
     VIDEO_STREAM_READER_PROCESSING_SHAPE,
     VIDEO_STREAM_READER_QUEUE_PUT_TIMEOUT,
@@ -35,69 +38,94 @@ if not logger.handlers:  # Avoid duplicate handlers
 # ================================================================
 
 
+class StreamVideoReaderConfig(BaseModel):
+    """Configuration for StreamVideoReader."""
+
+    video_stream_url: str
+
+    # Connection
+    connect_open_timeout_s: float = VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S
+    connect_retry_delay_s: float = VIDEO_STREAM_READER_RECONNECT_DELAY
+    connect_max_consecutive_failures: int = VIDEO_STREAM_READER_MAX_CONSECUTIVE_CONNECTION_FAILURES
+
+    # Frame reading
+    frame_read_timeout_s: float = VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S
+    frame_read_retry_delay_s: float = VIDEO_STREAM_READER_FRAME_RETRY_DELAY
+    frame_read_max_consecutive_failures: int = VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES
+
+    # Processing
+    expected_aspect_ratio: float = VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO
+    processing_shape: tuple[int, int] = VIDEO_STREAM_READER_PROCESSING_SHAPE  # (W, H)
+
+    # Output
+    meta_queue_put_timeout: float = VIDEO_STREAM_READER_QUEUE_PUT_TIMEOUT
+    poison_pill_timeout: float = POISON_PILL_TIMEOUT
+
+    @field_validator(
+        'connect_open_timeout_s',
+        'connect_retry_delay_s',
+        'frame_read_timeout_s',
+        'frame_read_retry_delay_s',
+        'meta_queue_put_timeout',
+        'poison_pill_timeout',
+        'expected_aspect_ratio',
+    )
+    @classmethod
+    def must_be_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"must be positive, got {v}")
+        return v
+
+    @field_validator(
+        'connect_max_consecutive_failures',
+        'frame_read_max_consecutive_failures',
+    )
+    @classmethod
+    def must_be_positive_int(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"must be a positive integer, got {v}")
+        return v
+
+    @field_validator('processing_shape')
+    @classmethod
+    def must_be_valid_shape(cls, v: tuple) -> tuple:
+        if len(v) != 2 or v[0] <= 0 or v[1] <= 0:
+            raise ValueError(f"processing_shape must be a (W, H) tuple of positive ints, got {v}")
+        return v
+
+
 class StreamVideoReader(mp.Process):
     """
-    Reads video stream frames from media server or CDN,
-    and pushes them to the frame queue together with id and timestamp.
-    The process continually tries to connect to the provided server address.
-    The process terminates when it receives an external stop event
+    First process in the pipeline. Reads frames from a media server via RTSP/RTMP,
+    resizes them to the configured processing shape, writes each frame zero-copy into
+    a shared FrameBuffer slot, and places a lightweight FrameSlotMetadata on the output
+    metadata queue for the next process to consume.
+
+    Termination:
+    - Clean shutdown: when the stream ends or connection retries are exhausted, a
+      POISON_PILL is placed on the metadata queue so downstream processes flush and
+      stop in order.
+    - Error shutdown: if error_event is set by any process, this process stops
+      immediately without flushing.
+
+    Frame drop policy: if no buffer slot is free (consumer too slow) or the metadata
+    queue is full, the current frame is discarded so the consumer always receives the
+    most recent available frame.
     """
-    
+
     def __init__(
             self,
-            frame_queue: mp.Queue,
-            stop_event: mp.Event,   # stop event used to stop gracefully
-            error_event: mp.Event,  # error event used to stop gracefully on processing error
-            video_stream_url: str,
-            connect_open_timeout_s: float = VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S,
-            connect_retry_delay_s: float = VIDEO_STREAM_READER_RECONNECT_DELAY,
-            connect_max_consecutive_failures: int = VIDEO_STREAM_READER_MAX_CONSECUTIVE_CONNECTION_FAILURES,
-            frame_read_timeout_s: float = VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S,
-            frame_read_retry_delay_s: float = VIDEO_STREAM_READER_FRAME_RETRY_DELAY,
-            frame_read_max_consecutive_failures: int = VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES,
-            buffer_size: int = VIDEO_STREAM_READER_BUFFER_SIZE,
-            expected_aspect_ratio: float = VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO,
-            processing_shape: tuple[int, int] = VIDEO_STREAM_READER_PROCESSING_SHAPE,
-            queue_out_put_timeout: float = VIDEO_STREAM_READER_QUEUE_PUT_TIMEOUT,
-            poison_pill_timeout: float = POISON_PILL_TIMEOUT,
+            output_meta_queue: mp.Queue,
+            output_frame_buffer: FrameBuffer,
+            error_event: multiprocessing.synchronize.Event,
+            config: StreamVideoReaderConfig,
     ):
-        
         super().__init__()
 
-        # Shared output queue. Next process will read from this
-        self.frame_queue = frame_queue
-
-        # Shared stop event.
-        # Allows to stop all processes at the same time
-        # (sent by video reading process on correct termination)
-        self.stop_event = stop_event
-
-        # Shared error event.
-        # Allows to stop all processes at the same time
-        # (sent by any process terminating unexpectedly due to error, all other processes should stop)
+        self.output_meta_queue = output_meta_queue
+        self.output_frame_buffer = output_frame_buffer
         self.error_event = error_event
-
-        # video stream URL
-        self.video_stream_url = video_stream_url
-
-        # Connection configuration
-        self.connect_open_timeout_s = connect_open_timeout_s
-        self.connect_retry_delay_s = connect_retry_delay_s
-        self.connect_max_consecutive_failures = connect_max_consecutive_failures
-
-        # Frame reading configuration
-        self.frame_read_timeout_s = frame_read_timeout_s
-        self.frame_read_retry_delay_s = frame_read_retry_delay_s
-        self.frame_read_max_consecutive_failures = frame_read_max_consecutive_failures
-        self.buffer_size = buffer_size
-
-        # Processing configuration
-        self.expected_aspect_ratio = expected_aspect_ratio
-        self.processing_shape = processing_shape
-
-        # Output configuration
-        self.queue_out_put_timeout = queue_out_put_timeout
-        self.poison_pill_timeout = poison_pill_timeout
+        self.config = config
 
         self.work_finished = mp.Event()
 
@@ -105,16 +133,22 @@ class StreamVideoReader(mp.Process):
         """
         Set up video capture with appropriate settings for video streams.
         """
-        cap = cv2.VideoCapture(self.video_stream_url)
+        cap = cv2.VideoCapture(self.config.video_stream_url)
 
-        if not cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.connect_open_timeout_s * 1000):
-            raise ConnectionError("Failed to set CAP_PROP_OPEN_TIMEOUT_MSEC: blocking behavior on connection is undefined")
+        if not cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.config.connect_open_timeout_s * 1000):
+            raise ConnectionError(
+                "Failed to set CAP_PROP_OPEN_TIMEOUT_MSEC: "
+                "blocking behavior on connection is undefined"
+            )
 
-        if not cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.frame_read_timeout_s * 1000):
-            raise ConnectionError("Failed to set CAP_PROP_READ_TIMEOUT_MSEC: blocking behavior on cap.read() is undefined")
+        if not cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.config.frame_read_timeout_s * 1000):
+            raise ConnectionError(
+                "Failed to set CAP_PROP_READ_TIMEOUT_MSEC: "
+                "blocking behavior on cap.read() is undefined"
+            )
 
         # CAP_PROP_BUFFERSIZE is a no-op for RTSP/FFmpeg backend; buffer is managed by FFmpeg internally
-        # cap.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
+        # cap.set(cv2.CAP_PROP_BUFFERSIZE, ...)
 
         return cap
 
@@ -139,7 +173,7 @@ class StreamVideoReader(mp.Process):
         try:
 
             # Use a non-blocking check to see if we should stop.
-            while not (self.stop_event.is_set() or self.error_event.is_set()):
+            while not self.error_event.is_set():
 
                 # --------------------------------------------------------------
                 # setup videocapture
@@ -155,53 +189,58 @@ class StreamVideoReader(mp.Process):
                     cap = self._setup_capture()
                     # Manually trigger the exception if the connection isn't actually "live"
                     if cap is None or not cap.isOpened():
-                        raise ConnectionError(f"VideoCapture is either not open or not functional for {self.video_stream_url}")
+                        raise ConnectionError(
+                            f"VideoCapture is either not open or not functional "
+                            f"for {self.config.video_stream_url}"
+                        )
                     logger.info("VideoCapture Object setup complete and stream is open")
                     consecutive_connection_failures = 0
                     consecutive_read_failures = 0
-                
+
                 except Exception as e:
                     total_connection_failures += 1
                     consecutive_connection_failures += 1
                     logger.warning(
-                        f"Unable to setup videocapture for video source {self.video_stream_url}: {e}. "
+                        f"Unable to setup videocapture for {self.config.video_stream_url}: {e}. "
                         f"N. Consecutive connection failures: {consecutive_connection_failures} "
-                        f"(max: {self.connect_max_consecutive_failures}). "
-                        f"N. Total connection failures: {total_connection_failures}. "
+                        f"(max: {self.config.connect_max_consecutive_failures}). "
+                        f"N. Total connection failures: {total_connection_failures}."
                     )
 
                     # when the max number of connection attempts has not been surpassed yet, retry to connect
-                    if consecutive_connection_failures < self.connect_max_consecutive_failures:
-                        logger.warning(f"Retrying to setup VideoCapture in {self.connect_retry_delay_s} seconds ...")
-                        sleep(self.connect_retry_delay_s)
+                    if consecutive_connection_failures < self.config.connect_max_consecutive_failures:
+                        logger.warning(
+                            f"Retrying to setup VideoCapture "
+                            f"in {self.config.connect_retry_delay_s} seconds ..."
+                        )
+                        sleep(self.config.connect_retry_delay_s)
                         continue
 
-                    # otherwise, stop the application
+                    # otherwise, initiate clean shutdown via poison pill
                     else:
-                        logger.warning(
-                            f"Max number of consecutive connection attempts to the video stream source surpassed. "
-                            f"Video stream not available. Shutting down the application ..."
+                        logger.error(
+                            "Max consecutive connection attempts surpassed. "
+                            "Video stream not available. Shutting down the pipeline ..."
                         )
-                        self.stop_event.set()
-                        logger.info("Stop event set")
                         break
-                        # after break, jump out of this outer loop to the cleanup code
+                        # after break, jump out of this outer loop to the poison pill / cleanup code
 
                 # --------------------------------------------------------------
                 # connection established
                 # --------------------------------------------------------------
 
                 logger.info("Starting video reading loop")
-                while cap.isOpened() and not (self.stop_event.is_set() or self.error_event.is_set()):
-                    # continue to read frame until the connection is live and no halting events are set
-                    # if loop exists due to connection breakdown, the outer loop retries to establish the connection
-                    # if loop exits due to halting event, outer loop exists as well,
-                    # and the final cleanup code is executed
+                while cap.isOpened() and not self.error_event.is_set():
+                    # continue to read frames until the connection is live and no halting event is set.
+                    # if the loop exits due to connection breakdown, the outer loop retries to establish the connection.
+                    # if the loop exits due to error_event, the outer loop exits as well,
+                    # and the final cleanup code is executed.
 
                     success, frame = cap.read()
+                    timestamp = time()  # capture time: recorded immediately after cap.read() returns
                     frame_id += 1
                     # cap.read() is a blocking operation !!!!
-                    # still, if nothing has arrived in the timeout time, wait a  bit to retry.
+                    # still, if nothing has arrived within the timeout time, wait a bit to retry.
 
                     # --------- read failure ---------
                     if (not success) or (frame is None) or (frame.size == 0):
@@ -210,131 +249,148 @@ class StreamVideoReader(mp.Process):
                         logger.warning(
                             f"Frame {frame_id} read failed. "
                             f"N. Consecutive read failures: {consecutive_read_failures} "
-                            f"(max: {self.frame_read_max_consecutive_failures}). "
-                            f"N. Total read failures: {total_read_failures}. "
+                            f"(max: {self.config.frame_read_max_consecutive_failures}). "
+                            f"N. Total read failures: {total_read_failures}."
                         )
-
-                        if consecutive_read_failures < self.frame_read_max_consecutive_failures:
-                            logger.warning(f"Attempting new read in {self.frame_read_retry_delay_s} seconds... ")
-                            sleep(self.frame_read_retry_delay_s)
+                        if consecutive_read_failures < self.config.frame_read_max_consecutive_failures:
+                            logger.warning(
+                                f"Attempting new read "
+                                f"in {self.config.frame_read_retry_delay_s} seconds..."
+                            )
+                            sleep(self.config.frame_read_retry_delay_s)
                             continue
-
                         else:
                             logger.error(
-                                f"Max number tolerated consecutive frame read failures has been surpassed. "
-                                f"Trying to reconnect in {self.connect_retry_delay_s} seconds..."
+                                "Max consecutive frame read failures surpassed. "
+                                f"Trying to reconnect in {self.config.connect_retry_delay_s} seconds..."
                             )
-                            sleep(self.connect_retry_delay_s)
+                            sleep(self.config.connect_retry_delay_s)
                             break
                             # breaks out of the inner loop, go back to the outer loop and try to reconnect
 
-                    # --------- read successful, check aspect ration and resize ---------
+                    # --------- read successful, check aspect ratio and resize ---------
 
-                    # check that the video frames are in the expected 16/9 aspect ratio
-                    # failure here must cause a shutdown of the application
-                    # which is only intended to process 16:9 images
+                    # check that the video frames are in the expected 16:9 aspect ratio.
+                    # failure here must cause a shutdown of the application,
+                    # which is only intended to process 16:9 images.
                     frame_height, frame_width, _ = frame.shape
-                    aspect_ratio = frame_width/frame_height
-                    if not abs(aspect_ratio - self.expected_aspect_ratio) < 1.0e-2:     # tolerance: accounts for encoder padding (e.g. 1920x1088)
+                    aspect_ratio = frame_width / frame_height
+                    if not abs(aspect_ratio - self.config.expected_aspect_ratio) < 0.02:  # tolerance: accounts for encoder padding (e.g. 1920x1088)
                         logger.error(
-                            f"Application expects frame with aspect ratio (W/H)={self.expected_aspect_ratio} "
-                            f"but got frame of size W/H = {frame_width}/{frame_height} = {aspect_ratio}."
-                            f"Shutting down the application ..."
+                            f"Application expects aspect ratio (W/H)={self.config.expected_aspect_ratio} "
+                            f"but got frame of size W/H = {frame_width}/{frame_height} = {aspect_ratio}. "
+                            "Shutting down the application ..."
                         )
                         self.error_event.set()
                         logger.info("Error event set")
                         break
                         # after break, skip to the end of this inner loop,
-                        # enter the outer loop with terminates due to error_event being set.
-                        # This causes a jump to the final cleanup code
+                        # enter the outer loop which terminates due to error_event being set,
+                        # causing a jump to the final cleanup code.
 
-                    # resize to desired frame size, here (1280, 720) as a compromise between resolution and speed
-                    # failure here can simply cause a warning, and risizing the enxt frame will be attempted
+                    # resize to desired frame size, here (1280, 720) as a compromise between resolution and speed.
+                    # failure here can simply cause a warning, and resizing the next frame will be attempted.
                     try:
-                        frame = cv2.resize(frame, self.processing_shape, interpolation=DOWNSAMPLING_MODE)
+                        frame = cv2.resize(
+                            frame, 
+                            self.config.processing_shape, 
+                            interpolation=DOWNSAMPLING_MODE,
+                        )
                     except cv2.error:
                         total_read_failures += 1
                         consecutive_read_failures += 1
                         logger.warning(
-                            f"Frame {frame_id} resizing failed. "
-                            f"N. Consecutive read failures: {consecutive_read_failures} (max: {self.frame_read_max_consecutive_failures}). "
-                            f"N. Total read failures: {total_read_failures}. "
+                            f"Frame {frame_id} resize failed. "
+                            f"N. Consecutive read failures: {consecutive_read_failures} "
+                            f"(max: {self.config.frame_read_max_consecutive_failures}). "
+                            f"N. Total read failures: {total_read_failures}."
                         )
-
-                        if consecutive_read_failures < self.frame_read_max_consecutive_failures:
-                            logger.warning(f"Attempting new read in {self.frame_read_retry_delay_s} seconds... ")
-                            sleep(self.frame_read_retry_delay_s)
+                        if consecutive_read_failures < self.config.frame_read_max_consecutive_failures:
+                            logger.warning(
+                                f"Attempting new read "
+                                f"in {self.config.frame_read_retry_delay_s} seconds..."
+                            )
+                            sleep(self.config.frame_read_retry_delay_s)
                             continue
-
                         else:
                             logger.error(
-                                f"Max number tolerated consecutive frame read failures has been surpassed. "
-                                f"Shutting down the application ..."
+                                "Max consecutive frame resize failures surpassed. "
+                                "Shutting down the application ..."
                             )
                             self.error_event.set()
                             logger.info("Error event set")
                             break
 
-                    # --------- read successful and checks passed, output queue object ---------
+                    # --------- read successful and checks passed: write to shared memory ---------
 
                     # Reset failure counter on successful read and checks passed
                     consecutive_read_failures = 0
 
-                    # Package the frame with its unique frame ID
-                    frame_object = FrameQueueObject(
+                    # Acquire a free buffer slot. If none is available the consumer is too slow:
+                    # drop this frame so the next one can be written when a slot is freed.
+                    slot_idx = self.output_frame_buffer.acquire()
+                    if slot_idx is None:
+                        logger.warning(
+                            f"No free slot in frame buffer. Consumer too slow. "
+                            f"Frame {frame_id} discarded."
+                        )
+                        continue
+
+                    # Write the frame zero-copy into shared memory
+                    self.output_frame_buffer.write(slot_idx, frame)
+
+                    # Build the lightweight metadata message carrying the slot reference
+                    meta = FrameSlotMetadata(
                         frame_id=frame_id,
-                        frame=frame,
-                        timestamp=time(),
-                        original_wh=(frame_width, frame_height)
+                        timestamp=timestamp,
+                        original_wh=(frame_width, frame_height),
+                        slot_index=slot_idx,
                     )
 
-                    # Try to put output object in output queue
+                    # Put the metadata on the output queue so the next process can locate the frame
+                    # no need to sleep on failure since we already waited during the put timeout
                     try:
-                        self.frame_queue.put(frame_object, timeout=self.queue_out_put_timeout)
-                        logger.debug(f"Added frame {frame_id} to queue.")
-                    # Catch exception for queue full
-                    # no need to sleep since already waited during put timeout
+                        self.output_meta_queue.put(meta, timeout=self.config.meta_queue_put_timeout)
+                        logger.debug(f"Frame {frame_id} → slot {slot_idx}, metadata queued.")
                     except QueueFullException:
+                        # Return the slot to the free pool so it can be reused; drop this frame
+                        self.output_frame_buffer.release(slot_idx)
                         logger.warning(
-                            f"Failed to put frame in queue: Queue is full. "
-                            f"Consumer too slow or stopped?. "
-                            f"Frame discarded. "
-                            f"Trying to read a new frame ..."
+                            f"Metadata queue full. Frame {frame_id} discarded. "
+                            "Consumer too slow or stopped?"
                         )
 
-                    # end of successful read of frame
-                    # move on to read next frame
+                    # end of successful frame read — move on to read the next frame
 
-            # Propagate termination signal via poison pill if interruption due to stop_event.
-            # stop event indicates "clean shutdown" due to input stream termination.
-            # In case of error_event, all processes should shut down (cleanly) in the state they currently are,
-            # so there is not really a need to propagate the poison pill.
-            # If process fails to send the poison pill for clean shutdown, then the error event is set to ensure
-            # termination of the application
-            if self.stop_event.is_set() and not self.error_event.is_set():
+            # Propagate termination signal via poison pill on clean shutdown.
+            # Reaching here without error_event means connection retries were exhausted,
+            # which is the "clean" end-of-stream signal for this pipeline.
+            # In case of error_event, all processes stop where they are, so no pill is needed.
+            # If sending the poison pill fails, set the error event to force-stop downstream processes.
+            if not self.error_event.is_set():
                 try:
-                    logger.info("Attempting to put sentinel value on output queue ...")
-                    self.frame_queue.put(POISON_PILL, timeout=self.poison_pill_timeout)
+                    logger.info("Attempting to put sentinel value on output metadata queue ...")
+                    self.output_meta_queue.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
                     logger.info("Sentinel value has been passed on to the next process.")
                 except Exception as e:
                     logger.error(f"Error sending Poison Pill: {e}")
                     self.error_event.set()
                     logger.warning(
                         "Error event set: "
-                        "force-stop downstream processes if they are unable to receive the poison pill"
+                        "force-stopping downstream processes as poison pill could not be delivered."
                     )
             else:
-                # error event has been set, all processes will stop where they are.
-                logger.info("Terminating and Skipping Poison Pill sending. Error Event received.")
+                # error event has been set: all processes will stop where they are.
+                logger.info("Terminating and skipping Poison Pill sending. Error event is set.")
 
         except Exception as e:
-            logger.critical(f"An unexpected error happened in Video reader process: {e}")
+            logger.critical(f"An unexpected error happened in StreamVideoReader: {e}")
             self.error_event.set()
             logger.warning("Error event set: force-stopping the application")
 
         finally:
 
-            #  Final Cleanup
+            # Final cleanup
 
             if cap is not None:
                 try:
@@ -344,79 +400,70 @@ class StreamVideoReader(mp.Process):
                 except Exception as e:
                     logger.error(f"Failed to close the VideoCapture object: {e}")
 
+            self.output_frame_buffer.close()
+
             # log process conclusion
             logger.info(
                 "StreamVideoReader process stopped gracefully. "
-                f"Stop event: {self.stop_event.is_set()}. "
                 f"Error event: {self.error_event.is_set()}."
             )
             self.work_finished.set()
 
 
-
 if __name__ == "__main__":
 
-    frame_queue = mp.Queue(maxsize=3)
-    stop_event = mp.Event()
+    from time import time
+
+    VIDEO_STREAM_URL = "rtsp://0.0.0.0:8554/annot"
+    FRAME_SHAPE = (720, 1280, 3)   # (H, W, C) — numpy convention
+    N_SLOTS = 3
+    META_QUEUE_SIZE = 3
+
     error_event = mp.Event()
+    output_meta_queue = mp.Queue(maxsize=META_QUEUE_SIZE)
+    output_frame_buffer = FrameBuffer(frame_shape=FRAME_SHAPE, n_slots=N_SLOTS)
 
-    video_stream_url = "rtsp://0.0.0.0:8554/annot"
+    config = StreamVideoReaderConfig(video_stream_url=VIDEO_STREAM_URL)
 
-    VSLOW=1
-    SLOW=10
-    REAL=30
-    FAST=50
+    reader = StreamVideoReader(
+        output_meta_queue=output_meta_queue,
+        output_frame_buffer=output_frame_buffer,
+        error_event=error_event,
+        config=config,
+    )
 
-    stream_reader = StreamVideoReader(frame_queue, stop_event, error_event, video_stream_url)
-    consumer = Consumer(frame_queue, error_event, frequency_hz=FAST)
+    def consumer_loop():
+        """Simple consumer: reads frames from shared memory and logs throughput."""
+        frames_received = 0
+        start = time()
+        while True:
+            try:
+                msg = output_meta_queue.get(timeout=5.0)
+            except Exception:
+                break
+            if isinstance(msg, str) and msg == POISON_PILL:
+                output_meta_queue.put(POISON_PILL)  # re-queue for any other consumer
+                break
+            if error_event.is_set():
+                break
+            assert isinstance(msg, FrameSlotMetadata)
+            output_frame_buffer.read(msg.slot_index)  # would be processed here
+            output_frame_buffer.release(msg.slot_index)
+            frames_received += 1
+            elapsed = time() - start
+            print(
+                f"[Consumer] frame_id={msg.frame_id} "
+                f"slot={msg.slot_index} "
+                f"fps={frames_received / elapsed:.1f}"
+            )
 
-    print("CONSUMERS STARTED")
-    consumer.start()
+    import threading
+    consumer_thread = threading.Thread(target=consumer_loop, daemon=True)
+    consumer_thread.start()
 
-    sleep(2)
+    reader.start()
+    reader.join()
+    consumer_thread.join(timeout=10.0)
 
-    print("VIDEO READER STARTED")
-    stream_reader.start()
-
-    event_set = False
-    start_time = time()
-    block_in = 15.0
-
-    processes = [stream_reader, consumer]
-
-    while True:
-
-        if time()-start_time > block_in and not event_set:
-            event_set=True
-            #print("PRODUCER STOPPED")
-            #producer.stop()
-            print("ERROR EVENT SET")
-            error_event.set()
-
-        # Check if everyone has finished their logic
-        all_finished = all(p.work_finished.is_set() for p in processes)
-
-        # Check if an error occurred anywhere
-        error_occurred = error_event.is_set()
-
-        if all_finished or error_occurred:
-            if error_occurred:
-                print("[Main] Error detected. Terminating chain.")
-            else:
-                print("[Main] All processes finished logic. Cleaning up.")
-            break
-
-        sleep(0.5)
-
-    print(f"[Main] Granting 5s for all processed to cleanly conclude their processing.")
-    sleep(5.0)
-    # The Sweep: Force everyone to join or die
-    for p in processes:
-        # If the logic is finished but the process is still 'alive',
-        # it is 100% stuck in the queue feeder thread.
-        if p.is_alive():
-            print(f"[Main] {p.name} is hanging in cleanup. Work Completed: {p.work_finished.is_set()}. Terminating.")
-            p.terminate()
-
-        p.join()
-        print(f"[Main] {p.name} joined.")
+    output_frame_buffer.unlink()
+    print("[Main] Done.")
