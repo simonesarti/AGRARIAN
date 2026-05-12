@@ -1,26 +1,54 @@
 import multiprocessing as mp
+import multiprocessing.synchronize
+import logging
 from queue import Empty as QueueEmptyException
 from queue import Full as QueueFullException
+from time import time, sleep
 
-from src.danger_detection.detection.detection import postprocess_detection_results
+from pydantic import BaseModel, Field, PositiveFloat, field_validator
 from ultralytics import YOLO
 
-from src.danger_detection.processes.messages import DetectionResult
-from src.shared.processes.messages import CombinedFrameTelemetryQueueObject
-from src.shared.processes.constants import *
-from time import time, sleep
-import logging
+from src.danger_detection.detection.detection import postprocess_detection_results
+from src.danger_detection.processes.messages import DetectionSlotMetadata
+from src.shared.processes.frame_buffer import FrameBuffer
+from src.shared.processes.messages import CombinedSlotMetadata
+from src.shared.processes.constants import (
+    MODELS_QUEUE_GET_TIMEOUT,
+    MODELS_QUEUE_PUT_TIMEOUT,
+    POISON_PILL,
+    POISON_PILL_TIMEOUT,
+)
+
 
 # ================================================================
 
 logger = logging.getLogger("main.danger_detector")
 
 if not logger.handlers:  # Avoid duplicate handlers
-    video_handler = logging.FileHandler('./logs/animals_detection.log', mode='w')
-    video_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-    logger.addHandler(video_handler)
+    _handler = logging.FileHandler('./logs/animals_detection.log', mode='w')
+    _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logger.addHandler(_handler)
     logger.setLevel(logging.DEBUG)
+
 # ================================================================
+
+
+class DetectionWorkerConfig(BaseModel):
+    """Configuration for DetectionWorker."""
+
+    model_checkpoint: str
+    predict_args: dict = Field(default_factory=dict)   # YOLO predict kwargs (conf, iou, device, etc.)
+
+    queue_get_timeout: PositiveFloat = MODELS_QUEUE_GET_TIMEOUT
+    queue_put_timeout: PositiveFloat = MODELS_QUEUE_PUT_TIMEOUT
+    poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
+
+    @field_validator('model_checkpoint')
+    @classmethod
+    def must_be_non_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("model_checkpoint must not be empty")
+        return v
 
 
 class DetectorWrapper:
@@ -37,129 +65,177 @@ class DetectorWrapper:
 
 class DetectionWorker(mp.Process):
     """
-    DetectionWorker is a standalone process that:
-    - Instantiates the detector once during initialization
-    - Stores 'detection_args' for consistent use
-    - Processes incoming frames and sends back results
-    - Shuts down when it receives a poison pill, forwarding the termination signal to the next process in the sequence
+    Animal detection process in the danger detection pipeline.
+
+    Reads frames from the upstream FrameBuffer, runs YOLO inference, and passes
+    the frame unchanged to the downstream FrameBuffer. Detection results (bounding
+    boxes, class IDs) are small enough to travel in the lightweight metadata queue
+    alongside the slot index.
+
+    The frame is not modified by detection; it is forwarded so that the segmentation
+    process can operate on it in the next chain step.
+
+    Termination:
+    - Clean shutdown: POISON_PILL received from the input metadata queue is
+      propagated to the output metadata queue.
+    - Error shutdown: if error_event is set by any process, the loop stops
+      immediately without flushing.
+
+    Frame drop policy: if no output buffer slot is free (consumer too slow) or
+    the output metadata queue is full, the current frame is discarded.
     """
 
     def __init__(
             self,
-            input_queue: mp.Queue,
-            result_queue: mp.Queue,
-            error_event: mp.Event,
-            detection_args,
-            queue_get_timeout: float = MODELS_QUEUE_GET_TIMEOUT,
-            queue_put_timeout: float = MODELS_QUEUE_PUT_TIMEOUT,
-            poison_pill_timeout: float = POISON_PILL_TIMEOUT,
+            input_meta_queue: mp.Queue,
+            input_frame_buffer: FrameBuffer,
+            output_meta_queue: mp.Queue,
+            output_frame_buffer: FrameBuffer,
+            error_event: multiprocessing.synchronize.Event,
+            config: DetectionWorkerConfig,
     ):
         super().__init__()
 
-        self.input_queue = input_queue
-        self.result_queue = result_queue
+        # Input: frames arrive as lightweight metadata referencing input shared memory slots
+        self.input_meta_queue = input_meta_queue
+        self.input_frame_buffer = input_frame_buffer
+
+        # Output: frame forwarded to next hop's shared memory, detection results in metadata
+        self.output_meta_queue = output_meta_queue
+        self.output_frame_buffer = output_frame_buffer
 
         self.error_event = error_event
-
-        self.detection_args = detection_args
-
-        self.queue_get_timeout = queue_get_timeout
-        self.queue_put_timeout = queue_put_timeout
-        self.poison_pill_timeout = poison_pill_timeout
+        self.config = config
 
         self.work_finished = mp.Event()
 
     def run(self):
         """
-        Main loop of the process: initializes the detector and processes frames.
+        Main loop of the process: instantiates the detector once, then processes frames.
         """
-        
         logger.info("Animal detection process started.")
         poison_pill_received = False
 
         try:
 
-            # instantiate the detection model
-            detection_model_checkpoint = self.detection_args.pop("model_checkpoint")
-            model = YOLO(detection_model_checkpoint, task="detect")
-            detector = DetectorWrapper(model=model, predict_args=self.detection_args)
+            # Instantiate the detection model inside run() so that GPU context and model
+            # weights are loaded in the child process, not inherited from the parent.
+            model = YOLO(self.config.model_checkpoint, task="detect")
+            detector = DetectorWrapper(model=model, predict_args=self.config.predict_args)
             logger.info("Animal detection model loaded.")
 
-            # prepare detection classes names and number
-            classes_names = model.names  # list of class names
+            # model.names is a {class_id: class_name} dict — fixed for the lifetime of this process
+            classes_names = model.names
             num_classes = len(classes_names)
 
             while not self.error_event.is_set():
 
                 iter_start = time()
 
+                # ---- pull next frame metadata from the input queue ----
                 try:
-                    # frame_telemetry_object is either a CombinedFrameTelemetryQueueObject or the POISON_PILL
-                    frame_telemetry_object: CombinedFrameTelemetryQueueObject | str = self.input_queue.get(timeout=self.queue_get_timeout)
+                    meta = self.input_meta_queue.get(timeout=self.config.queue_get_timeout)
                 except QueueEmptyException:
-                    logger.debug(f"Input queue timed out. Upstream producer may be stalled. Retrying...")
-                    continue  # Go back and try to get again
+                    logger.debug("Input queue timed out. Upstream producer may be stalled. Retrying ...")
+                    continue
 
-                if isinstance(frame_telemetry_object, str) and frame_telemetry_object == POISON_PILL:
-                    poison_pill_received = True
+                # ---- poison pill: propagate downstream and exit ----
+                if isinstance(meta, str) and meta == POISON_PILL:
                     logger.info("Found sentinel value on queue.")
-                    try:
-                        logger.info("Attempting to put sentinel value on output queue ...")
-                        self.result_queue.put(POISON_PILL, timeout=self.poison_pill_timeout)
-                        logger.info("Sentinel value has been passed on to the next process.")
-                    except Exception as e:
-                        logger.error(f"Error propagating Poison Pill: {e}")
-                        self.error_event.set()
-                        logger.warning(
-                            "Error event set: force-stop application since downstream processes "
-                            "are unable to receive the poison pill."
-                        )
+                    poison_pill_received = True
                     break
 
-                get_time = time() - iter_start
+                assert isinstance(meta, CombinedSlotMetadata)
 
-                # Perform detection using stored arguments
+                get_start = time()
+
+                # ---- read frame from input shared memory and immediately release the slot ----
+                # release() is called right after read() so that the upstream process
+                # can reuse the slot as quickly as possible
+                frame = self.input_frame_buffer.read(meta.slot_index)
+                self.input_frame_buffer.release(meta.slot_index)
+
+                # ---- run YOLO inference ----
                 predict_start = time()
-                classes, boxes_centers, boxes_corner1, boxes_corner2 = detector.predict(frame_telemetry_object.frame)
-                predict_time = time() - predict_start
+                classes, boxes_centers, boxes_corner1, boxes_corner2 = detector.predict(frame)
 
-                result = DetectionResult(
-                    frame_id=frame_telemetry_object.frame_id,
-                    frame=frame_telemetry_object.frame,
+                # ---- acquire an output slot and forward the frame to output shared memory ----
+                out_slot = self.output_frame_buffer.acquire()
+                if out_slot is None:
+                    # No free output slot — the downstream process is too slow.
+                    # Drop this frame so the next one can be written when a slot is freed.
+                    logger.warning(
+                        f"No free slot in output frame buffer. "
+                        f"Frame {meta.frame_id} discarded. Consumer too slow?"
+                    )
+                    continue
+
+                # The frame is forwarded unchanged; detection results travel in the metadata queue.
+                # Detection box arrays are small (O(N_detections * few bytes)) and are safe to
+                # pickle in the queue alongside the lightweight metadata.
+                self.output_frame_buffer.write(out_slot, frame)
+
+                # ---- put combined metadata on the output queue ----
+                out_meta = DetectionSlotMetadata(
+                    frame_id=meta.frame_id,
+                    timestamp=meta.timestamp,
+                    original_wh=meta.original_wh,
+                    slot_index=out_slot,
+                    telemetry=meta.telemetry,
                     classes_names=classes_names,
                     num_classes=num_classes,
                     classes=classes,
                     boxes_centers=boxes_centers,
                     boxes_corner1=boxes_corner1,
                     boxes_corner2=boxes_corner2,
-                    timestamp=frame_telemetry_object.timestamp,
-                    original_wh=frame_telemetry_object.original_wh,
                 )
 
-                # put result in output queue
+                # no need to sleep on failure since we already waited during the put timeout
                 append_start = time()
                 try:
-                    self.result_queue.put(result, timeout=self.queue_put_timeout)
-                    logger.debug("Put detection results on output queue")
-                except QueueFullException:
-                    logger.error(
-                        f"Failed to put detection results on output queue: queue is full. "
-                        f"Consumer too slow or stuck?. "
-                        f"Skipping detection results. "
-                        "This might break sync between models in the next process and cause an global error event"
+                    self.output_meta_queue.put(out_meta, timeout=self.config.queue_put_timeout)
+                    logger.debug(
+                        f"Frame {meta.frame_id} → output slot {out_slot}, "
+                        f"detection results queued."
                     )
-                append_time = time() - append_start
-
-                iter_time = time()-iter_start
+                except QueueFullException:
+                    # Return the output slot to the free pool since no metadata was queued —
+                    # the consumer will never know to release it otherwise
+                    self.output_frame_buffer.release(out_slot)
+                    logger.error(
+                        f"Output metadata queue full. Frame {meta.frame_id} discarded. "
+                        "Consumer too slow or stopped?"
+                    )
+                
+                iter_end = time() 
 
                 logger.debug(
-                    f"frame {frame_telemetry_object.frame_id} processed in {iter_time * 1000:.2f} ms, "
+                    f"frame {meta.frame_id} processed in {(iter_end - iter_start) * 1000:.2f} ms, "
                     f"of which --> "
-                    f"GET: {get_time * 1000:.2f} ms, "
-                    f"PREDICT: {predict_time * 1000:.2f} ms, "
-                    f"PROPAGATE: {append_time * 1000:.2f} ms."
+                    f"GET: {(predict_start - get_start) * 1000:.2f} ms, "
+                    f"PREDICT: {(append_start - predict_start) * 1000:.2f} ms, "
+                    f"PROPAGATE: {(iter_end - append_start) * 1000:.2f} ms."
                 )
                 # iteration completed correctly, move on to process next frame
+
+            # Propagate termination signal via poison pill on clean shutdown.
+            # In case of error_event, all processes stop where they are, so no pill is needed.
+            # If sending the poison pill fails, set the error event to force-stop downstream.
+            if not self.error_event.is_set():
+                try:
+                    logger.info("Attempting to put sentinel value on output queue ...")
+                    self.output_meta_queue.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
+                    logger.info("Sentinel value has been passed on to the next process.")
+                except Exception as e:
+                    logger.error(f"Error propagating Poison Pill: {e}")
+                    self.error_event.set()
+                    logger.warning(
+                        "Error event set: force-stop application since downstream processes "
+                        "are unable to receive the poison pill."
+                    )
+            else:
+                # error event has been set: all processes will stop where they are
+                logger.info("Terminating and skipping Poison Pill sending. Error event is set.")
 
         except Exception as e:
             logger.critical(f"An unexpected critical error happened in the animal detection process: {e}")
@@ -167,6 +243,11 @@ class DetectionWorker(mp.Process):
             logger.warning("Error event set: force-stopping the application")
 
         finally:
+
+            # Detach from shared memory in this process.
+            # The parent is responsible for calling unlink() after all processes have finished.
+            self.input_frame_buffer.close()
+            self.output_frame_buffer.close()
 
             logger.info(
                 "Animal detection process terminated successfully. "
@@ -176,71 +257,99 @@ class DetectionWorker(mp.Process):
             self.work_finished.set()
 
 
-
 if __name__ == "__main__":
 
     import numpy as np
-    from src.shared.processes.consumer import Consumer
-    from src.shared.processes.producer import Producer
-    from src.configs.utils import read_yaml_config
+    import threading
 
-    VSLOW = 1
-    SLOW = 10
-    FAST = 50
-    REAL = 30
+    FRAME_SHAPE = (720, 1280, 3)  # (H, W, C) — numpy convention
+    N_SLOTS = 3
+    N_FRAMES = 10
 
-    CONSUMER_QUEUE_MAX = 10
-
-    detection_args = read_yaml_config("configs/danger_detection/detector.yaml")
-
-    def generate_frame_telemetry_queue_object():
-        ts = time()
-        return CombinedFrameTelemetryQueueObject(
-            frame_id=int(ts*100),
-            frame=np.random.randint(0, 256, size=(720, 1280, 3), dtype=np.uint8),
-            telemetry=None,
-            timestamp=ts,
-            original_wh=(1920, 1080),
-        )
-
-    frame_telemetry_queue = mp.Queue()
-    stop_event = mp.Event()
     error_event = mp.Event()
 
-    out_queue = mp.Queue(maxsize=CONSUMER_QUEUE_MAX)
+    input_meta_queue = mp.Queue(maxsize=N_SLOTS)
+    input_frame_buffer = FrameBuffer(frame_shape=FRAME_SHAPE, n_slots=N_SLOTS)
 
-    producer = Producer(frame_telemetry_queue, error_event, generate_frame_telemetry_queue_object, frequency_hz=SLOW)
-    consumer = Consumer(out_queue, error_event, frequency_hz=SLOW)
+    output_meta_queue = mp.Queue(maxsize=N_SLOTS)
+    output_frame_buffer = FrameBuffer(frame_shape=FRAME_SHAPE, n_slots=N_SLOTS)
 
-    detector = DetectionWorker(frame_telemetry_queue, out_queue, error_event, detection_args)
+    config = DetectionWorkerConfig(
+        model_checkpoint="models/detector.pt",
+    )
 
-    print("CONSUMERS STARTED")
-    consumer.start()
+    worker = DetectionWorker(
+        input_meta_queue=input_meta_queue,
+        input_frame_buffer=input_frame_buffer,
+        output_meta_queue=output_meta_queue,
+        output_frame_buffer=output_frame_buffer,
+        error_event=error_event,
+        config=config,
+    )
 
-    sleep(3)
+    def producer_loop():
+        """Push fake frames into the input shared memory buffer."""
+        for i in range(N_FRAMES):
+            slot = input_frame_buffer.acquire()
+            if slot is not None:
+                frame = np.random.randint(0, 256, FRAME_SHAPE, dtype=np.uint8)
+                input_frame_buffer.write(slot, frame)
+                meta = CombinedSlotMetadata(
+                    frame_id=i,
+                    timestamp=time(),
+                    original_wh=(1920, 1080),
+                    slot_index=slot,
+                    telemetry=None,
+                )
+                try:
+                    input_meta_queue.put(meta, timeout=1.0)
+                except Exception:
+                    input_frame_buffer.release(slot)
+            sleep(1 / 10)
+        # Signal end-of-stream
+        input_meta_queue.put(POISON_PILL)
 
-    print("DETECTOR STARTED")
-    detector.start()
+    def consumer_loop():
+        """Drain the output queue and release output slots."""
+        frames_received = 0
+        while True:
+            try:
+                msg = output_meta_queue.get(timeout=10.0)
+            except Exception:
+                print("[Consumer] Timed out. Stopping.")
+                break
+            if isinstance(msg, str) and msg == POISON_PILL:
+                output_meta_queue.put(POISON_PILL)  # re-queue for any additional downstream consumers
+                print(f"[Consumer] Poison pill received. {frames_received} frames processed.")
+                break
+            if error_event.is_set():
+                break
+            assert isinstance(msg, DetectionSlotMetadata)
+            output_frame_buffer.release(msg.slot_index)
+            frames_received += 1
+            print(
+                f"[Consumer] frame_id={msg.frame_id} "
+                f"detections={len(msg.classes)} "
+                f"slot={msg.slot_index}"
+            )
 
-    sleep(3)
+    prod_thread = threading.Thread(target=producer_loop, daemon=True)
+    cons_thread = threading.Thread(target=consumer_loop, daemon=True)
 
-    print("PRODUCER STARTED")
-    producer.start()
+    print("[Main] Starting worker ...")
+    worker.start()
+    sleep(0.5)  # let the worker process fully start before feeding it
 
-    sleep(5)
+    print("[Main] Starting consumer ...")
+    cons_thread.start()
 
-    #print("PRODUCER STOPPED")
-    #producer.stop()
-    print("ERROR EVENT SET")
-    error_event.set()
+    print("[Main] Starting producer ...")
+    prod_thread.start()
 
-    sleep(5)
+    worker.join()
+    prod_thread.join(timeout=5.0)
+    cons_thread.join(timeout=5.0)
 
-    producer.join(timeout=5)
-    print("producer joined")
-
-    detector.join()
-    print("detector joined")
-
-    consumer.join()
-    print("consumer joined")
+    input_frame_buffer.unlink()
+    output_frame_buffer.unlink()
+    print("[Main] Done.")

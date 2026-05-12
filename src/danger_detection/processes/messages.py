@@ -3,6 +3,26 @@ from dataclasses import dataclass
 
 
 @dataclass
+class DetectionSlotMetadata:
+    """
+    Lightweight message carrying a shared-memory frame slot reference and detection results.
+    Passed between DetectionWorker and SegmentationWorker via the metadata queue.
+    The frame lives in a FrameBuffer slot; detection box arrays are small enough to carry directly.
+    """
+    frame_id: int
+    timestamp: float
+    original_wh: tuple[int, int]
+    slot_index: int
+    telemetry: dict | None
+    classes_names: dict           # {class_id: class_name} — fixed for the model lifetime
+    num_classes: int
+    classes: np.ndarray           # (N,) class IDs for each detection
+    boxes_centers: np.ndarray     # (N, 2) center coordinates
+    boxes_corner1: np.ndarray     # (N, 2) top-left corner coordinates
+    boxes_corner2: np.ndarray     # (N, 2) bottom-right corner coordinates
+
+
+@dataclass
 class DetectionResult:
     """
     A dataclass to store the results of an object detection task.
