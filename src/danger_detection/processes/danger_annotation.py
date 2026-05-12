@@ -97,28 +97,32 @@ class DangerAnnotationWorker(mp.Process):
     Computes the danger mask and intersection mask by intersecting per-animal safety
     circles with the five danger layers. Annotates the frame in-place with safety
     circles, danger/intersection overlays, detection boxes, and animal count. Upscales
-    the annotated frame to the original video resolution and writes it to the output
-    FrameBuffer (sized (original_H, original_W, 3)).
+    the annotated frame to the original video resolution.
 
-    The output metadata carries the alert message string (empty if no danger), which the
-    downstream alert writer uses to decide whether to dispatch a notification.
+    Fan-out: the annotated frame is written independently to two output FrameBuffers —
+    one for the alert writer and one for the video writer. Each consumer owns its slot
+    lifecycle (acquire/release) independently. A slot-acquire failure or a full metadata
+    queue on one output does not affect the other output.
 
     Termination:
     - Clean shutdown: POISON_PILL received from the input metadata queue is
-      propagated to the output metadata queue.
+      propagated to both output metadata queues.
     - Error shutdown: if error_event is set by any process, the loop stops
       immediately without flushing.
 
     Frame drop policy: if no output buffer slot is free (consumer too slow) or
-    the output metadata queue is full, the current frame is discarded.
+    the output metadata queue is full, the current frame is discarded for that
+    consumer only.
     """
 
     def __init__(
             self,
             input_meta_queue: mp.Queue,
             input_frame_buffer: FrameBuffer,
-            output_meta_queue: mp.Queue,
-            output_frame_buffer: FrameBuffer,  # must be sized (original_H, original_W, 3)
+            alert_output_meta_queue: mp.Queue,
+            alert_output_frame_buffer: FrameBuffer,  # must be sized (original_H, original_W, 3)
+            video_output_meta_queue: mp.Queue,
+            video_output_frame_buffer: FrameBuffer,  # must be sized (original_H, original_W, 3)
             error_event: multiprocessing.synchronize.Event,
             config: DangerAnnotationWorkerConfig,
     ):
@@ -127,8 +131,11 @@ class DangerAnnotationWorker(mp.Process):
         self.input_meta_queue = input_meta_queue
         self.input_frame_buffer = input_frame_buffer
 
-        self.output_meta_queue = output_meta_queue
-        self.output_frame_buffer = output_frame_buffer
+        self.alert_output_meta_queue = alert_output_meta_queue
+        self.alert_output_frame_buffer = alert_output_frame_buffer
+
+        self.video_output_meta_queue = video_output_meta_queue
+        self.video_output_frame_buffer = video_output_frame_buffer
 
         self.error_event = error_event
         self.config = config
@@ -240,39 +247,65 @@ class DangerAnnotationWorker(mp.Process):
                     interpolation=UPSAMPLING_MODE,
                 )
 
-                # ---- acquire an output slot and write the full-resolution annotated frame ----
-                out_slot = self.output_frame_buffer.acquire()
-                if out_slot is None:
-                    logger.warning(
-                        f"No free slot in output frame buffer. "
-                        f"Frame {meta.frame_id} discarded. Consumer too slow?"
-                    )
-                    continue
-
-                self.output_frame_buffer.write(out_slot, annotated_frame)
-
-                # ---- build and enqueue output metadata ----
-                out_meta = AnnotationSlotMetadata(
-                    frame_id=meta.frame_id,
-                    timestamp=meta.timestamp,
-                    slot_index=out_slot,
-                    alert_msg=alert_msg,
-                )
+                # ---- fan-out: write annotated frame to both consumers independently ----
 
                 append_start = time()
-                try:
-                    self.output_meta_queue.put(out_meta, timeout=self.config.queue_put_timeout)
-                    logger.debug(
-                        f"Frame {meta.frame_id} → output slot {out_slot}. "
-                        f"Danger: {alert_msg if danger_exists else 'none'}."
+
+                # -- Alert output --
+                alert_slot = self.alert_output_frame_buffer.acquire()
+                if alert_slot is None:
+                    logger.warning(
+                        f"No free slot in alert output frame buffer. "
+                        f"Frame {meta.frame_id} dropped for alert writer. Consumer too slow?"
                     )
-                except QueueFullException:
-                    # Return the output slot so it is not leaked
-                    self.output_frame_buffer.release(out_slot)
-                    logger.error(
-                        f"Output metadata queue full. Frame {meta.frame_id} discarded. "
-                        "Consumer too slow or stopped?"
+                else:
+                    self.alert_output_frame_buffer.write(alert_slot, annotated_frame)
+                    alert_meta = AnnotationSlotMetadata(
+                        frame_id=meta.frame_id,
+                        timestamp=meta.timestamp,
+                        slot_index=alert_slot,
+                        alert_msg=alert_msg,
                     )
+                    try:
+                        self.alert_output_meta_queue.put(alert_meta, timeout=self.config.queue_put_timeout)
+                        logger.debug(
+                            f"Frame {meta.frame_id} → alert slot {alert_slot}. "
+                            f"Danger: {alert_msg if danger_exists else 'none'}."
+                        )
+                    except QueueFullException:
+                        self.alert_output_frame_buffer.release(alert_slot)
+                        logger.error(
+                            f"Alert output metadata queue full. Frame {meta.frame_id} dropped for alert writer. "
+                            "Consumer too slow or stopped?"
+                        )
+
+                # -- Video output --
+                video_slot = self.video_output_frame_buffer.acquire()
+                if video_slot is None:
+                    logger.warning(
+                        f"No free slot in video output frame buffer. "
+                        f"Frame {meta.frame_id} dropped for video writer. Consumer too slow?"
+                    )
+                else:
+                    self.video_output_frame_buffer.write(video_slot, annotated_frame)
+                    video_meta = AnnotationSlotMetadata(
+                        frame_id=meta.frame_id,
+                        timestamp=meta.timestamp,
+                        slot_index=video_slot,
+                        alert_msg=alert_msg,
+                    )
+                    try:
+                        self.video_output_meta_queue.put(video_meta, timeout=self.config.queue_put_timeout)
+                        logger.debug(
+                            f"Frame {meta.frame_id} → video slot {video_slot}. "
+                            f"Danger: {alert_msg if danger_exists else 'none'}."
+                        )
+                    except QueueFullException:
+                        self.video_output_frame_buffer.release(video_slot)
+                        logger.error(
+                            f"Video output metadata queue full. Frame {meta.frame_id} dropped for video writer. "
+                            "Consumer too slow or stopped?"
+                        )
 
                 iter_end = time()
 
@@ -285,19 +318,23 @@ class DangerAnnotationWorker(mp.Process):
                 )
                 # iteration completed correctly, move on to process next frame
 
-            # Propagate termination signal via poison pill on clean shutdown.
+            # Propagate termination signal via poison pill on clean shutdown to both consumers.
             if not self.error_event.is_set():
-                try:
-                    logger.info("Attempting to put sentinel value on output queue ...")
-                    self.output_meta_queue.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
-                    logger.info("Sentinel value has been passed on to the next process.")
-                except Exception as e:
-                    logger.error(f"Error propagating Poison Pill: {e}")
-                    self.error_event.set()
-                    logger.warning(
-                        "Error event set: force-stop application since downstream processes "
-                        "are unable to receive the poison pill."
-                    )
+                for name, q in [
+                    ("alert", self.alert_output_meta_queue),
+                    ("video", self.video_output_meta_queue),
+                ]:
+                    try:
+                        logger.info(f"Attempting to put sentinel value on {name} output queue ...")
+                        q.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
+                        logger.info(f"Sentinel value passed to {name} output queue.")
+                    except Exception as e:
+                        logger.error(f"Error propagating Poison Pill to {name} output queue: {e}")
+                        self.error_event.set()
+                        logger.warning(
+                            "Error event set: force-stop application since downstream processes "
+                            "are unable to receive the poison pill."
+                        )
             else:
                 logger.info("Terminating and skipping Poison Pill sending. Error event is set.")
 
@@ -309,7 +346,8 @@ class DangerAnnotationWorker(mp.Process):
         finally:
 
             self.input_frame_buffer.close()
-            self.output_frame_buffer.close()
+            self.alert_output_frame_buffer.close()
+            self.video_output_frame_buffer.close()
 
             logger.info(
                 "Danger annotation process terminated successfully. "
@@ -335,16 +373,21 @@ if __name__ == "__main__":
     input_meta_queue = mp.Queue(maxsize=N_SLOTS)
     input_frame_buffer = FrameBuffer(frame_shape=STACKED_GEO_SHAPE, n_slots=N_SLOTS)
 
-    output_meta_queue = mp.Queue(maxsize=N_SLOTS)
-    output_frame_buffer = FrameBuffer(frame_shape=ANNOTATED_SHAPE, n_slots=N_SLOTS)
+    alert_output_meta_queue = mp.Queue(maxsize=N_SLOTS)
+    alert_output_frame_buffer = FrameBuffer(frame_shape=ANNOTATED_SHAPE, n_slots=N_SLOTS)
+
+    video_output_meta_queue = mp.Queue(maxsize=N_SLOTS)
+    video_output_frame_buffer = FrameBuffer(frame_shape=ANNOTATED_SHAPE, n_slots=N_SLOTS)
 
     config = DangerAnnotationWorkerConfig()
 
     worker = DangerAnnotationWorker(
         input_meta_queue=input_meta_queue,
         input_frame_buffer=input_frame_buffer,
-        output_meta_queue=output_meta_queue,
-        output_frame_buffer=output_frame_buffer,
+        alert_output_meta_queue=alert_output_meta_queue,
+        alert_output_frame_buffer=alert_output_frame_buffer,
+        video_output_meta_queue=video_output_meta_queue,
+        video_output_frame_buffer=video_output_frame_buffer,
         error_event=error_event,
         config=config,
     )
@@ -384,49 +427,60 @@ if __name__ == "__main__":
             sleep(1 / 10)
         input_meta_queue.put(POISON_PILL)
 
-    def consumer_loop():
-        """Drain the output queue and release output slots."""
-        frames_received = 0
-        while True:
-            try:
-                msg = output_meta_queue.get(timeout=10.0)
-            except Exception:
-                print("[Consumer] Timed out. Stopping.")
-                break
-            if isinstance(msg, str) and msg == POISON_PILL:
-                output_meta_queue.put(POISON_PILL)
-                print(f"[Consumer] Poison pill received. {frames_received} frames processed.")
-                break
-            if error_event.is_set():
-                break
-            assert isinstance(msg, AnnotationSlotMetadata)
-            annotated = output_frame_buffer.read(msg.slot_index)
-            output_frame_buffer.release(msg.slot_index)
-            frames_received += 1
-            print(
-                f"[Consumer] frame_id={msg.frame_id} "
-                f"annotated_shape={annotated.shape} "
-                f"alert='{msg.alert_msg}' "
-                f"slot={msg.slot_index}"
-            )
+    def make_consumer(name: str, out_meta_queue: mp.Queue, out_frame_buffer: FrameBuffer):
+        """Factory for a consumer thread draining one output queue."""
+        def consumer_loop():
+            frames_received = 0
+            while True:
+                try:
+                    msg = out_meta_queue.get(timeout=10.0)
+                except Exception:
+                    print(f"[{name}] Timed out. Stopping.")
+                    break
+                if isinstance(msg, str) and msg == POISON_PILL:
+                    print(f"[{name}] Poison pill received. {frames_received} frames processed.")
+                    break
+                if error_event.is_set():
+                    break
+                assert isinstance(msg, AnnotationSlotMetadata)
+                annotated = out_frame_buffer.read(msg.slot_index)
+                out_frame_buffer.release(msg.slot_index)
+                frames_received += 1
+                print(
+                    f"[{name}] frame_id={msg.frame_id} "
+                    f"annotated_shape={annotated.shape} "
+                    f"alert='{msg.alert_msg}' "
+                    f"slot={msg.slot_index}"
+                )
+        return consumer_loop
 
     prod_thread = threading.Thread(target=producer_loop, daemon=True)
-    cons_thread = threading.Thread(target=consumer_loop, daemon=True)
+    alert_cons_thread = threading.Thread(
+        target=make_consumer("AlertConsumer", alert_output_meta_queue, alert_output_frame_buffer),
+        daemon=True,
+    )
+    video_cons_thread = threading.Thread(
+        target=make_consumer("VideoConsumer", video_output_meta_queue, video_output_frame_buffer),
+        daemon=True,
+    )
 
     print("[Main] Starting worker ...")
     worker.start()
     sleep(0.5)
 
-    print("[Main] Starting consumer ...")
-    cons_thread.start()
+    print("[Main] Starting consumers ...")
+    alert_cons_thread.start()
+    video_cons_thread.start()
 
     print("[Main] Starting producer ...")
     prod_thread.start()
 
     worker.join()
     prod_thread.join(timeout=5.0)
-    cons_thread.join(timeout=5.0)
+    alert_cons_thread.join(timeout=5.0)
+    video_cons_thread.join(timeout=5.0)
 
     input_frame_buffer.unlink()
-    output_frame_buffer.unlink()
+    alert_output_frame_buffer.unlink()
+    video_output_frame_buffer.unlink()
     print("[Main] Done.")
