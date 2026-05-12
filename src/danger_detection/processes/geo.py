@@ -63,6 +63,11 @@ class GeoWorkerConfig(BaseModel):
     input_args: dict
     drone_args: dict
 
+    # Fallback animal body length used to estimate meters-per-pixel when telemetry is absent.
+    # The longer axis of each detection bbox is assumed to correspond to this length.
+    # Default: 1.3 m (median adult domestic sheep).
+    animal_reference_size_m: PositiveFloat = 1.3
+
     queue_get_timeout: PositiveFloat = MODELS_QUEUE_GET_TIMEOUT
     queue_put_timeout: PositiveFloat = MODELS_QUEUE_PUT_TIMEOUT
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
@@ -175,14 +180,46 @@ class GeoWorker(mp.Process):
                 predict_start = time()
 
                 if meta.telemetry is None:
-                    logger.warning(
-                        f"Frame {meta.frame_id}: no telemetry available. "
-                        "Geo analysis skipped — assuming no geo danger (zero masks)."
-                    )
-                    safety_radius_pixels = -1
+                    # No telemetry: DEM/geofencing/slope analysis cannot be performed.
+                    # Zero masks are used for those layers.
+                    # Safety radius is estimated from detection bboxes if any are present:
+                    # the longer axis of each bbox is assumed to equal animal_reference_size_m,
+                    # giving a per-frame meters-per-pixel estimate via the median across all detections.
+                    # If no detections are present, safety_radius_pixels stays at -1 (no danger reported).
                     nodata_dem_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
                     geofencing_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
                     slope_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+
+                    if len(meta.classes) > 0:
+                        # max(width, height) of each bbox — longer axis approximates body length
+                        bbox_widths = np.abs(meta.boxes_corner2[:, 0] - meta.boxes_corner1[:, 0])
+                        bbox_heights = np.abs(meta.boxes_corner2[:, 1] - meta.boxes_corner1[:, 1])
+                        median_max_dim_px = float(np.median(np.maximum(bbox_widths, bbox_heights)))
+
+                        if median_max_dim_px > 0:
+                            meters_per_pixel_est = self.config.animal_reference_size_m / median_max_dim_px
+                            safety_radius_pixels = int(
+                                self.config.input_args["safety_radius_m"] / meters_per_pixel_est
+                            )
+                            logger.warning(
+                                f"Frame {meta.frame_id}: no telemetry — safety radius estimated from "
+                                f"{len(meta.classes)} bbox(es). "
+                                f"Median max bbox dim: {median_max_dim_px:.1f} px, "
+                                f"estimated meters/px: {meters_per_pixel_est:.4f}, "
+                                f"safety radius: {safety_radius_pixels} px."
+                            )
+                        else:
+                            safety_radius_pixels = -1
+                            logger.warning(
+                                f"Frame {meta.frame_id}: no telemetry and bbox dimensions are zero. "
+                                "Safety radius set to -1 — no danger will be reported."
+                            )
+                    else:
+                        safety_radius_pixels = -1
+                        logger.warning(
+                            f"Frame {meta.frame_id}: no telemetry and no detections. "
+                            "Safety radius set to -1 — no danger will be reported."
+                        )
 
                 else:
                     # load frame flight data
