@@ -13,7 +13,7 @@ from typing import Optional
 import multiprocessing as mp
 from aiomqtt import Client, TLSParameters
 from aiomqtt.exceptions import MqttError
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, PositiveFloat, PositiveInt, field_validator
 
 from src.shared.processes.constants import (
     FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
@@ -62,38 +62,24 @@ class FrameTelemetryCombinerConfig(BaseModel):
     mqtt_username: Optional[str] = None
     mqtt_password: Optional[str] = None
     mqtt_qos_level: int = TELEMETRY_LISTENER_QOS_LEVEL
-    mqtt_max_msg_wait_s: float = TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT
-    mqtt_reconnect_delay_s: float = TELEMETRY_LISTENER_RECONNECT_DELAY
+    mqtt_max_msg_wait_s: PositiveFloat = TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT
+    mqtt_reconnect_delay_s: PositiveFloat = TELEMETRY_LISTENER_RECONNECT_DELAY
     mqtt_ca_certs_path: Optional[str] = None          # required for MQTTS
     mqtt_cert_validation: Optional[int] = TELEMETRY_LISTENER_CERT_VALIDATION
-    mqtt_max_incoming_messages: int = TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES
+    mqtt_max_incoming_messages: PositiveInt = TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES
 
     # Telemetry–frame timestamp matching
-    telemetry_buffer_max_size: int = FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE
-    max_time_diff_s: float = FRAMETELCOMB_MAX_TIME_DIFF
+    telemetry_buffer_max_size: PositiveInt = FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE
+    max_time_diff_s: PositiveFloat = FRAMETELCOMB_MAX_TIME_DIFF
 
     # Input queue
-    queue_get_timeout: float = FRAMETELCOMB_QUEUE_GET_TIMEOUT
+    queue_get_timeout: PositiveFloat = FRAMETELCOMB_QUEUE_GET_TIMEOUT
 
     # Output queue
-    queue_put_timeout: float = FRAMETELCOMB_QUEUE_PUT_TIMEOUT
+    queue_put_timeout: PositiveFloat = FRAMETELCOMB_QUEUE_PUT_TIMEOUT
 
     # Shutdown
-    poison_pill_timeout: float = POISON_PILL_TIMEOUT
-
-    @field_validator(
-        'mqtt_max_msg_wait_s',
-        'mqtt_reconnect_delay_s',
-        'max_time_diff_s',
-        'queue_get_timeout',
-        'queue_put_timeout',
-        'poison_pill_timeout',
-    )
-    @classmethod
-    def must_be_positive(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError(f"must be positive, got {v}")
-        return v
+    poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
     @field_validator('mqtt_qos_level')
     @classmethod
@@ -102,12 +88,6 @@ class FrameTelemetryCombinerConfig(BaseModel):
             raise ValueError(f"QoS level must be 0, 1, or 2, got {v}")
         return v
 
-    @field_validator('telemetry_buffer_max_size', 'mqtt_max_incoming_messages')
-    @classmethod
-    def must_be_positive_int(cls, v: int) -> int:
-        if v <= 0:
-            raise ValueError(f"must be a positive integer, got {v}")
-        return v
 
 
 class FrameTelemetryCombiner(mp.Process):

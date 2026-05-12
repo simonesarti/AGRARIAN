@@ -5,7 +5,7 @@ import logging
 from time import time, sleep
 from queue import Full as QueueFullException
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, PositiveFloat, PositiveInt, field_validator
 
 from src.shared.processes.frame_buffer import FrameBuffer
 from src.shared.processes.messages import FrameSlotMetadata
@@ -44,47 +44,22 @@ class StreamVideoReaderConfig(BaseModel):
     video_stream_url: str
 
     # Connection
-    connect_open_timeout_s: float = VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S
-    connect_retry_delay_s: float = VIDEO_STREAM_READER_RECONNECT_DELAY
-    connect_max_consecutive_failures: int = VIDEO_STREAM_READER_MAX_CONSECUTIVE_CONNECTION_FAILURES
+    connect_open_timeout_s: PositiveFloat = VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S
+    connect_retry_delay_s: PositiveFloat = VIDEO_STREAM_READER_RECONNECT_DELAY
+    connect_max_consecutive_failures: PositiveInt = VIDEO_STREAM_READER_MAX_CONSECUTIVE_CONNECTION_FAILURES
 
     # Frame reading
-    frame_read_timeout_s: float = VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S
-    frame_read_retry_delay_s: float = VIDEO_STREAM_READER_FRAME_RETRY_DELAY
-    frame_read_max_consecutive_failures: int = VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES
+    frame_read_timeout_s: PositiveFloat = VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S
+    frame_read_retry_delay_s: PositiveFloat = VIDEO_STREAM_READER_FRAME_RETRY_DELAY
+    frame_read_max_consecutive_failures: PositiveInt = VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES
 
     # Processing
-    expected_aspect_ratio: float = VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO
+    expected_aspect_ratio: PositiveFloat = VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO
     processing_shape: tuple[int, int] = VIDEO_STREAM_READER_PROCESSING_SHAPE  # (W, H)
 
     # Output
-    meta_queue_put_timeout: float = VIDEO_STREAM_READER_QUEUE_PUT_TIMEOUT
-    poison_pill_timeout: float = POISON_PILL_TIMEOUT
-
-    @field_validator(
-        'connect_open_timeout_s',
-        'connect_retry_delay_s',
-        'frame_read_timeout_s',
-        'frame_read_retry_delay_s',
-        'meta_queue_put_timeout',
-        'poison_pill_timeout',
-        'expected_aspect_ratio',
-    )
-    @classmethod
-    def must_be_positive(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError(f"must be positive, got {v}")
-        return v
-
-    @field_validator(
-        'connect_max_consecutive_failures',
-        'frame_read_max_consecutive_failures',
-    )
-    @classmethod
-    def must_be_positive_int(cls, v: int) -> int:
-        if v <= 0:
-            raise ValueError(f"must be a positive integer, got {v}")
-        return v
+    meta_queue_put_timeout: PositiveFloat = VIDEO_STREAM_READER_QUEUE_PUT_TIMEOUT
+    poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
     @field_validator('processing_shape')
     @classmethod
