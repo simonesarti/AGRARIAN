@@ -41,17 +41,9 @@ venv/
 
 # Project specific directories
 assets/
-certificates/
-data/
-dev/
-docker/
 experiments/
 outputs/
-pyscripts/
-shscripts/
-simulation/
 tests/
-postgres_data/
 
 # - exclude partially
 checkpoints/*/
@@ -69,7 +61,6 @@ src/*/
 
 
 # Project specific files
-.pre-commit-config.yaml
 README.md
 *.py
 *.sh
