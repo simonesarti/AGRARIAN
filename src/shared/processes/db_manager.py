@@ -42,6 +42,7 @@ flights
 flight_id (PK)
 user_id (FK → users.user_id)
 start_time
+stream_url  # Video stream URL, set once the video writer starts
 
 ------
 alerts
@@ -96,6 +97,7 @@ class Flight(Base):
     flight_id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey('users.user_id'), nullable=False)
     start_time = Column(DateTime, default=datetime.now(timezone.utc))
+    stream_url = Column(String, nullable=True)  # Set once the video writer starts
 
     # Relationships: One Flight is associated to a single User
     user = relationship("User", back_populates="flights")
@@ -226,6 +228,30 @@ class DatabaseManager:
         self._worker_thread.start()
         logger.info("Database manager and worker thread initialized")
 
+    def set_stream_url(self, url: str) -> bool:
+        """
+        Update the stream_url field on the current flight record.
+        Called once the video writer has started and the URL is known.
+        Returns True on success, False if DB is not initialised or the update fails.
+        """
+        if self._db_engine is None:
+            return False
+
+        SessionFactory = sessionmaker(bind=self._db_engine)
+        try:
+            with SessionFactory() as session:
+                flight = session.get(Flight, self.flight_id)
+                if flight is None:
+                    logger.error(f"Flight {self.flight_id} not found; cannot set stream URL.")
+                    return False
+                flight.stream_url = url
+                session.commit()
+                logger.info(f"Flight {self.flight_id} stream URL set to: {url}")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to set stream URL for flight {self.flight_id}: {e}")
+            return False
+
     def save_alert(self, **kwargs) -> bool:
         """
         Asynchronously queue an alert to be saved to the database.
@@ -304,7 +330,7 @@ class DatabaseManager:
                         f"Frame id: {alert_params['frame_id']}, "
                         f"msg: {alert_params['alert_msg']}"
                     )
-            except (SQLAlchemyError, Exception) as e:
+            except Exception as e:
                 # session.rollback() is handled automatically by the 'with' block if the error happened inside it.
                 logger.error(f"DB Worker error for frame {alert_params.get('frame_id')}: {e}")
             finally:
