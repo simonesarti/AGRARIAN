@@ -3,10 +3,21 @@ import time
 import logging
 import shutil
 import multiprocessing as mp
-from src.shared.processes.constants import *
+import multiprocessing.synchronize
 from queue import Empty as QueueEmptyException
+from typing import Optional
+from pydantic import BaseModel, PositiveFloat, PositiveInt
+
+from src.shared.processes.constants import (
+    VIDEO_OUT_STORE_DELETE_LOCAL_ON_SUCCESS,
+    VIDEO_OUT_STORE_QUEUE_GET_TIMEOUT,
+    VIDEO_OUT_STORE_MAX_UPLOAD_RETRIES,
+    VIDEO_OUT_STORE_RETRY_BACKOFF_TIME,
+)
+
 
 # ================================================================
+
 logger = logging.getLogger("main.video_out.storage")
 
 if not logger.handlers:  # Avoid duplicate handlers
@@ -15,186 +26,272 @@ if not logger.handlers:  # Avoid duplicate handlers
     logger.addHandler(video_handler)
     logger.setLevel(logging.DEBUG)
 
-
 # ================================================================
+
+
+class VideoPersistenceProcessConfig(BaseModel):
+    """Base configuration for VideoPersistenceProcess."""
+
+    queue_get_timeout: PositiveFloat = VIDEO_OUT_STORE_QUEUE_GET_TIMEOUT
+    max_retries: PositiveInt = VIDEO_OUT_STORE_MAX_UPLOAD_RETRIES
+    retry_backoff_s: PositiveFloat = VIDEO_OUT_STORE_RETRY_BACKOFF_TIME
+    delete_local_on_success: bool = VIDEO_OUT_STORE_DELETE_LOCAL_ON_SUCCESS
+
+
+class AzureBlobStorageConfig(VideoPersistenceProcessConfig):
+    """Config for Azure Blob Storage uploads."""
+
+    connection_string: str
+    container_name: str
+    blob_prefix: str = ""       # Optional subfolder inside the container
+
+
+class S3StorageConfig(VideoPersistenceProcessConfig):
+    """Config for AWS S3 uploads."""
+
+    bucket_name: str
+    key_prefix: str = ""        # Optional subfolder inside the bucket
+    # Credentials — if None, boto3 falls back to env vars / IAM role
+    aws_access_key_id: Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
+    region_name: Optional[str] = None
+
+
+class LocalStorageConfig(VideoPersistenceProcessConfig):
+    """Config for local-copy 'uploads' (testing / no-cloud fallback)."""
+
+    target_directory: str
+
 
 class VideoPersistenceProcess(mp.Process):
     """
-    Dedicated process that waits for video file paths from a queue and
-    uploads them to remote storage.
+    Terminal process in the video saving branch.
+
+    Waits for a single value from VideoProducerProcess via input_queue:
+    - str  : path to the locally saved video file → upload it
+    - None : video save failed upstream → skip upload and exit
+
+    The process polls the queue at queue_get_timeout intervals so it can
+    react to error_event being set by another process while waiting. Once
+    a value is received (or the error_event fires), the process exits.
+    No poison pill needed — this is a run-once process.
+
+    Subclasses implement _upload_file() for their specific storage backend.
     """
 
     def __init__(
             self,
             input_queue: mp.Queue,
-            storage_url: str,
-            delete_local_on_success: bool = VIDEO_OUT_STORE_DELETE_LOCAL_ON_SUCCESS,
-            queue_get_timeout: float = VIDEO_OUT_STORE_QUEUE_GET_TIMEOUT,
-            max_retries: int = VIDEO_OUT_STORE_MAX_UPLOAD_RETRIES,
-            retry_backoff: float = VIDEO_OUT_STORE_RETRY_BACKOFF_TIME,
+            error_event: multiprocessing.synchronize.Event,
+            config: VideoPersistenceProcessConfig,
     ):
         super().__init__()
         self.input_queue = input_queue
-        self.storage_url = storage_url
-        self.delete_local_on_success = delete_local_on_success
-        self.queue_get_timeout = queue_get_timeout
-        self.max_retries = max_retries
-        self.retry_backoff = retry_backoff
-
+        self.error_event = error_event
+        self.config = config
         self.work_finished = mp.Event()
-        
-    def _cleanup_local_file(self, video_file_path: str):
-        """Safely removes the local file on upload success, if configured to do so."""
-        if self.delete_local_on_success:
-            try:
-                if os.path.exists(video_file_path):
-                    os.remove(video_file_path)
-                    logger.info(f"Successfully deleted local file: {video_file_path}")
-            except OSError as e:
-                logger.error(f"Could not delete local file {video_file_path}: {e}")
 
-    def _upload_file(self, file: str, url: str) -> bool:
-        """
-        Abstract method for service-specific storage logic.
-        Should return True on success, False on failure.
-        """
-        # This depends on the service used to store the video (Azure, S3, etc.)
-        raise NotImplementedError("No service-specific upload logic implemented.")
-    
-    def _run_upload_routine(self, video_file_path: str):
-        """
-        Try to perform the upload with constant backoff.
-        """
-        
+    def _upload_file(self, file_path: str) -> bool:
+        """Upload file to storage backend. Returns True on success, False on failure."""
+        raise NotImplementedError("Subclasses must implement _upload_file().")
+
+    def _cleanup_local_file(self, video_file_path: str) -> None:
+        """Delete the local file after a successful upload, if configured to do so."""
+        if self.config.delete_local_on_success:
+            try:
+                os.remove(video_file_path)
+                logger.info(f"Local file deleted: {video_file_path}")
+            except OSError as e:
+                logger.error(f"Could not delete local file '{video_file_path}': {e}")
+
+    def _run_upload_routine(self, video_file_path: str) -> None:
+        """Attempt the upload with retries and constant backoff."""
         if not os.path.exists(video_file_path):
-            logger.error(f"Upload aborted: Local file {video_file_path} not found.")
+            logger.error(f"Upload aborted: file not found at '{video_file_path}'.")
             return
 
-        attempt = 0
-        success = False
-
-        while attempt < self.max_retries:
-
+        for attempt in range(1, self.config.max_retries + 1):
             try:
-                logger.info(f"Starting upload attempt {attempt + 1}/{self.max_retries}...")
-                success = self._upload_file(file=video_file_path, url=self.storage_url)
-
-                if success:
-                    logger.info(f"Remote upload complete: {self.storage_url}")
+                logger.info(f"Upload attempt {attempt}/{self.config.max_retries} ...")
+                if self._upload_file(video_file_path):
+                    logger.info(f"Upload complete: '{video_file_path}'.")
                     self._cleanup_local_file(video_file_path)
-                    break
-                else:
-                    logger.warning(f"Storage service returned failure for {video_file_path}")
-
+                    return
+                logger.warning(f"Upload attempt #{attempt} failed.")
             except Exception as e:
-                logger.error(f"Unexpected error during upload attempt {attempt + 1}: {e}")
+                logger.error(f"Upload attempt #{attempt} raised: {e}", exc_info=True)
 
-            attempt += 1
-            if attempt < self.max_retries:
-                logger.info(f"Retrying upload in {self.retry_backoff} seconds...")
-                time.sleep(self.retry_backoff)
+            if attempt < self.config.max_retries:
+                logger.info(f"Retrying in {self.config.retry_backoff_s} seconds ...")
+                time.sleep(self.config.retry_backoff_s)
 
-        if not success:
-            logger.error(
-                f"Failed to persist {video_file_path} after {self.max_retries} attempts. "
-                "Local file is preserved for manual recovery."
-            )
+        logger.error(
+            f"Failed to upload '{video_file_path}' after {self.config.max_retries} attempt(s). "
+            "Local file preserved for manual recovery."
+        )
 
     def run(self):
-        """
-        Process entry point. 
-        Loops until a poison pill is received.
-        """
-
-        logger.info("VideoPersistenceProcess started and waiting for tasks...")
+        logger.info("VideoPersistenceProcess started.")
 
         try:
-
-            while True:
-
+            # Poll until a message arrives or another process signals an error
+            message = None
+            while not self.error_event.is_set():
                 try:
-                    message = self.input_queue.get(timeout=self.queue_get_timeout)
-                except QueueEmptyException:
-                    logger.debug("No upload tasks in queue, continuing to wait...")
-                    continue
-
-                if isinstance(message, str) and message == POISON_PILL:
-                    logger.info("Poison pill received. Shutting down Persistence Process.")
+                    message = self.input_queue.get(timeout=self.config.queue_get_timeout)
                     break
+                except QueueEmptyException:
+                    logger.debug("Waiting for video path from VideoProducerProcess ...")
 
-                # If message is not a pill, it's the locally saved video path
-                logger.info(f"Received upload task for: {message}")
-                self._run_upload_routine(message)
+            if self.error_event.is_set():
+                logger.info("Error event set by another process. Exiting without upload.")
+                return
+
+            if message is None:
+                logger.info("Received None: video save failed upstream. No upload to perform.")
+                return
+
+            if not isinstance(message, str):
+                logger.error(f"Unexpected message type {type(message).__name__}. Exiting.")
+                return
+
+            logger.info(f"Received upload task for: '{message}'")
+            self._run_upload_routine(message)
 
         except Exception as e:
-            logger.error(
-                f"Critical error in Persistence Process loop: {e}. Terminating process.",
-                exc_info=True,
-            )
-        
+            logger.critical(f"Critical error in VideoPersistenceProcess: {e}", exc_info=True)
+            self.error_event.set()
+
         finally:
-            logger.info("VideoPersistenceProcess terminated gracefully.")
+            logger.info("VideoPersistenceProcess terminated.")
             self.work_finished.set()
 
 
+class AzureBlobStoragePersistenceProcess(VideoPersistenceProcess):
+    """Uploads video files to Azure Blob Storage using azure-storage-blob."""
 
-class LocalCopyVideoPersistenceProcess(VideoPersistenceProcess):
-    """
-    VideoPersistenceProcess implementation that saves files to a local directory.
-    """
+    def __init__(
+            self, 
+            input_queue: mp.Queue, 
+            error_event: multiprocessing.synchronize.Event,
+            config: AzureBlobStorageConfig,
+        ):
+        super().__init__(input_queue, error_event, config)
+        self.config: AzureBlobStorageConfig
 
-    def _upload_file(self, file: str, url: str) -> bool:
-        """
-        Local copy implementation of the upload routine.
-        Simply moves the file to the target directory.
-        """
-
-        time.sleep(5)  # Simulate some delay
-
+    def _upload_file(self, file_path: str) -> bool:
         try:
-            target_path = os.path.join(url, os.path.basename(file))
-            shutil.copy2(file, target_path)
-            logger.info(f"File copied to local storage: {target_path}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to copy file {file} to {url}: {e}")
+            from azure.storage.blob import BlobServiceClient
+        except ImportError:
+            logger.error(
+                "azure-storage-blob is not installed. "
+                "Run: pip install azure-storage-blob"
+            )
             return False
+
+        blob_name = os.path.basename(file_path)
+        if self.config.blob_prefix:
+            blob_name = f"{self.config.blob_prefix.rstrip('/')}/{blob_name}"
+
+        client = BlobServiceClient.from_connection_string(self.config.connection_string)
+        container = client.get_container_client(self.config.container_name)
+
+        with open(file_path, "rb") as data:
+            container.upload_blob(name=blob_name, data=data, overwrite=True)
+
+        logger.info(
+            f"Uploaded to Azure Blob Storage: "
+            f"container='{self.config.container_name}', blob='{blob_name}'"
+        )
+        return True
+
+
+class S3StoragePersistenceProcess(VideoPersistenceProcess):
+    """Uploads video files to AWS S3 using boto3."""
+
+    def __init__(
+            self, 
+            input_queue: mp.Queue, 
+            error_event: multiprocessing.synchronize.Event,
+            config: S3StorageConfig,
+        ):
+        super().__init__(input_queue, error_event, config)
+        self.config: S3StorageConfig
+
+    def _upload_file(self, file_path: str) -> bool:
+        try:
+            import boto3
+        except ImportError:
+            logger.error(
+                "boto3 is not installed. "
+                "Run: pip install boto3"
+            )
+            return False
+
+        key = os.path.basename(file_path)
+        if self.config.key_prefix:
+            key = f"{self.config.key_prefix.rstrip('/')}/{key}"
+
+        session = boto3.Session(
+            aws_access_key_id=self.config.aws_access_key_id,
+            aws_secret_access_key=self.config.aws_secret_access_key,
+            region_name=self.config.region_name,
+        )
+        s3 = session.client("s3")
+        # upload_file handles multipart uploads automatically for large files
+        s3.upload_file(file_path, self.config.bucket_name, key)
+
+        logger.info(
+            f"Uploaded to S3: s3://{self.config.bucket_name}/{key}"
+        )
+        return True
+
+
+class LocalStoragePersistenceProcess(VideoPersistenceProcess):
+    """Copies video files to a local directory (testing / no-cloud fallback)."""
+
+    def __init__(
+            self, 
+            input_queue: mp.Queue, 
+            error_event: multiprocessing.synchronize.Event,
+            config: LocalStorageConfig,
+        ):
+        super().__init__(input_queue, error_event, config)
+        self.config: LocalStorageConfig
+
+    def _upload_file(self, file_path: str) -> bool:
+        os.makedirs(self.config.target_directory, exist_ok=True)
+        target_path = os.path.join(self.config.target_directory, os.path.basename(file_path))
+        shutil.copy2(file_path, target_path)
+        logger.info(f"File copied to local storage: '{target_path}'")
+        return True
 
 
 if __name__ == "__main__":
 
-    import multiprocessing as mp
-    import time
+    import tempfile
 
-    # Example usage of LocalCopyVideoPersistenceProcess
-    input_queue = mp.Queue(maxsize=MAX_SIZE_VIDEO_STORAGE)
-    storage_directory = "./local_video_storage"
+    # Create a temporary source file to simulate a saved video
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        f.write(b"dummy video content")
+        dummy_video_path = f.name
 
-    # Ensure the storage directory exists
-    os.makedirs(storage_directory, exist_ok=True)
+    target_dir = tempfile.mkdtemp()
+    input_queue = mp.Queue(maxsize=2)
+    error_event = mp.Event()
 
-    video_persistence_process = LocalCopyVideoPersistenceProcess(
+    config = LocalStorageConfig(target_directory=target_dir)
+    process = LocalStoragePersistenceProcess(
         input_queue=input_queue,
-        storage_url=storage_directory,
+        error_event=error_event,
+        config=config,
     )
 
-    video_persistence_process.start()
+    process.start()
+    input_queue.put(dummy_video_path)
+    process.join(timeout=10)
 
-    # Simulate adding video files to the queue
-    for i in range(5):
-        fake_video_path = f"./video_{i}.mp4"
-        # Create a dummy file to simulate a video file
-        with open(fake_video_path, 'w') as f:
-            f.write("This is a dummy video file.\n")
-        input_queue.put(fake_video_path, timeout=1.0)
-        print(f"Enqueued {fake_video_path} for upload.")
-        time.sleep(1)
-
-
-    # Send poison pill to terminate the process
-    time.sleep(2)
-    input_queue.put(POISON_PILL)
-
-    # Wait for the process to finish
-    video_persistence_process.join()
-    print("Video persistence process has terminated.")
+    print(f"Source: {dummy_video_path}")
+    print(f"Target dir: {target_dir}")
+    print(f"Error event set: {error_event.is_set()}")
+    print(f"Work finished: {process.work_finished.is_set()}")
