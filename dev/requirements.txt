@@ -14,7 +14,8 @@ Pillow
 pyYAML
 pytest
 pytest-cov
-python-dotenv
+pydantic
+pydantic-settings
 ray[tune]
 rasterio
 requests
