@@ -134,9 +134,8 @@ class VideoStreamManager:
         while self.running:
 
             try:
-                # Launcc FFMPEG process
+                # Launch FFmpeg process
                 logger.info(
-                    f"Streamer thread has not been stopped yet. "
                     f"Attempting to connect to {self.mediaserver_url}"
                 )
                 self._ffmpeg_process = subprocess.Popen(
@@ -198,19 +197,21 @@ class VideoStreamManager:
     def _finalize_ffmpeg(self):
         """Internal routine to close the pipe and wait for process exit."""
         if self._ffmpeg_process:
-            logger.info("Draining complete. Closing FFmpeg pipe...")
+            logger.info("Closing FFmpeg pipe ...")
             try:
                 if self._ffmpeg_process.stdin:
                     self._ffmpeg_process.stdin.close()
-
-                # Wait for FFmpeg to wrap up the FLV container
+            except Exception as e:
+                logger.error(f"Error closing FFmpeg stdin: {e}")
+            # Always wait, even if stdin.close() raised, to avoid zombie processes
+            try:
                 self._ffmpeg_process.wait(timeout=self.ffmpeg_shutdown_timeout)
                 logger.info("FFmpeg process exited cleanly.")
             except subprocess.TimeoutExpired:
                 logger.warning("FFmpeg did not exit in time. Forcing termination.")
                 self._ffmpeg_process.kill()
             except Exception as e:
-                logger.error(f"Error during FFmpeg shutdown: {e}")
+                logger.error(f"Error waiting for FFmpeg to exit: {e}")
 
     def start(self) -> bool:
         """
