@@ -149,7 +149,7 @@ def main():
         frame_read_timeout_s=s.video_stream_reader_frame_read_timeout_s,
         frame_read_retry_delay_s=s.video_stream_reader_frame_retry_delay,
         frame_read_max_consecutive_failures=s.video_stream_reader_frame_max_consecutive_failures,
-        meta_queue_put_timeout=s.video_stream_reader_queue_put_timeout,
+        queue_timeout=s.pipeline_queue_timeout,
         poison_pill_timeout=s.poison_pill_timeout,
     )
 
@@ -170,22 +170,19 @@ def main():
         mqtt_max_incoming_messages=s.telemetry_listener_max_incoming_messages,
         telemetry_buffer_max_size=s.frametelcomb_max_telem_buffer_size,
         max_time_diff_s=s.frametelcomb_max_time_diff,
-        queue_get_timeout=s.frametelcomb_queue_get_timeout,
-        queue_put_timeout=s.frametelcomb_queue_put_timeout,
+        queue_timeout=s.pipeline_queue_timeout,
         poison_pill_timeout=s.poison_pill_timeout,
     )
 
     # Model configs are loaded from YAML; Pydantic validates checkpoint path etc.
     detection_config    = DetectionWorkerConfig(
         **detection_args,
-        queue_get_timeout=s.models_queue_get_timeout,
-        queue_put_timeout=s.models_queue_put_timeout,
+        queue_timeout=s.pipeline_queue_timeout,
         poison_pill_timeout=s.poison_pill_timeout,
     )
     segmentation_config = SegmentationWorkerConfig(
         **segmentation_args,
-        queue_get_timeout=s.models_queue_get_timeout,
-        queue_put_timeout=s.models_queue_put_timeout,
+        queue_timeout=s.pipeline_queue_timeout,
         poison_pill_timeout=s.poison_pill_timeout,
     )
 
@@ -204,14 +201,12 @@ def main():
             "sensor_width_pixels":  s.drone_sensor_width_pixels,
             "sensor_height_pixels": s.drone_sensor_height_pixels,
         },
-        queue_get_timeout=s.models_queue_get_timeout,
-        queue_put_timeout=s.models_queue_put_timeout,
+        queue_timeout=s.pipeline_queue_timeout,
         poison_pill_timeout=s.poison_pill_timeout,
     )
 
     danger_annotation_config = DangerAnnotationWorkerConfig(
-        queue_get_timeout=s.annotation_queue_get_timeout,
-        queue_put_timeout=s.annotation_queue_put_timeout,
+        queue_timeout=s.pipeline_queue_timeout,
         poison_pill_timeout=s.poison_pill_timeout,
     )
 
@@ -244,11 +239,10 @@ def main():
 
     video_producer_config = VideoProducerProcessConfig(
         fps=s.fps,
-        queue_get_timeout=s.video_writer_get_frame_timeout,
+        queue_timeout=s.pipeline_queue_timeout,
         video_output_dir=str(output_dir),
         media_server_url=s.video_out_stream_url,
         stream_manager_queue_max_size=s.max_size_video_stream,
-        stream_manager_queue_get_timeout=s.video_out_stream_queue_get_timeout,
         stream_manager_ffmpeg_startup_timeout=s.video_out_stream_ffmpeg_startup_timeout,
         stream_manager_ffmpeg_shutdown_timeout=s.video_out_stream_ffmpeg_shutdown_timeout,
         stream_manager_startup_timeout=s.video_out_stream_startup_timeout,

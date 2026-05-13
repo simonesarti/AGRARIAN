@@ -8,7 +8,7 @@ import numpy as np
 from src.shared.processes.constants import (
     FPS,
     MAX_SIZE_VIDEO_STREAM,
-    VIDEO_OUT_STREAM_QUEUE_GET_TIMEOUT,
+    PIPELINE_QUEUE_TIMEOUT,
     VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT,    # 0.5
     VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,    # 8.0
     VIDEO_OUT_STREAM_STARTUP_TIMEOUT,           # 2.0
@@ -32,7 +32,7 @@ class VideoStreamManager:
             mediaserver_url: str,
             fps: int = FPS,
             queue_max_size: int = MAX_SIZE_VIDEO_STREAM,
-            queue_get_timeout: float = VIDEO_OUT_STREAM_QUEUE_GET_TIMEOUT,
+            queue_get_timeout: float = PIPELINE_QUEUE_TIMEOUT,
             ffmpeg_startup_timeout: float = VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT,
             ffmpeg_shutdown_timeout: float = VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,
             startup_timeout: float = VIDEO_OUT_STREAM_STARTUP_TIMEOUT,

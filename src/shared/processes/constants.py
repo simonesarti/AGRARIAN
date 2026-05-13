@@ -157,7 +157,6 @@ VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO = 16.0/9.0
 VIDEO_STREAM_READER_PROCESSING_SHAPE = (1280, 720)  # (W,H)
 VIDEO_STREAM_READER_ORIGINAL_SHAPE = (1920, 1080)   # (W,H) expected original resolution for output buffer pre-allocation
 
-VIDEO_STREAM_READER_QUEUE_PUT_TIMEOUT = 0.02                              # 20 ms
 
 
 # -------------------------- TELEMETRY READER --------------------------
@@ -215,19 +214,20 @@ TELEMETRY_LISTENER_TEMPLATE_TELEMETRY = {
 # -------------------------------------------------------------------
 FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE = MAX_SIZE_TELEMETRY_READER_OUT * 2    # double process input queue
 FRAMETELCOMB_MAX_TIME_DIFF = 0.15                   # 150 ms
-FRAMETELCOMB_QUEUE_GET_TIMEOUT = 0.01               # 10 ms
-FRAMETELCOMB_QUEUE_PUT_TIMEOUT = 0.01               # 10 ms
 FRAMETELCOMB_QUEUE_PUT_MAX_RETRIES = 3              # 3
 FRAMETELCOMB_QUEUE_PUT_BACKOFF = 0.005              # 5 ms  (15 ms over 3 retries)
 
 # -------------------------------------------------------------------
+# -------------------------- PIPELINE QUEUE TIMEOUT -----------------
+# -------------------------------------------------------------------
+# Single timeout used by all hot-path stages (stream reader, combiner,
+# models, annotation, video writer, video streamer) for both get and put
+# blocking calls. Controls shutdown responsiveness, not correctness.
+PIPELINE_QUEUE_TIMEOUT = 0.01                       # 10 ms
+
+# -------------------------------------------------------------------
 # -------------------------- MODELS & ANNOTATIONS -------------------
 # -------------------------------------------------------------------
-MODELS_QUEUE_GET_TIMEOUT = 0.02                     # 20 ms
-MODELS_QUEUE_PUT_TIMEOUT = 0.02                     # 20 ms
-
-ANNOTATION_QUEUE_GET_TIMEOUT = 0.02
-ANNOTATION_QUEUE_PUT_TIMEOUT = 0.02
 ANNOTATION_MAX_PUT_ALERT_CONSECUTIVE_FAILURES = 3
 ANNOTATION_MAX_PUT_VIDEO_CONSECUTIVE_FAILURES = FPS * 2
 
@@ -273,7 +273,6 @@ DB_MANAGER_THREAD_CLOSE_TIMEOUT = 5.0                   # 5.0 s
 # -------------------------- OUT VIDEO WRITER --------------------------
 # -------------------------------------------------------------------
 
-VIDEO_WRITER_GET_FRAME_TIMEOUT = 0.01                              # 10 ms
 VIDEO_WRITER_HANDOFF_TIMEOUT = 1.0
 
 # ------------------------- OUT VIDEO STREAM  --------------------------
@@ -287,7 +286,6 @@ VIDEO_OUT_STREAM_PROTOCOL = RTMP                     # use rtmp by default
 VIDEO_OUT_STREAM_PORT = RTMP_PORT                    # use rtmp by default
 VIDEO_OUT_STREAM_STREAM_KEY = "annot"
 
-VIDEO_OUT_STREAM_QUEUE_GET_TIMEOUT = 0.01                   # 10 ms
 VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT = 0.5               # 0.5 s
 VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT = 8.0              # 8.0 s
 VIDEO_OUT_STREAM_STARTUP_TIMEOUT = 2.0                      # 2.0 s

@@ -12,8 +12,7 @@ from src.danger_detection.segmentation.segmentation import create_onnx_segmentat
 from src.danger_detection.processes.messages import DetectionSlotMetadata, SegmentationSlotMetadata
 from src.shared.processes.frame_buffer import FrameBuffer
 from src.shared.processes.constants import (
-    MODELS_QUEUE_GET_TIMEOUT,
-    MODELS_QUEUE_PUT_TIMEOUT,
+    PIPELINE_QUEUE_TIMEOUT,
     POISON_PILL,
     POISON_PILL_TIMEOUT,
 )
@@ -38,8 +37,7 @@ class SegmentationWorkerConfig(BaseModel):
     model_checkpoint: str
     predict_args: dict = Field(default_factory=dict)
 
-    queue_get_timeout: PositiveFloat = MODELS_QUEUE_GET_TIMEOUT
-    queue_put_timeout: PositiveFloat = MODELS_QUEUE_PUT_TIMEOUT
+    queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
     @field_validator('model_checkpoint')
@@ -140,7 +138,7 @@ class SegmentationWorker(mp.Process):
 
                 # ---- pull next frame metadata from the input queue ----
                 try:
-                    meta = self.input_meta_queue.get(timeout=self.config.queue_get_timeout)
+                    meta = self.input_meta_queue.get(timeout=self.config.queue_timeout)
                 except QueueEmptyException:
                     logger.debug("Input queue timed out. Upstream producer may be stalled. Retrying ...")
                     continue
@@ -202,7 +200,7 @@ class SegmentationWorker(mp.Process):
 
                 append_start = time()
                 try:
-                    self.output_meta_queue.put(out_meta, timeout=self.config.queue_put_timeout)
+                    self.output_meta_queue.put(out_meta, timeout=self.config.queue_timeout)
                     logger.debug(
                         f"Frame {meta.frame_id} → output slot {out_slot}, "
                         f"segmentation results queued."

@@ -10,8 +10,6 @@ from src.shared.processes.constants import (
     ALERTS_JPEG_COMPRESSION_QUALITY,
     ALERTS_MAX_CONSECUTIVE_FAILURES,
     ALERTS_QUEUE_GET_TIMEOUT,
-    ANNOTATION_QUEUE_GET_TIMEOUT,
-    ANNOTATION_QUEUE_PUT_TIMEOUT,
     AWS,
     AZURE,
     DB_HOST,
@@ -29,8 +27,6 @@ from src.shared.processes.constants import (
     FPS,
     FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
     FRAMETELCOMB_MAX_TIME_DIFF,
-    FRAMETELCOMB_QUEUE_GET_TIMEOUT,
-    FRAMETELCOMB_QUEUE_PUT_TIMEOUT,
     GOOGLE,
     LOCAL,
     MAX_SIZE_DANGER_DETECTION_RESULT,
@@ -41,8 +37,7 @@ from src.shared.processes.constants import (
     MAX_SIZE_SEGMENTATION_IN,
     MAX_SIZE_VIDEO_STORAGE,
     MAX_SIZE_VIDEO_STREAM,
-    MODELS_QUEUE_GET_TIMEOUT,
-    MODELS_QUEUE_PUT_TIMEOUT,
+    PIPELINE_QUEUE_TIMEOUT,
     MQTT,
     MQTTS,
     POISON_PILL_TIMEOUT,
@@ -69,7 +64,6 @@ from src.shared.processes.constants import (
     VIDEO_OUT_STREAM_HOST,
     VIDEO_OUT_STREAM_PORT,
     VIDEO_OUT_STREAM_PROTOCOL,
-    VIDEO_OUT_STREAM_QUEUE_GET_TIMEOUT,
     VIDEO_OUT_STREAM_SHUTDOWN_TIMEOUT,
     VIDEO_OUT_STREAM_STARTUP_TIMEOUT,
     VIDEO_OUT_STREAM_STREAM_KEY,
@@ -83,10 +77,8 @@ from src.shared.processes.constants import (
     VIDEO_STREAM_READER_PORT,
     VIDEO_STREAM_READER_PROCESSING_SHAPE,
     VIDEO_STREAM_READER_PROTOCOL,
-    VIDEO_STREAM_READER_QUEUE_PUT_TIMEOUT,
     VIDEO_STREAM_READER_RECONNECT_DELAY,
     VIDEO_STREAM_READER_STREAM_KEY,
-    VIDEO_WRITER_GET_FRAME_TIMEOUT,
     VIDEO_WRITER_HANDOFF_TIMEOUT,
     WEBSOCKET_HOST,
     WEBSOCKET_PORT,
@@ -172,7 +164,6 @@ class AppSettings(BaseSettings):
     video_stream_reader_frame_read_timeout_s:          float         = Field(default=VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S,          gt=0)
     video_stream_reader_frame_retry_delay:             float         = Field(default=VIDEO_STREAM_READER_FRAME_RETRY_DELAY,             gt=0)
     video_stream_reader_frame_max_consecutive_failures:int           = Field(default=VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES, ge=0)
-    video_stream_reader_queue_put_timeout:             float         = Field(default=VIDEO_STREAM_READER_QUEUE_PUT_TIMEOUT,             gt=0)
     # Processing resolution (frames are downscaled to this before inference)
     video_stream_reader_processing_width:  int = Field(default=VIDEO_STREAM_READER_PROCESSING_SHAPE[0], gt=0)
     video_stream_reader_processing_height: int = Field(default=VIDEO_STREAM_READER_PROCESSING_SHAPE[1], gt=0)
@@ -200,22 +191,15 @@ class AppSettings(BaseSettings):
 
     frametelcomb_max_telem_buffer_size: int   = Field(default=FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE, gt=0)
     frametelcomb_max_time_diff:         float = Field(default=FRAMETELCOMB_MAX_TIME_DIFF,         ge=0)
-    frametelcomb_queue_get_timeout:     float = Field(default=FRAMETELCOMB_QUEUE_GET_TIMEOUT,     gt=0)
-    frametelcomb_queue_put_timeout:     float = Field(default=FRAMETELCOMB_QUEUE_PUT_TIMEOUT,     gt=0)
 
     # ------------------------------------------------------------------ #
-    # MODEL WORKERS (detection, segmentation, geo)
+    # PIPELINE QUEUE TIMEOUT
     # ------------------------------------------------------------------ #
 
-    models_queue_get_timeout: float = Field(default=MODELS_QUEUE_GET_TIMEOUT, gt=0)
-    models_queue_put_timeout: float = Field(default=MODELS_QUEUE_PUT_TIMEOUT, gt=0)
-
-    # ------------------------------------------------------------------ #
-    # DANGER ANNOTATION
-    # ------------------------------------------------------------------ #
-
-    annotation_queue_get_timeout: float = Field(default=ANNOTATION_QUEUE_GET_TIMEOUT, gt=0)
-    annotation_queue_put_timeout: float = Field(default=ANNOTATION_QUEUE_PUT_TIMEOUT, gt=0)
+    # Single timeout (seconds) for all hot-path queue get/put calls across
+    # every stage: stream reader, combiner, models, annotation, video writer,
+    # video streamer. Controls shutdown responsiveness only.
+    pipeline_queue_timeout: float = Field(default=PIPELINE_QUEUE_TIMEOUT, gt=0)
 
     # ------------------------------------------------------------------ #
     # ALERTS WRITER
@@ -258,8 +242,7 @@ class AppSettings(BaseSettings):
     # VIDEO WRITER
     # ------------------------------------------------------------------ #
 
-    video_writer_get_frame_timeout: float = Field(default=VIDEO_WRITER_GET_FRAME_TIMEOUT, gt=0)
-    video_writer_handoff_timeout:   float = Field(default=VIDEO_WRITER_HANDOFF_TIMEOUT,   gt=0)
+    video_writer_handoff_timeout: float = Field(default=VIDEO_WRITER_HANDOFF_TIMEOUT, gt=0)
 
     # ------------------------------------------------------------------ #
     # VIDEO STREAM OUTPUT (RTMP → media server)
@@ -271,7 +254,6 @@ class AppSettings(BaseSettings):
     video_out_stream_stream_key:             str           = VIDEO_OUT_STREAM_STREAM_KEY
     video_out_stream_username:               Optional[str] = None
     video_out_stream_password:               Optional[str] = None
-    video_out_stream_queue_get_timeout:      float         = Field(default=VIDEO_OUT_STREAM_QUEUE_GET_TIMEOUT,      gt=0)
     video_out_stream_ffmpeg_startup_timeout: float         = Field(default=VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT, gt=0)
     video_out_stream_ffmpeg_shutdown_timeout:float         = Field(default=VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,gt=0)
     video_out_stream_startup_timeout:        float         = Field(default=VIDEO_OUT_STREAM_STARTUP_TIMEOUT,        gt=0)

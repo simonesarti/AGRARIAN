@@ -18,7 +18,7 @@ from src.shared.processes.constants import (
     VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES,
     VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO,
     VIDEO_STREAM_READER_PROCESSING_SHAPE,
-    VIDEO_STREAM_READER_QUEUE_PUT_TIMEOUT,
+    PIPELINE_QUEUE_TIMEOUT,
     DOWNSAMPLING_MODE,
     POISON_PILL,
     POISON_PILL_TIMEOUT,
@@ -58,7 +58,7 @@ class StreamVideoReaderConfig(BaseModel):
     processing_shape: tuple[int, int] = VIDEO_STREAM_READER_PROCESSING_SHAPE  # (W, H)
 
     # Output
-    meta_queue_put_timeout: PositiveFloat = VIDEO_STREAM_READER_QUEUE_PUT_TIMEOUT
+    queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
     @field_validator('processing_shape')
@@ -325,7 +325,7 @@ class StreamVideoReader(mp.Process):
                     # Put the metadata on the output queue so the next process can locate the frame
                     # no need to sleep on failure since we already waited during the put timeout
                     try:
-                        self.output_meta_queue.put(meta, timeout=self.config.meta_queue_put_timeout)
+                        self.output_meta_queue.put(meta, timeout=self.config.queue_timeout)
                         logger.debug(f"Frame {frame_id} → slot {slot_idx}, metadata queued.")
                     except QueueFullException:
                         # Return the slot to the free pool so it can be reused; drop this frame

@@ -21,8 +21,7 @@ from src.danger_detection.processes.messages import GeoSlotMetadata
 from src.shared.processes.messages import AnnotationSlotMetadata
 from src.shared.processes.frame_buffer import FrameBuffer
 from src.shared.processes.constants import (
-    ANNOTATION_QUEUE_GET_TIMEOUT,
-    ANNOTATION_QUEUE_PUT_TIMEOUT,
+    PIPELINE_QUEUE_TIMEOUT,
     POISON_PILL,
     POISON_PILL_TIMEOUT,
     UPSAMPLING_MODE,
@@ -45,8 +44,7 @@ if not logger.handlers:  # Avoid duplicate handlers
 class DangerAnnotationWorkerConfig(BaseModel):
     """Configuration for DangerAnnotationWorker."""
 
-    queue_get_timeout: PositiveFloat = ANNOTATION_QUEUE_GET_TIMEOUT
-    queue_put_timeout: PositiveFloat = ANNOTATION_QUEUE_PUT_TIMEOUT
+    queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
 
@@ -161,7 +159,7 @@ class DangerAnnotationWorker(mp.Process):
 
                 # ---- pull next frame metadata from the input queue ----
                 try:
-                    meta = self.input_meta_queue.get(timeout=self.config.queue_get_timeout)
+                    meta = self.input_meta_queue.get(timeout=self.config.queue_timeout)
                 except QueueEmptyException:
                     logger.debug("Input queue timed out. Upstream producer may be stalled. Retrying ...")
                     continue
@@ -267,7 +265,7 @@ class DangerAnnotationWorker(mp.Process):
                         alert_msg=alert_msg,
                     )
                     try:
-                        self.alert_output_meta_queue.put(alert_meta, timeout=self.config.queue_put_timeout)
+                        self.alert_output_meta_queue.put(alert_meta, timeout=self.config.queue_timeout)
                         logger.debug(
                             f"Frame {meta.frame_id} → alert slot {alert_slot}. "
                             f"Danger: {alert_msg if danger_exists else 'none'}."
@@ -295,7 +293,7 @@ class DangerAnnotationWorker(mp.Process):
                         alert_msg=alert_msg,
                     )
                     try:
-                        self.video_output_meta_queue.put(video_meta, timeout=self.config.queue_put_timeout)
+                        self.video_output_meta_queue.put(video_meta, timeout=self.config.queue_timeout)
                         logger.debug(
                             f"Frame {meta.frame_id} → video slot {video_slot}. "
                             f"Danger: {alert_msg if danger_exists else 'none'}."

@@ -18,8 +18,7 @@ from pydantic import BaseModel, PositiveFloat, PositiveInt, Field
 from src.shared.processes.constants import (
     FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
     FRAMETELCOMB_MAX_TIME_DIFF,
-    FRAMETELCOMB_QUEUE_GET_TIMEOUT,
-    FRAMETELCOMB_QUEUE_PUT_TIMEOUT,
+    PIPELINE_QUEUE_TIMEOUT,
     MQTT,
     MQTTS,
     POISON_PILL,
@@ -72,11 +71,7 @@ class FrameTelemetryCombinerConfig(BaseModel):
     telemetry_buffer_max_size: PositiveInt = FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE
     max_time_diff_s: PositiveFloat = FRAMETELCOMB_MAX_TIME_DIFF
 
-    # Input queue
-    queue_get_timeout: PositiveFloat = FRAMETELCOMB_QUEUE_GET_TIMEOUT
-
-    # Output queue
-    queue_put_timeout: PositiveFloat = FRAMETELCOMB_QUEUE_PUT_TIMEOUT
+    queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
 
     # Shutdown
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
@@ -421,7 +416,7 @@ class FrameTelemetryCombiner(mp.Process):
                 # ---- pull next frame metadata from the input queue ----
                 # Short timeout to allow periodic checks of error_event
                 try:
-                    meta = self.input_meta_queue.get(timeout=self.config.queue_get_timeout)
+                    meta = self.input_meta_queue.get(timeout=self.config.queue_timeout)
                 except QueueEmptyException:
                     logger.debug("Input metadata queue empty. Waiting for frames ...")
                     continue
@@ -484,7 +479,7 @@ class FrameTelemetryCombiner(mp.Process):
 
                 # no need to sleep on failure since we already waited during the put timeout
                 try:
-                    self.output_meta_queue.put(out_meta, timeout=self.config.queue_put_timeout)
+                    self.output_meta_queue.put(out_meta, timeout=self.config.queue_timeout)
                     logger.debug(
                         f"Frame {meta.frame_id} → output slot {out_slot}, "
                         f"telemetry={'matched' if matched_telemetry else 'None'}."

@@ -15,10 +15,9 @@ from src.shared.processes.messages import AnnotationSlotMetadata
 from src.shared.processes.constants import (
     FPS,
     CODEC,
-    VIDEO_WRITER_GET_FRAME_TIMEOUT,
+    PIPELINE_QUEUE_TIMEOUT,
     VIDEO_WRITER_HANDOFF_TIMEOUT,
     MAX_SIZE_VIDEO_STREAM,
-    VIDEO_OUT_STREAM_QUEUE_GET_TIMEOUT,
     VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT,
     VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,
     VIDEO_OUT_STREAM_STARTUP_TIMEOUT,
@@ -44,7 +43,7 @@ class VideoProducerProcessConfig(BaseModel):
     """Configuration for VideoProducerProcess."""
 
     fps: PositiveInt = FPS
-    queue_get_timeout: PositiveFloat = VIDEO_WRITER_GET_FRAME_TIMEOUT
+    queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
 
     # ------- Local file save --------
     video_output_dir: str = "."
@@ -52,7 +51,6 @@ class VideoProducerProcessConfig(BaseModel):
     # ------- RTMP stream (media_server_url=None to disable) --------
     media_server_url: Optional[str] = None
     stream_manager_queue_max_size: PositiveInt = MAX_SIZE_VIDEO_STREAM
-    stream_manager_queue_get_timeout: PositiveFloat = VIDEO_OUT_STREAM_QUEUE_GET_TIMEOUT
     stream_manager_ffmpeg_startup_timeout: PositiveFloat = VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT
     stream_manager_ffmpeg_shutdown_timeout: PositiveFloat = VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT
     stream_manager_startup_timeout: PositiveFloat = VIDEO_OUT_STREAM_STARTUP_TIMEOUT
@@ -188,7 +186,7 @@ class VideoProducerProcess(mp.Process):
                 mediaserver_url=self.config.media_server_url,
                 fps=self.config.fps,
                 queue_max_size=self.config.stream_manager_queue_max_size,
-                queue_get_timeout=self.config.stream_manager_queue_get_timeout,
+                queue_get_timeout=self.config.queue_timeout,
                 ffmpeg_startup_timeout=self.config.stream_manager_ffmpeg_startup_timeout,
                 ffmpeg_shutdown_timeout=self.config.stream_manager_ffmpeg_shutdown_timeout,
                 startup_timeout=self.config.stream_manager_startup_timeout,
@@ -200,7 +198,7 @@ class VideoProducerProcess(mp.Process):
 
                 # ---- pull next frame metadata ----
                 try:
-                    meta = self.input_meta_queue.get(timeout=self.config.queue_get_timeout)
+                    meta = self.input_meta_queue.get(timeout=self.config.queue_timeout)
                 except QueueEmptyException:
                     logger.debug("Input queue empty. Waiting for frames ...")
                     continue
