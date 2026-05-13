@@ -13,17 +13,9 @@ TODO.md
 agrarian.sif
 
 # Base yolo checkpoints
-yolo11n.pt
-yolo11s.pt
-yolo11m.pt
-yolo11l.pt
-yolo11x.pt
-
-# checkpoints
-checkpoints/*
-logs/*
-TMP/
-TMP_HEALTH/
+*.pt
+*.onnx
+*.engine
 
 ###########################################
 
