@@ -10,6 +10,6 @@ conda activate agrarian312
 
 pip install --upgrade pip
 pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu130
-pip install --no-cache-dir -r dev/requirements.txt
+pip install --no-cache-dir -r dev_requirements.txt
 
 conda deactivate

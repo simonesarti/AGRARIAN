@@ -13,9 +13,16 @@ RUN apt update && apt install -y \
     libsm6 \
     libxext6 \
     libxrender-dev \
+    libtbb-dev \
+    libjpeg-turbo8-dev \
+    libpng-dev \
+    libtiff-dev \
+    libgoogle-perftools-dev \
     libglib2.0-0 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+ENV LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc.so"
 
 # Set the working directory
 WORKDIR /app
@@ -137,4 +144,4 @@ ENV \
 EXPOSE 8443
 
 # Set entrypoint
-ENTRYPOINT ["python", "health_monitoring_stream.py"]
+ENTRYPOINT ["python", "main.py"]
