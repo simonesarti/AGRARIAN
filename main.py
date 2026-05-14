@@ -27,8 +27,9 @@ def main() -> None:
         run()
 
     elif mode == "health_monitoring":
-        logger.critical("Health monitoring pipeline is not yet implemented.")
-        sys.exit(1)
+        logger.info("Starting health monitoring pipeline.")
+        from health_monitoring_stream import main as run
+        run()
 
     else:
         logger.critical(
