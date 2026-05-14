@@ -91,8 +91,12 @@ def main():
         logger.critical(f"Configuration error: {e}", exc_info=True)
         exit(1)
 
-    detection_args    = read_yaml_config("configs/danger_detection/detector.yaml")
-    segmentation_args = read_yaml_config("configs/danger_detection/segmenter.yaml")
+    try:
+        detection_args    = read_yaml_config("configs/danger_detection/detector.yaml")
+        segmentation_args = read_yaml_config("configs/danger_detection/segmenter.yaml")
+    except Exception as e:
+        logger.critical(f"Failed to load YAML config: {e}", exc_info=True)
+        exit(1)
 
     dem_path              = Path("dem/dem.tif")
     dem_mask_path         = Path("dem/dem_mask.tif")

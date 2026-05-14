@@ -83,8 +83,13 @@ def main():
         logger.critical(f"Configuration error: {e}", exc_info=True)
         exit(1)
 
-    tracking_args          = read_yaml_config("configs/health_monitoring/tracker.yaml")
-    anomaly_detection_args = read_yaml_config("configs/health_monitoring/anomaly_detector.yaml")
+    try:
+        tracking_args          = read_yaml_config("configs/health_monitoring/tracker.yaml")
+        anomaly_detection_args = read_yaml_config("configs/health_monitoring/anomaly_detector.yaml")
+    except Exception as e:
+        logger.critical(f"Failed to load YAML config: {e}", exc_info=True)
+        exit(1)
+    
     output_dir = Path(LOCAL_OUTPUT_DIR)
     output_dir.mkdir(exist_ok=True, parents=True)
 
