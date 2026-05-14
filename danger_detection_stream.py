@@ -40,48 +40,6 @@ if not logger.handlers:
 # ================================================================
 
 
-def _build_persistence_process(
-        input_queue: mp.Queue,
-        error_event,
-        s: AppSettings,
-):
-    """Instantiate the right VideoPersistenceProcess subclass from settings."""
-    base = dict(
-        delete_local_on_success=s.video_out_store_delete_local_on_success,
-        queue_get_timeout=s.video_out_store_queue_get_timeout,
-        max_retries=s.video_out_store_max_upload_retries,
-        retry_backoff_s=s.video_out_store_retry_backoff_time,
-    )
-    service = s.video_out_store_service
-
-    if service == "azure":
-        config = AzureBlobStorageConfig(
-            connection_string=s.video_out_store_azure_connection_string.get_secret_value(),
-            container_name=s.video_out_store_azure_container_name,
-            blob_prefix=s.video_out_store_azure_blob_prefix,
-            **base,
-        )
-        return AzureBlobStoragePersistenceProcess(input_queue=input_queue, error_event=error_event, config=config)
-
-    if service == "aws":
-        config = S3StorageConfig(
-            bucket_name=s.video_out_store_aws_bucket_name,
-            key_prefix=s.video_out_store_aws_key_prefix,
-            aws_access_key_id=s.video_out_store_aws_access_key_id,
-            aws_secret_access_key=s.video_out_store_aws_secret_access_key.get_secret_value() if s.video_out_store_aws_secret_access_key else None,
-            region_name=s.video_out_store_aws_region_name,
-            **base,
-        )
-        return S3StoragePersistenceProcess(input_queue=input_queue, error_event=error_event, config=config)
-
-    # LOCAL (default)
-    config = LocalStorageConfig(
-        target_directory=s.video_out_store_local_target_dir,
-        **base,
-    )
-    return LocalStoragePersistenceProcess(input_queue=input_queue, error_event=error_event, config=config)
-
-
 def main():
 
     try:
@@ -260,6 +218,38 @@ def main():
         storage_manager_handoff_timeout=s.video_writer_handoff_timeout,
     )
 
+    _persistence_base = dict(
+        delete_local_on_success=s.video_out_store_delete_local_on_success,
+        queue_get_timeout=s.video_out_store_queue_get_timeout,
+        max_retries=s.video_out_store_max_upload_retries,
+        retry_backoff_s=s.video_out_store_retry_backoff_time,
+    )
+    if s.video_out_store_service == "azure":
+        assert s.video_out_store_azure_connection_string is not None
+        video_persistence_config = AzureBlobStorageConfig(
+            connection_string=s.video_out_store_azure_connection_string.get_secret_value(),
+            container_name=s.video_out_store_azure_container_name,
+            blob_prefix=s.video_out_store_azure_blob_prefix,
+            **_persistence_base,
+        )
+        VideoPersistenceProcessClass = AzureBlobStoragePersistenceProcess
+    elif s.video_out_store_service == "aws":
+        video_persistence_config = S3StorageConfig(
+            bucket_name=s.video_out_store_aws_bucket_name,
+            key_prefix=s.video_out_store_aws_key_prefix,
+            aws_access_key_id=s.video_out_store_aws_access_key_id,
+            aws_secret_access_key=s.video_out_store_aws_secret_access_key.get_secret_value() if s.video_out_store_aws_secret_access_key else None,
+            region_name=s.video_out_store_aws_region_name,
+            **_persistence_base,
+        )
+        VideoPersistenceProcessClass = S3StoragePersistenceProcess
+    else:
+        video_persistence_config = LocalStorageConfig(
+            target_directory=s.video_out_store_local_target_dir,
+            **_persistence_base,
+        )
+        VideoPersistenceProcessClass = LocalStoragePersistenceProcess
+
     # ============== INSTANTIATE PROCESSES ==============
 
     try:
@@ -332,10 +322,10 @@ def main():
             config=video_producer_config,
         )
 
-        video_persistence_process = _build_persistence_process(
+        video_persistence_process = VideoPersistenceProcessClass(
             input_queue=video_to_persistence_q,
             error_event=error_event,
-            s=s,
+            config=video_persistence_config,
         )
 
     except Exception as e:
