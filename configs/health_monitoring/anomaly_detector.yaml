@@ -1,25 +1,37 @@
-# str: Path to the model checkpoint file.
-# Specifies the .pt file for the model to be used during inference.
-# if null, use a statistical approach
-model_checkpoint: null
+# Optional path to the trained AE checkpoint.
+# If null, reconstruction scores are uncalibrated (social scorer still works).
+weights_path: checkpoints/health_monitoring/ae.pt
 
-# int: length of the tracking window
-time_window_size: 100
+# Device for AE inference: "cpu", "cuda:0", "mps"
+device: cuda:0
 
-# float: update period in seconds of the time window
-history_update_period_seconds: 0.2  # (0.2 s = 5 fps) * 100 = 20 seconds anomaly window
+# Feature extraction settings
+features:
+  # Frames of trajectory history fed to the AE.  @ 30 fps ≈ 10 s.
+  sequence_length: 300
+  # K topological nearest neighbours used for relative velocity / position features.
+  local_context_k: 5
+  # Frames a track may be absent before its history is discarded.
+  # During the gap the last known feature vector is repeated.
+  interp_max_age: 8
 
-# int: run anomaly detection every N updates of the history
-anomaly_detection_period: 10
+# Anomaly scoring settings
+anomaly:
+  use_ae: true                  # enable LSTM-AE reconstruction scorer
+  use_social: true              # enable social Mahalanobis scorer
+  ae_threshold: 2.75            # AE z-score above which a track is flagged
+  social_threshold: 5.0         # Mahalanobis distance above which a track is flagged
+  smoothing_window: 56          # temporal smoothing (frames) — @ 30 fps ≈ 1.9 s
+  min_anomaly_duration: 90      # events shorter than this are discarded — @ 30 fps = 3 s
+  social_ema_alpha: 0.007       # EMA decay for online herd statistics
+  social_min_updates: 375       # frames before social scores are emitted — @ 30 fps ≈ 12.5 s
+  social_min_herd: 5            # minimum visible animals to update / score herd stats
+  require_both: false           # false = flag if either scorer fires; true = require both
 
-# str: graph creation strategy, can be ['knn', 'radius']
-graph_strategy: 'knn'
-
-# int: how many neighbours to connect when using graph_strategy: 'knn'
-knn_k: 10
-
-# float: radius in meters used to connect with neighbours when using graph_strategy: 'radius'
-radius_meters: 10.0
-
-# float
-majority_vote_threshold: 0.5
+# AE model architecture (must match the trained checkpoint)
+model:
+  feature_dim: 9
+  hidden_dim: 128
+  latent_dim: 64
+  num_layers: 2
+  dropout: 0.2
