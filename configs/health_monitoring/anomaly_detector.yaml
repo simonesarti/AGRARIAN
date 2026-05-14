@@ -1,11 +1,11 @@
-# Optional path to the trained AE checkpoint.
-# If null, reconstruction scores are uncalibrated (social scorer still works).
+# Path to the trained AE checkpoint.
+# If null, reconstruction scores are uncalibrated (social scorer still runs).
 weights_path: checkpoints/health_monitoring/ae.pt
 
 # Device for AE inference: "cpu", "cuda:0", "mps"
 device: cuda:0
 
-# Feature extraction settings
+# Feature extraction settings — must match the trained checkpoint.
 features:
   # Frames of trajectory history fed to the AE.  @ 30 fps ≈ 10 s.
   sequence_length: 300
@@ -15,20 +15,7 @@ features:
   # During the gap the last known feature vector is repeated.
   interp_max_age: 8
 
-# Anomaly scoring settings
-anomaly:
-  use_ae: true                  # enable LSTM-AE reconstruction scorer
-  use_social: true              # enable social Mahalanobis scorer
-  ae_threshold: 2.75            # AE z-score above which a track is flagged
-  social_threshold: 5.0         # Mahalanobis distance above which a track is flagged
-  smoothing_window: 56          # temporal smoothing (frames) — @ 30 fps ≈ 1.9 s
-  min_anomaly_duration: 90      # events shorter than this are discarded — @ 30 fps = 3 s
-  social_ema_alpha: 0.007       # EMA decay for online herd statistics
-  social_min_updates: 375       # frames before social scores are emitted — @ 30 fps ≈ 12.5 s
-  social_min_herd: 5            # minimum visible animals to update / score herd stats
-  require_both: false           # false = flag if either scorer fires; true = require both
-
-# AE model architecture (must match the trained checkpoint)
+# AE model architecture — must match the trained checkpoint.
 model:
   feature_dim: 9
   hidden_dim: 128

@@ -155,10 +155,21 @@ def main():
 
     anomaly_config = HMAnomalyDetectionWorkerConfig(
         features_cfg=FeaturesConfig(**anomaly_detection_args.get("features", {})),
-        anomaly_cfg=AnomalyConfig(**anomaly_detection_args.get("anomaly", {})),
+        anomaly_cfg=AnomalyConfig(
+            use_ae=s.hm_anomaly_use_ae,
+            use_social=s.hm_anomaly_use_social,
+            ae_threshold=s.hm_anomaly_ae_threshold,
+            social_threshold=s.hm_anomaly_social_threshold,
+            smoothing_window=s.hm_anomaly_smoothing_window,
+            min_anomaly_duration=s.hm_anomaly_min_anomaly_duration,
+            social_ema_alpha=s.hm_anomaly_social_ema_alpha,
+            social_min_updates=s.hm_anomaly_social_min_updates,
+            social_min_herd=s.hm_anomaly_social_min_herd,
+            require_both=s.hm_anomaly_require_both,
+        ),
         model_cfg=ModelConfig(**anomaly_detection_args.get("model", {})),
         weights_path=anomaly_detection_args.get("weights_path"),
-        device=anomaly_detection_args.get("device", "cpu"),
+        device=anomaly_detection_args.get("device"),
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )

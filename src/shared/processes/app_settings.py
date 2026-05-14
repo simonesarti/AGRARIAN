@@ -8,6 +8,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from src.shared.processes.constants import (
     ALERTS_COOLDOWN_SECONDS,
     ALERTS_JPEG_COMPRESSION_QUALITY,
+    HM_ANOMALY_AE_THRESHOLD,
+    HM_ANOMALY_MIN_ANOMALY_DURATION,
+    HM_ANOMALY_REQUIRE_BOTH,
+    HM_ANOMALY_SMOOTHING_WINDOW,
+    HM_ANOMALY_SOCIAL_EMA_ALPHA,
+    HM_ANOMALY_SOCIAL_MIN_HERD,
+    HM_ANOMALY_SOCIAL_MIN_UPDATES,
+    HM_ANOMALY_SOCIAL_THRESHOLD,
+    HM_ANOMALY_USE_AE,
+    HM_ANOMALY_USE_SOCIAL,
     DB_HOST,
     DB_PORT,
     DRONE_SENSOR_HEIGHT_MM,
@@ -158,6 +168,21 @@ class AppSettings(BaseSettings):
     video_out_store_aws_region_name:         Optional[str]       = None
     # Local (testing / no-cloud fallback)
     video_out_store_local_target_dir: str = VIDEO_OUT_STORE_LOCAL_TARGET_DIR
+
+    # ------------------------------------------------------------------ #
+    # HEALTH MONITORING — ANOMALY DETECTION
+    # ------------------------------------------------------------------ #
+
+    hm_anomaly_use_ae:              bool           = HM_ANOMALY_USE_AE
+    hm_anomaly_use_social:          bool           = HM_ANOMALY_USE_SOCIAL
+    hm_anomaly_ae_threshold:        PositiveFloat  = HM_ANOMALY_AE_THRESHOLD
+    hm_anomaly_social_threshold:    PositiveFloat  = HM_ANOMALY_SOCIAL_THRESHOLD
+    hm_anomaly_smoothing_window:    PositiveInt    = HM_ANOMALY_SMOOTHING_WINDOW
+    hm_anomaly_min_anomaly_duration: PositiveInt   = HM_ANOMALY_MIN_ANOMALY_DURATION
+    hm_anomaly_social_ema_alpha:    PositiveFloat  = HM_ANOMALY_SOCIAL_EMA_ALPHA
+    hm_anomaly_social_min_updates:  PositiveInt    = HM_ANOMALY_SOCIAL_MIN_UPDATES
+    hm_anomaly_social_min_herd:     PositiveInt    = HM_ANOMALY_SOCIAL_MIN_HERD
+    hm_anomaly_require_both:        bool           = HM_ANOMALY_REQUIRE_BOTH
 
     # ================================================================== #
     # FIELD VALIDATORS

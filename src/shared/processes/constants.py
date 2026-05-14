@@ -34,7 +34,17 @@ SLOPE_ANGLE_THRESHOLD = 30.0
 
 # -------------------------- HEALTH MONITORING PARAMETERS --------------------------
 
-SLIDING_WINDOW_SIZE_S = 30.0                                                      # seconds
+# Anomaly detection defaults
+HM_ANOMALY_USE_AE = True
+HM_ANOMALY_USE_SOCIAL = True
+HM_ANOMALY_AE_THRESHOLD = 2.75
+HM_ANOMALY_SOCIAL_THRESHOLD = 5.0
+HM_ANOMALY_SMOOTHING_WINDOW = 56
+HM_ANOMALY_MIN_ANOMALY_DURATION = 90
+HM_ANOMALY_SOCIAL_EMA_ALPHA = 0.007
+HM_ANOMALY_SOCIAL_MIN_UPDATES = 375
+HM_ANOMALY_SOCIAL_MIN_HERD = 5
+HM_ANOMALY_REQUIRE_BOTH = False
 
 # -------------------------- DRONE HARDWARE PARAMETERS --------------------------
 
