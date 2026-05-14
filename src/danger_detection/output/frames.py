@@ -15,7 +15,7 @@ CLASS_COLOR = [BLUE, PURPLE]
 
 
 # generate the constant images based on the frame shape and color
-def get_danger_intersect_colored_frames(shape):
+def get_danger_intersect_colored_frames(shape) -> tuple[np.ndarray, np.ndarray]:
     color_danger_frame = np.full(shape, RED, dtype=np.uint8)
     color_intersect_frame = np.full(shape, YELLOW, dtype=np.uint8)
     return color_danger_frame, color_intersect_frame

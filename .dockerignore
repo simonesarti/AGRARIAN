@@ -1,0 +1,69 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Operating System specific
+.DS_Store
+
+# Byte-compiled / optimized / DLL files
+**/__pycache__/
+**/*.py[cod]
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environment
+.env
+.venv/
+venv/
+
+# IDEs
+.idea/
+.vscode/
+
+# Project specific directories
+assets/
+experiments/
+outputs/
+tests/
+
+# - exclude partially
+checkpoints/*/
+configs/*/
+logs/*/
+src/*/
+
+# - keep these components
+!checkpoints/danger_detection/
+!configs/danger_detection/
+!logs/danger_detection/
+!src/configs/
+!src/danger_detection/
+!src/shared/
+
+
+# Project specific files
+README.md
+*.py
+*.sh
+
+# keep these files:
+!danger_detection_stream.py

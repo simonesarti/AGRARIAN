@@ -222,7 +222,7 @@ if __name__ == "__main__":
     import numpy as np
     from src.shared.processes.consumer import Consumer
     from src.shared.processes.producer import Producer
-    from src.configs.utils import read_yaml_config
+    from src.utils import read_yaml_config
 
     VSLOW = 1
     SLOW = 10

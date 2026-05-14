@@ -1,8 +1,0 @@
-# str: Name of the directory where the results of the analysis will be saved
-output_dir: 'experiments/pr1_health'
-
-# str: Name of the files on which alerts will be saved
-alert_file_name: 'alerts'
-
-# str: Name of the video showing the annotated original data (with/without sheep count and tracks)
-annotated_video_name: 'health_monitoring_annotated'

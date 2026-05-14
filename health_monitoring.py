@@ -1,6 +1,6 @@
 from src.configs.health_monitoring import check_health_monitoring_args
 from src.configs.drone import check_drone_args
-from src.configs.utils import read_yaml_config
+from src.utils import read_yaml_config
 from src.health_monitoring.health_monitoring import perform_health_monitoring
 # from src.health_monitoring.health_monitoring_parallel import perform_health_monitoring
 

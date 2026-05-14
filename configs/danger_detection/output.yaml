@@ -1,8 +1,0 @@
-# str: Name of the directory where the results of the analysis will be saved
-output_dir: 'test_danger_detection_stream_dd_hd'
-
-# str: Name of the files on which alerts will be saved
-alert_file_name: 'alerts_stream'
-
-# str: Name of the video showing the annotated original data (with/without sheep count and tracks)
-annotated_video_name: 'danger_detection_annotated'

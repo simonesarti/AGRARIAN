@@ -8,7 +8,7 @@ import numpy as np
 from src.shared.processes.constants import (
     FPS,
     MAX_SIZE_VIDEO_STREAM,
-    VIDEO_OUT_STREAM_QUEUE_GET_TIMEOUT,
+    PIPELINE_QUEUE_TIMEOUT,
     VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT,    # 0.5
     VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,    # 8.0
     VIDEO_OUT_STREAM_STARTUP_TIMEOUT,           # 2.0
@@ -32,7 +32,7 @@ class VideoStreamManager:
             mediaserver_url: str,
             fps: int = FPS,
             queue_max_size: int = MAX_SIZE_VIDEO_STREAM,
-            queue_get_timeout: float = VIDEO_OUT_STREAM_QUEUE_GET_TIMEOUT,
+            queue_get_timeout: float = PIPELINE_QUEUE_TIMEOUT,
             ffmpeg_startup_timeout: float = VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT,
             ffmpeg_shutdown_timeout: float = VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,
             startup_timeout: float = VIDEO_OUT_STREAM_STARTUP_TIMEOUT,
@@ -134,9 +134,8 @@ class VideoStreamManager:
         while self.running:
 
             try:
-                # Launcc FFMPEG process
+                # Launch FFmpeg process
                 logger.info(
-                    f"Streamer thread has not been stopped yet. "
                     f"Attempting to connect to {self.mediaserver_url}"
                 )
                 self._ffmpeg_process = subprocess.Popen(
@@ -198,19 +197,21 @@ class VideoStreamManager:
     def _finalize_ffmpeg(self):
         """Internal routine to close the pipe and wait for process exit."""
         if self._ffmpeg_process:
-            logger.info("Draining complete. Closing FFmpeg pipe...")
+            logger.info("Closing FFmpeg pipe ...")
             try:
                 if self._ffmpeg_process.stdin:
                     self._ffmpeg_process.stdin.close()
-
-                # Wait for FFmpeg to wrap up the FLV container
+            except Exception as e:
+                logger.error(f"Error closing FFmpeg stdin: {e}")
+            # Always wait, even if stdin.close() raised, to avoid zombie processes
+            try:
                 self._ffmpeg_process.wait(timeout=self.ffmpeg_shutdown_timeout)
                 logger.info("FFmpeg process exited cleanly.")
             except subprocess.TimeoutExpired:
                 logger.warning("FFmpeg did not exit in time. Forcing termination.")
                 self._ffmpeg_process.kill()
             except Exception as e:
-                logger.error(f"Error during FFmpeg shutdown: {e}")
+                logger.error(f"Error waiting for FFmpeg to exit: {e}")
 
     def start(self) -> bool:
         """

@@ -160,7 +160,7 @@ class AnnotationWorker(mp.Process):
                 annotated_frame = cv2.resize(
                     src=annotated_frame,
                     dsize=previous_step_results.original_wh,    # (w,h)
-                    interpolation=UPSAMPLING_MODE,
+                    interpolation=cv2.INTER_LINEAR,
                 )
 
                 result = AnnotationResults(

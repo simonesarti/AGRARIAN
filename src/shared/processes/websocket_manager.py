@@ -159,7 +159,8 @@ class WebSocketManager:
 
             # Broadcast in parallel to all clients
             logger.info(f"Broadcasting alert {frame_id} to {len(self.connected_clients)} client(s)")
-            tasks = [asyncio.create_task(client.send(message)) for client in self.connected_clients]
+            # Iterate a snapshot to avoid mutation during async send operations
+            tasks = [asyncio.create_task(client.send(message)) for client in list(self.connected_clients)]
 
             if tasks:
                 # Use a timeout to prevent slow clients from blocking the loop
@@ -197,9 +198,8 @@ class WebSocketManager:
             broadcast_task.cancel()
             try:
                 await broadcast_task
-                logger.info("Successfully cancelled broadcasting task")
             except asyncio.CancelledError:
-                logger.error("Failed to cancel broadcasting task")
+                logger.info("Broadcast task cancelled successfully.")
 
     def _run_async_loop(self):
         """Run the asyncio event loop in the separate thread."""
