@@ -59,7 +59,7 @@ from src.shared.processes.constants import (
     VIDEO_OUT_STORE_RETRY_BACKOFF_TIME,
 )
 from src.health_monitoring.inference.config import FeaturesConfig, AnomalyConfig, ModelConfig
-from src.configs.utils import read_yaml_config
+from src.utils import read_yaml_config
 
 
 # ================================================================

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from src.configs.utils import (
+from utils import (
     parse_config_file,
     read_yaml_config,
     is_valid_pt_file,

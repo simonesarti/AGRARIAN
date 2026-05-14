@@ -1,6 +1,6 @@
 from src.configs.danger_detection import check_danger_detection_args
 from src.configs.drone import check_drone_args
-from src.configs.utils import read_yaml_config
+from src.utils import read_yaml_config
 from src.danger_detection.danger_detection import perform_danger_detection
 # from src.danger_detection.danger_detection_parallel import perform_danger_detection
 
