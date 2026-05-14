@@ -2,88 +2,50 @@ import math
 import re
 from typing import Any, Literal, Optional
 
-from pydantic import Field, NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt, SecretStr, computed_field, field_validator, model_validator
+from pydantic import Field, PositiveFloat, PositiveInt, SecretStr, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.shared.processes.constants import (
     ALERTS_COOLDOWN_SECONDS,
     ALERTS_JPEG_COMPRESSION_QUALITY,
-    ALERTS_MAX_CONSECUTIVE_FAILURES,
-    ALERTS_QUEUE_GET_TIMEOUT,
     DB_HOST,
-    DB_MANAGER_MAX_OVERFLOW,
-    DB_MANAGER_POOL_SIZE,
-    DB_MANAGER_QUEUE_SIZE,
-    DB_MANAGER_QUEUE_WAIT_TIMEOUT,
-    DB_MANAGER_THREAD_CLOSE_TIMEOUT,
     DB_PORT,
     DRONE_SENSOR_HEIGHT_MM,
     DRONE_SENSOR_HEIGHT_PIXELS,
     DRONE_SENSOR_WIDTH_MM,
     DRONE_SENSOR_WIDTH_PIXELS,
     DRONE_TRUE_FOCAL_LEN_MM,
-    FPS,
-    FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
-    FRAMETELCOMB_MAX_TIME_DIFF,
-    MAX_SIZE_DANGER_DETECTION_RESULT,
-    MAX_SIZE_DETECTION_IN,
-    MAX_SIZE_FRAME_READER_OUT,
-    MAX_SIZE_GEO_IN,
-    MAX_SIZE_NOTIFICATIONS_STREAM,
-    MAX_SIZE_SEGMENTATION_IN,
-    MAX_SIZE_VIDEO_STORAGE,
-    MAX_SIZE_VIDEO_STREAM,
-    PIPELINE_QUEUE_TIMEOUT,
-    POISON_PILL_TIMEOUT,
     SAFETY_RADIUS_M,
     SLOPE_ANGLE_THRESHOLD,
     TELEMETRY_LISTENER_HOST,
-    TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES,
-    TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT,
     TELEMETRY_LISTENER_PORT,
     TELEMETRY_LISTENER_QOS_LEVEL,
-    TELEMETRY_LISTENER_RECONNECT_DELAY,
     VIDEO_OUT_STORE_DELETE_LOCAL_ON_SUCCESS,
     VIDEO_OUT_STORE_LOCAL_TARGET_DIR,
-    VIDEO_OUT_STORE_MAX_UPLOAD_RETRIES,
-    VIDEO_OUT_STORE_QUEUE_GET_TIMEOUT,
-    VIDEO_OUT_STORE_RETRY_BACKOFF_TIME,
-    VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,
-    VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT,
     VIDEO_OUT_STREAM_HOST,
     VIDEO_OUT_STREAM_PORT,
-    VIDEO_OUT_STREAM_SHUTDOWN_TIMEOUT,
-    VIDEO_OUT_STREAM_STARTUP_TIMEOUT,
     VIDEO_OUT_STREAM_STREAM_KEY,
-    VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S,
-    VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES,
-    VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S,
-    VIDEO_STREAM_READER_FRAME_RETRY_DELAY,
     VIDEO_STREAM_READER_HOST,
-    VIDEO_STREAM_READER_MAX_CONSECUTIVE_CONNECTION_FAILURES,
     VIDEO_STREAM_READER_PORT,
-    VIDEO_STREAM_READER_RECONNECT_DELAY,
     VIDEO_STREAM_READER_STREAM_KEY,
-    VIDEO_WRITER_HANDOFF_TIMEOUT,
     WEBSOCKET_HOST,
     WEBSOCKET_PORT,
-    WS_MANAGER_BROADCAST_TIMEOUT,
-    WS_MANAGER_PING_INTERVAL,
-    WS_MANAGER_PING_TIMEOUT,
-    WS_MANAGER_THREAD_CLOSE_TIMEOUT,
 )
 
 
 class AppSettings(BaseSettings):
     """
-    Single source of truth for all pipeline configuration.
+    Single source of truth for deployment-varying pipeline configuration.
 
     Values are read from environment variables (case-insensitive) and from a
     .env file if present.  The field name maps 1-to-1 to the env var name:
-    e.g. field `fps` reads FPS, field `db_service` reads DB_SERVICE.
+    e.g. field `db_service` reads DB_SERVICE.
 
     env_ignore_empty=True means an empty string in the environment is treated
     the same as "not set" and causes the field default to be used instead.
+
+    Internal tuning constants (queue sizes, timeouts, retry counts) live in
+    constants.py and are not configurable via environment variables.
     """
 
     model_config = SettingsConfigDict(
@@ -94,25 +56,10 @@ class AppSettings(BaseSettings):
     )
 
     # ------------------------------------------------------------------ #
-    # PIPELINE QUEUE / BUFFER SIZES
-    # ------------------------------------------------------------------ #
-
-    max_size_frame_reader_out:        PositiveInt = MAX_SIZE_FRAME_READER_OUT
-    max_size_detection_in:            PositiveInt = MAX_SIZE_DETECTION_IN
-    max_size_segmentation_in:         PositiveInt = MAX_SIZE_SEGMENTATION_IN
-    max_size_geo_in:                  PositiveInt = MAX_SIZE_GEO_IN
-    max_size_danger_detection_result: PositiveInt = MAX_SIZE_DANGER_DETECTION_RESULT
-    max_size_video_stream:            PositiveInt = MAX_SIZE_VIDEO_STREAM
-    max_size_notifications_stream:    PositiveInt = MAX_SIZE_NOTIFICATIONS_STREAM
-    max_size_video_storage:           PositiveInt = MAX_SIZE_VIDEO_STORAGE
-
-    # ------------------------------------------------------------------ #
     # GENERAL
     # ------------------------------------------------------------------ #
 
-    fps:                    PositiveInt   = FPS
     alerts_cooldown_seconds: PositiveFloat = ALERTS_COOLDOWN_SECONDS
-    poison_pill_timeout:     PositiveFloat = POISON_PILL_TIMEOUT
 
     # ------------------------------------------------------------------ #
     # DRONE HARDWARE
@@ -128,8 +75,8 @@ class AppSettings(BaseSettings):
     # DANGER DETECTION PARAMETERS
     # ------------------------------------------------------------------ #
 
-    safety_radius_m:          PositiveFloat = SAFETY_RADIUS_M
-    slope_angle_threshold:    float = Field(default=SLOPE_ANGLE_THRESHOLD, ge=0, le=90)
+    safety_radius_m:       PositiveFloat = SAFETY_RADIUS_M
+    slope_angle_threshold: float         = Field(default=SLOPE_ANGLE_THRESHOLD, ge=0, le=90)
     # Parsed from "(lon1, lat1), (lon2, lat2), ..." — leave empty/unset to disable geofencing
     geofencing_vertexes: Optional[list[tuple[float, float]]] = None
 
@@ -137,56 +84,29 @@ class AppSettings(BaseSettings):
     # VIDEO STREAM READER
     # ------------------------------------------------------------------ #
 
-    video_stream_reader_protocol:                      Literal["rtsp", "rtmp", "rtmps", "rtsps"] = "rtsp"
-    video_stream_reader_host:                          str           = VIDEO_STREAM_READER_HOST
-    video_stream_reader_port:                          int           = Field(default=VIDEO_STREAM_READER_PORT, ge=1, le=65535)
-    video_stream_reader_stream_key:                    str           = VIDEO_STREAM_READER_STREAM_KEY
+    video_stream_reader_protocol:              Literal["rtsp", "rtmp", "rtmps", "rtsps"] = "rtsp"
+    video_stream_reader_host:                  str           = VIDEO_STREAM_READER_HOST
+    video_stream_reader_port:                  int           = Field(default=VIDEO_STREAM_READER_PORT, ge=1, le=65535)
+    video_stream_reader_stream_key:            str           = VIDEO_STREAM_READER_STREAM_KEY
     video_stream_reader_username: Optional[str]       = None
     video_stream_reader_password: Optional[SecretStr] = None
-    video_stream_reader_connection_open_timeout_s:           PositiveFloat    = VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S
-    video_stream_reader_reconnect_delay:                     PositiveFloat    = VIDEO_STREAM_READER_RECONNECT_DELAY
-    video_stream_reader_max_consecutive_connection_failures: NonNegativeInt   = VIDEO_STREAM_READER_MAX_CONSECUTIVE_CONNECTION_FAILURES
-    video_stream_reader_frame_read_timeout_s:                PositiveFloat    = VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S
-    video_stream_reader_frame_retry_delay:                   PositiveFloat    = VIDEO_STREAM_READER_FRAME_RETRY_DELAY
-    video_stream_reader_frame_max_consecutive_failures:      NonNegativeInt   = VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES
 
     # ------------------------------------------------------------------ #
     # TELEMETRY / MQTT
     # ------------------------------------------------------------------ #
 
-    telemetry_listener_protocol:           Literal["mqtt", "mqtts"] = "mqtt"
-    telemetry_listener_host:               str              = TELEMETRY_LISTENER_HOST
-    telemetry_listener_port:               int              = Field(default=TELEMETRY_LISTENER_PORT, ge=1, le=65535)
+    telemetry_listener_protocol:              Literal["mqtt", "mqtts"] = "mqtt"
+    telemetry_listener_host:                  str              = TELEMETRY_LISTENER_HOST
+    telemetry_listener_port:                  int              = Field(default=TELEMETRY_LISTENER_PORT, ge=1, le=65535)
     telemetry_listener_username: Optional[str]       = None
     telemetry_listener_password: Optional[SecretStr] = None
-    telemetry_listener_qos_level:          Literal[0, 1, 2] = TELEMETRY_LISTENER_QOS_LEVEL
-    telemetry_listener_reconnect_delay:       PositiveFloat = TELEMETRY_LISTENER_RECONNECT_DELAY
-    telemetry_listener_msg_wait_timeout:      PositiveFloat = TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT
-    telemetry_listener_max_incoming_messages: PositiveInt   = TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES
-
-    # ------------------------------------------------------------------ #
-    # FRAME + TELEMETRY COMBINER
-    # ------------------------------------------------------------------ #
-
-    frametelcomb_max_telem_buffer_size: PositiveInt      = FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE
-    frametelcomb_max_time_diff:         NonNegativeFloat = FRAMETELCOMB_MAX_TIME_DIFF
-
-    # ------------------------------------------------------------------ #
-    # PIPELINE QUEUE TIMEOUT
-    # ------------------------------------------------------------------ #
-
-    # Single timeout (seconds) for all hot-path queue get/put calls across
-    # every stage: stream reader, combiner, models, annotation, video writer,
-    # video streamer. Controls shutdown responsiveness only.
-    pipeline_queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
+    telemetry_listener_qos_level: Literal[0, 1, 2] = TELEMETRY_LISTENER_QOS_LEVEL
 
     # ------------------------------------------------------------------ #
     # ALERTS WRITER
     # ------------------------------------------------------------------ #
 
-    alerts_queue_get_timeout:        PositiveFloat  = ALERTS_QUEUE_GET_TIMEOUT
-    alerts_max_consecutive_failures: NonNegativeInt = ALERTS_MAX_CONSECUTIVE_FAILURES
-    alerts_jpeg_compression_quality:   int   = Field(default=ALERTS_JPEG_COMPRESSION_QUALITY,   ge=0, le=100)
+    alerts_jpeg_compression_quality: int = Field(default=ALERTS_JPEG_COMPRESSION_QUALITY, ge=0, le=100)
 
     # ------------------------------------------------------------------ #
     # WEBSOCKET SERVER
@@ -194,10 +114,6 @@ class AppSettings(BaseSettings):
 
     websocket_host: str = WEBSOCKET_HOST
     websocket_port: int = Field(default=WEBSOCKET_PORT, ge=1, le=65535)
-    ws_manager_broadcast_timeout:    PositiveFloat = WS_MANAGER_BROADCAST_TIMEOUT
-    ws_manager_ping_interval:        PositiveFloat = WS_MANAGER_PING_INTERVAL
-    ws_manager_ping_timeout:         PositiveFloat = WS_MANAGER_PING_TIMEOUT
-    ws_manager_thread_close_timeout: PositiveFloat = WS_MANAGER_THREAD_CLOSE_TIMEOUT
 
     # ------------------------------------------------------------------ #
     # DATABASE
@@ -211,17 +127,6 @@ class AppSettings(BaseSettings):
     db_worker_password: Optional[SecretStr] = None
     db_username:        str                 = ""
     db_password:        SecretStr           = ""
-    db_manager_pool_size:            PositiveInt = DB_MANAGER_POOL_SIZE
-    db_manager_max_overflow:         int         = Field(default=DB_MANAGER_MAX_OVERFLOW, ge=-1)
-    db_manager_queue_size:           PositiveInt = DB_MANAGER_QUEUE_SIZE
-    db_manager_queue_wait_timeout:   PositiveFloat = DB_MANAGER_QUEUE_WAIT_TIMEOUT
-    db_manager_thread_close_timeout: PositiveFloat = DB_MANAGER_THREAD_CLOSE_TIMEOUT
-
-    # ------------------------------------------------------------------ #
-    # VIDEO WRITER
-    # ------------------------------------------------------------------ #
-
-    video_writer_handoff_timeout: PositiveFloat = VIDEO_WRITER_HANDOFF_TIMEOUT
 
     # ------------------------------------------------------------------ #
     # VIDEO STREAM OUTPUT (RTMP → media server)
@@ -233,31 +138,24 @@ class AppSettings(BaseSettings):
     video_out_stream_stream_key:             str           = VIDEO_OUT_STREAM_STREAM_KEY
     video_out_stream_username: Optional[str]       = None
     video_out_stream_password: Optional[SecretStr] = None
-    video_out_stream_ffmpeg_startup_timeout:  PositiveFloat = VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT
-    video_out_stream_ffmpeg_shutdown_timeout: PositiveFloat = VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT
-    video_out_stream_startup_timeout:         PositiveFloat = VIDEO_OUT_STREAM_STARTUP_TIMEOUT
-    video_out_stream_shutdown_timeout:        PositiveFloat = VIDEO_OUT_STREAM_SHUTDOWN_TIMEOUT
 
     # ------------------------------------------------------------------ #
     # VIDEO STORAGE (cloud / local upload after recording)
     # ------------------------------------------------------------------ #
 
     # Service: azure, aws, local
-    video_out_store_service:              Literal["azure", "aws", "local"] = "local"
-    video_out_store_delete_local_on_success: bool  = VIDEO_OUT_STORE_DELETE_LOCAL_ON_SUCCESS
-    video_out_store_queue_get_timeout:  PositiveFloat  = VIDEO_OUT_STORE_QUEUE_GET_TIMEOUT
-    video_out_store_max_upload_retries: NonNegativeInt = VIDEO_OUT_STORE_MAX_UPLOAD_RETRIES
-    video_out_store_retry_backoff_time: PositiveFloat  = VIDEO_OUT_STORE_RETRY_BACKOFF_TIME
+    video_out_store_service:                 Literal["azure", "aws", "local"] = "local"
+    video_out_store_delete_local_on_success: bool = VIDEO_OUT_STORE_DELETE_LOCAL_ON_SUCCESS
     # Azure Blob Storage
     video_out_store_azure_connection_string: Optional[SecretStr] = None
     video_out_store_azure_container_name:    Optional[str]       = None
-    video_out_store_azure_blob_prefix:       str           = ""
+    video_out_store_azure_blob_prefix:       str                 = ""
     # AWS S3
-    video_out_store_aws_bucket_name:         Optional[str] = None
-    video_out_store_aws_key_prefix:          str           = ""
-    video_out_store_aws_access_key_id:     Optional[str]       = None
-    video_out_store_aws_secret_access_key: Optional[SecretStr] = None
-    video_out_store_aws_region_name:         Optional[str] = None
+    video_out_store_aws_bucket_name:         Optional[str]       = None
+    video_out_store_aws_key_prefix:          str                 = ""
+    video_out_store_aws_access_key_id:       Optional[str]       = None
+    video_out_store_aws_secret_access_key:   Optional[SecretStr] = None
+    video_out_store_aws_region_name:         Optional[str]       = None
     # Local (testing / no-cloud fallback)
     video_out_store_local_target_dir: str = VIDEO_OUT_STORE_LOCAL_TARGET_DIR
 

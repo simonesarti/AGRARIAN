@@ -6,11 +6,9 @@ import logging
 
 from src.shared.processes.app_settings import AppSettings
 from src.shared.processes.stream_video_reader import StreamVideoReader, StreamVideoReaderConfig
-from src.shared.processes.frame_telemetry_combiner import FrameTelemetryCombiner, FrameTelemetryCombinerConfig
-from src.danger_detection.processes.detection import DetectionWorker, DetectionWorkerConfig
-from src.danger_detection.processes.segmentation import SegmentationWorker, SegmentationWorkerConfig
-from src.danger_detection.processes.geo import GeoWorker, GeoWorkerConfig
-from src.danger_detection.processes.danger_annotation import DangerAnnotationWorker, DangerAnnotationWorkerConfig
+from src.health_monitoring.processes.hm_tracking_worker import HMTrackingWorker, HMTrackingWorkerConfig
+from src.health_monitoring.processes.hm_anomaly_worker import HMAnomalyDetectionWorker, HMAnomalyDetectionWorkerConfig
+from src.health_monitoring.processes.hm_annotation_worker import HMAnnotationWorker, HMAnnotationWorkerConfig
 from src.shared.processes.output_alert_streamer import NotificationsStreamWriter, NotificationsStreamWriterConfig
 from src.shared.processes.output_video_streamer import VideoProducerProcess, VideoProducerProcessConfig
 from src.shared.processes.video_storage_manager import (
@@ -28,8 +26,6 @@ from src.shared.processes.constants import (
     VIDEO_STREAM_READER_ORIGINAL_SHAPE,
     MAX_SIZE_FRAME_READER_OUT,
     MAX_SIZE_DETECTION_IN,
-    MAX_SIZE_SEGMENTATION_IN,
-    MAX_SIZE_GEO_IN,
     MAX_SIZE_DANGER_DETECTION_RESULT,
     MAX_SIZE_NOTIFICATIONS_STREAM,
     MAX_SIZE_VIDEO_STREAM,
@@ -42,11 +38,6 @@ from src.shared.processes.constants import (
     VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S,
     VIDEO_STREAM_READER_FRAME_RETRY_DELAY,
     VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES,
-    TELEMETRY_LISTENER_RECONNECT_DELAY,
-    TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT,
-    TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES,
-    FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
-    FRAMETELCOMB_MAX_TIME_DIFF,
     ALERTS_QUEUE_GET_TIMEOUT,
     ALERTS_MAX_CONSECUTIVE_FAILURES,
     WS_MANAGER_PING_INTERVAL,
@@ -67,6 +58,7 @@ from src.shared.processes.constants import (
     VIDEO_OUT_STORE_MAX_UPLOAD_RETRIES,
     VIDEO_OUT_STORE_RETRY_BACKOFF_TIME,
 )
+from src.health_monitoring.inference.config import FeaturesConfig, AnomalyConfig, ModelConfig
 from src.configs.utils import read_yaml_config
 
 
@@ -75,7 +67,7 @@ from src.configs.utils import read_yaml_config
 logger = logging.getLogger("main")
 
 if not logger.handlers:
-    _handler = logging.FileHandler('./logs/main_dd.log', mode='w')
+    _handler = logging.FileHandler('./logs/main_hm.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
     logger.setLevel(logging.INFO)
@@ -91,14 +83,10 @@ def main():
         logger.critical(f"Configuration error: {e}", exc_info=True)
         exit(1)
 
-    detection_args    = read_yaml_config("configs/danger_detection/detector.yaml")
-    segmentation_args = read_yaml_config("configs/danger_detection/segmenter.yaml")
-
-    dem_path              = Path("dem/dem.tif")
-    dem_mask_path         = Path("dem/dem_mask.tif")
-    output_dir            = Path(LOCAL_OUTPUT_DIR)
+    tracking_args          = read_yaml_config("configs/health_monitoring/tracker.yaml")
+    anomaly_detection_args = read_yaml_config("configs/health_monitoring/anomaly_detector.yaml")
+    output_dir = Path(LOCAL_OUTPUT_DIR)
     output_dir.mkdir(exist_ok=True, parents=True)
-    mqtt_certificates_dir = Path("certificates") / "mqtt"
 
     session_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
 
@@ -107,48 +95,41 @@ def main():
     error_event = mp.Event()
 
     # ============== FRAME BUFFER SHAPES ==============
-    # Shapes are (H, W, C) — NumPy convention
+    # Shapes are (H, W, C) — NumPy convention.
+    # All stages pass 3-channel BGR frames; only the resolution changes at annotation.
 
     _proc_h, _proc_w = VIDEO_STREAM_READER_PROCESSING_SHAPE[1], VIDEO_STREAM_READER_PROCESSING_SHAPE[0]
     _orig_h, _orig_w = VIDEO_STREAM_READER_ORIGINAL_SHAPE[1],   VIDEO_STREAM_READER_ORIGINAL_SHAPE[0]
 
     _3ch = (_proc_h, _proc_w, 3)
-    _5ch = (_proc_h, _proc_w, 5)
-    _8ch = (_proc_h, _proc_w, 8)
     _ann = (_orig_h, _orig_w, 3)
 
     # ============== FRAME BUFFERS ==============
     # n_slots matches the corresponding metadata queue maxsize: each queue entry
     # holds exactly one slot index, so queue capacity == max in-flight frames.
 
-    reader_to_combiner_buf        = FrameBuffer(_3ch, n_slots=MAX_SIZE_FRAME_READER_OUT)
-    combiner_to_detection_buf     = FrameBuffer(_3ch, n_slots=MAX_SIZE_DETECTION_IN)
-    detection_to_segmentation_buf = FrameBuffer(_3ch, n_slots=MAX_SIZE_SEGMENTATION_IN)
-    segmentation_to_geo_buf       = FrameBuffer(_5ch, n_slots=MAX_SIZE_GEO_IN)
-    geo_to_annotation_buf         = FrameBuffer(_8ch, n_slots=MAX_SIZE_DANGER_DETECTION_RESULT)
-    annotation_to_alert_buf       = FrameBuffer(_ann, n_slots=MAX_SIZE_NOTIFICATIONS_STREAM)
-    annotation_to_video_buf       = FrameBuffer(_ann, n_slots=MAX_SIZE_VIDEO_STREAM)
+    reader_to_tracking_buf    = FrameBuffer(_3ch, n_slots=MAX_SIZE_FRAME_READER_OUT)
+    tracking_to_anomaly_buf   = FrameBuffer(_3ch, n_slots=MAX_SIZE_DETECTION_IN)
+    anomaly_to_annotation_buf = FrameBuffer(_3ch, n_slots=MAX_SIZE_DANGER_DETECTION_RESULT)
+    annotation_to_alert_buf   = FrameBuffer(_ann, n_slots=MAX_SIZE_NOTIFICATIONS_STREAM)
+    annotation_to_video_buf   = FrameBuffer(_ann, n_slots=MAX_SIZE_VIDEO_STREAM)
 
     frame_buffers = [
-        reader_to_combiner_buf,
-        combiner_to_detection_buf,
-        detection_to_segmentation_buf,
-        segmentation_to_geo_buf,
-        geo_to_annotation_buf,
+        reader_to_tracking_buf,
+        tracking_to_anomaly_buf,
+        anomaly_to_annotation_buf,
         annotation_to_alert_buf,
         annotation_to_video_buf,
     ]
 
     # ============== METADATA QUEUES ==============
 
-    reader_to_combiner_q        = mp.Queue(maxsize=MAX_SIZE_FRAME_READER_OUT)
-    combiner_to_detection_q     = mp.Queue(maxsize=MAX_SIZE_DETECTION_IN)
-    detection_to_segmentation_q = mp.Queue(maxsize=MAX_SIZE_SEGMENTATION_IN)
-    segmentation_to_geo_q       = mp.Queue(maxsize=MAX_SIZE_GEO_IN)
-    geo_to_annotation_q         = mp.Queue(maxsize=MAX_SIZE_DANGER_DETECTION_RESULT)
-    annotation_to_alert_q       = mp.Queue(maxsize=MAX_SIZE_NOTIFICATIONS_STREAM)
-    annotation_to_video_q       = mp.Queue(maxsize=MAX_SIZE_VIDEO_STREAM)
-    video_to_persistence_q      = mp.Queue(maxsize=1)
+    reader_to_tracking_q    = mp.Queue(maxsize=MAX_SIZE_FRAME_READER_OUT)
+    tracking_to_anomaly_q   = mp.Queue(maxsize=MAX_SIZE_DETECTION_IN)
+    anomaly_to_annotation_q = mp.Queue(maxsize=MAX_SIZE_DANGER_DETECTION_RESULT)
+    annotation_to_alert_q   = mp.Queue(maxsize=MAX_SIZE_NOTIFICATIONS_STREAM)
+    annotation_to_video_q   = mp.Queue(maxsize=MAX_SIZE_VIDEO_STREAM)
+    video_to_persistence_q  = mp.Queue(maxsize=1)
 
     # ============== BUILD PROCESS CONFIGS ==============
 
@@ -164,59 +145,25 @@ def main():
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
-    combiner_config = FrameTelemetryCombinerConfig(
-        mqtt_protocol=s.telemetry_listener_protocol,
-        mqtt_broker_host=s.telemetry_listener_host,
-        mqtt_broker_port=s.telemetry_listener_port,
-        mqtt_username=s.telemetry_listener_username,
-        mqtt_password=s.telemetry_listener_password.get_secret_value() if s.telemetry_listener_password else None,
-        mqtt_qos_level=s.telemetry_listener_qos_level,
-        mqtt_max_msg_wait_s=TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT,
-        mqtt_reconnect_delay_s=TELEMETRY_LISTENER_RECONNECT_DELAY,
-        mqtt_ca_certs_path=(
-            str(mqtt_certificates_dir)
-            if s.telemetry_listener_protocol == "mqtts"
-            else None
-        ),
-        mqtt_max_incoming_messages=TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES,
-        telemetry_buffer_max_size=FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
-        max_time_diff_s=FRAMETELCOMB_MAX_TIME_DIFF,
+    _tracking_checkpoint = tracking_args.pop("model_checkpoint")
+    tracking_config = HMTrackingWorkerConfig(
+        model_checkpoint=_tracking_checkpoint,
+        track_kwargs=tracking_args,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
-    # Model configs are loaded from YAML; Pydantic validates checkpoint path etc.
-    detection_config    = DetectionWorkerConfig(
-        **detection_args,
-        queue_timeout=PIPELINE_QUEUE_TIMEOUT,
-        poison_pill_timeout=POISON_PILL_TIMEOUT,
-    )
-    segmentation_config = SegmentationWorkerConfig(
-        **segmentation_args,
-        queue_timeout=PIPELINE_QUEUE_TIMEOUT,
-        poison_pill_timeout=POISON_PILL_TIMEOUT,
-    )
-
-    geo_config = GeoWorkerConfig(
-        input_args={
-            "dem":                   str(dem_path),
-            "dem_mask":              str(dem_mask_path),
-            "safety_radius_m":       s.safety_radius_m,
-            "slope_angle_threshold": s.slope_angle_threshold,
-            "geofencing_vertexes":   s.geofencing_vertexes,
-        },
-        drone_args={
-            "true_focal_len_mm":    s.drone_true_focal_len_mm,
-            "sensor_width_mm":      s.drone_sensor_width_mm,
-            "sensor_height_mm":     s.drone_sensor_height_mm,
-            "sensor_width_pixels":  s.drone_sensor_width_pixels,
-            "sensor_height_pixels": s.drone_sensor_height_pixels,
-        },
+    anomaly_config = HMAnomalyDetectionWorkerConfig(
+        features_cfg=FeaturesConfig(**anomaly_detection_args.get("features", {})),
+        anomaly_cfg=AnomalyConfig(**anomaly_detection_args.get("anomaly", {})),
+        model_cfg=ModelConfig(**anomaly_detection_args.get("model", {})),
+        weights_path=anomaly_detection_args.get("weights_path"),
+        device=anomaly_detection_args.get("device", "cpu"),
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
-    danger_annotation_config = DangerAnnotationWorkerConfig(
+    annotation_config = HMAnnotationWorkerConfig(
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
@@ -297,57 +244,39 @@ def main():
 
     try:
         video_reader_process = StreamVideoReader(
-            output_meta_queue=reader_to_combiner_q,
-            output_frame_buffer=reader_to_combiner_buf,
+            output_meta_queue=reader_to_tracking_q,
+            output_frame_buffer=reader_to_tracking_buf,
             error_event=error_event,
             config=video_reader_config,
         )
 
-        combiner_process = FrameTelemetryCombiner(
-            input_meta_queue=reader_to_combiner_q,
-            input_frame_buffer=reader_to_combiner_buf,
-            output_meta_queue=combiner_to_detection_q,
-            output_frame_buffer=combiner_to_detection_buf,
+        tracking_process = HMTrackingWorker(
+            input_meta_queue=reader_to_tracking_q,
+            input_frame_buffer=reader_to_tracking_buf,
+            output_meta_queue=tracking_to_anomaly_q,
+            output_frame_buffer=tracking_to_anomaly_buf,
             error_event=error_event,
-            config=combiner_config,
+            config=tracking_config,
         )
 
-        detection_process = DetectionWorker(
-            input_meta_queue=combiner_to_detection_q,
-            input_frame_buffer=combiner_to_detection_buf,
-            output_meta_queue=detection_to_segmentation_q,
-            output_frame_buffer=detection_to_segmentation_buf,
+        anomaly_process = HMAnomalyDetectionWorker(
+            input_meta_queue=tracking_to_anomaly_q,
+            input_frame_buffer=tracking_to_anomaly_buf,
+            output_meta_queue=anomaly_to_annotation_q,
+            output_frame_buffer=anomaly_to_annotation_buf,
             error_event=error_event,
-            config=detection_config,
+            config=anomaly_config,
         )
 
-        segmentation_process = SegmentationWorker(
-            input_meta_queue=detection_to_segmentation_q,
-            input_frame_buffer=detection_to_segmentation_buf,
-            output_meta_queue=segmentation_to_geo_q,
-            output_frame_buffer=segmentation_to_geo_buf,
-            error_event=error_event,
-            config=segmentation_config,
-        )
-
-        geo_process = GeoWorker(
-            input_meta_queue=segmentation_to_geo_q,
-            input_frame_buffer=segmentation_to_geo_buf,
-            output_meta_queue=geo_to_annotation_q,
-            output_frame_buffer=geo_to_annotation_buf,
-            error_event=error_event,
-            config=geo_config,
-        )
-
-        danger_annotation_process = DangerAnnotationWorker(
-            input_meta_queue=geo_to_annotation_q,
-            input_frame_buffer=geo_to_annotation_buf,
+        annotation_process = HMAnnotationWorker(
+            input_meta_queue=anomaly_to_annotation_q,
+            input_frame_buffer=anomaly_to_annotation_buf,
             alert_output_meta_queue=annotation_to_alert_q,
             alert_output_frame_buffer=annotation_to_alert_buf,
             video_output_meta_queue=annotation_to_video_q,
             video_output_frame_buffer=annotation_to_video_buf,
             error_event=error_event,
-            config=danger_annotation_config,
+            config=annotation_config,
         )
 
         alert_writer_process = NotificationsStreamWriter(
@@ -382,11 +311,9 @@ def main():
 
     processes = [
         video_reader_process,
-        combiner_process,
-        detection_process,
-        segmentation_process,
-        geo_process,
-        danger_annotation_process,
+        tracking_process,
+        anomaly_process,
+        annotation_process,
         alert_writer_process,
         video_producer_process,
         video_persistence_process,
