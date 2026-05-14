@@ -19,7 +19,6 @@ from src.shared.processes.constants import (
     VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO,
     VIDEO_STREAM_READER_PROCESSING_SHAPE,
     PIPELINE_QUEUE_TIMEOUT,
-    DOWNSAMPLING_MODE,
     POISON_PILL,
     POISON_PILL_TIMEOUT,
 )
@@ -269,7 +268,7 @@ class StreamVideoReader(mp.Process):
                         frame = cv2.resize(
                             frame, 
                             self.config.processing_shape, 
-                            interpolation=DOWNSAMPLING_MODE,
+                            interpolation=cv2.INTER_LINEAR,
                         )
                     except cv2.error:
                         total_read_failures += 1

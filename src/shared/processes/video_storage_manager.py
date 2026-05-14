@@ -6,7 +6,7 @@ import multiprocessing as mp
 import multiprocessing.synchronize
 from queue import Empty as QueueEmptyException
 from typing import Optional
-from pydantic import BaseModel, PositiveFloat, PositiveInt
+from pydantic import BaseModel, NonNegativeInt, PositiveFloat, PositiveInt
 
 from src.shared.processes.constants import (
     VIDEO_OUT_STORE_DELETE_LOCAL_ON_SUCCESS,
@@ -33,7 +33,7 @@ class VideoPersistenceProcessConfig(BaseModel):
     """Base configuration for VideoPersistenceProcess."""
 
     queue_get_timeout: PositiveFloat = VIDEO_OUT_STORE_QUEUE_GET_TIMEOUT
-    max_retries: PositiveInt = VIDEO_OUT_STORE_MAX_UPLOAD_RETRIES
+    max_retries: NonNegativeInt = VIDEO_OUT_STORE_MAX_UPLOAD_RETRIES
     retry_backoff_s: PositiveFloat = VIDEO_OUT_STORE_RETRY_BACKOFF_TIME
     delete_local_on_success: bool = VIDEO_OUT_STORE_DELETE_LOCAL_ON_SUCCESS
 

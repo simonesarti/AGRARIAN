@@ -19,11 +19,8 @@ from src.shared.processes.constants import (
     FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
     FRAMETELCOMB_MAX_TIME_DIFF,
     PIPELINE_QUEUE_TIMEOUT,
-    MQTT,
-    MQTTS,
     POISON_PILL,
     POISON_PILL_TIMEOUT,
-    TELEMETRY_LISTENER_CERT_VALIDATION,
     TELEMETRY_LISTENER_HOST,
     TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES,
     TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT,
@@ -55,7 +52,7 @@ class FrameTelemetryCombinerConfig(BaseModel):
     """Configuration for FrameTelemetryCombiner."""
 
     # MQTT connection
-    mqtt_protocol: str = MQTT
+    mqtt_protocol: Literal["mqtt", "mqtts"] = "mqtt"
     mqtt_broker_host: str = TELEMETRY_LISTENER_HOST
     mqtt_broker_port: int = Field(default=TELEMETRY_LISTENER_PORT, ge=1, le=65535)
     mqtt_username: Optional[str] = None
@@ -64,7 +61,7 @@ class FrameTelemetryCombinerConfig(BaseModel):
     mqtt_max_msg_wait_s: PositiveFloat = TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT
     mqtt_reconnect_delay_s: PositiveFloat = TELEMETRY_LISTENER_RECONNECT_DELAY
     mqtt_ca_certs_path: Optional[str] = None          # required for MQTTS
-    mqtt_cert_validation: Optional[int] = TELEMETRY_LISTENER_CERT_VALIDATION
+    mqtt_cert_validation: Optional[int] = ssl.CERT_REQUIRED
     mqtt_max_incoming_messages: PositiveInt = TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES
 
     # Telemetry–frame timestamp matching
@@ -151,7 +148,7 @@ class FrameTelemetryCombiner(mp.Process):
     def _create_mqtt_client(self) -> Client:
         """Build an aiomqtt Client from the config."""
         tls_params = None
-        if self.config.mqtt_protocol == MQTTS:
+        if self.config.mqtt_protocol == "mqtts":
             # TLS is required for MQTTS; a CA certificate file must be provided
             tls_params = TLSParameters(
                 ca_certs=self.config.mqtt_ca_certs_path,

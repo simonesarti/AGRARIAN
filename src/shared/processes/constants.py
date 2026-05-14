@@ -1,9 +1,8 @@
-import ssl  # Needed for creating SSL context parameters
-import cv2
+# -------------------------- APPLICATION MODES --------------------------
+
+SUPPORTED_APP_MODES = ("danger_detection", "health_monitoring")
 
 # -------------------------- GENERAL --------------------------
-
-NOT_SPECIFIED = "not_specified"
 
 # target FPS for processing and output
 FPS = 30
@@ -15,20 +14,11 @@ POISON_PILL = "HALT"
 POISON_PILL_TIMEOUT = 5.0                                               # 5.0 s
 SHUTDOWN_TIMEOUT = 10.0                                                 # 10.0 s
 
-# image downsampling interpolation
-DOWNSAMPLING_MODE = cv2.INTER_LINEAR
-
-# image upsampling interpolation
-UPSAMPLING_MODE = cv2.INTER_LINEAR
 
 # str: Name of the directory where the results of the analysis will be saved
 LOCAL_OUTPUT_DIR = 'processing_results'
 
-# str: Name of the files on which alerts will be saved
-ALERTS_FILE_NAME = 'alerts.txt'
-
 # str: Name of the video showing the annotated original data (with/without sheep count and tracks)
-ANNOTATED_VIDEO_NAME = 'annotated_video.mp4'
 CODEC = 'mp4v'
 
 # agrarian database name
@@ -41,10 +31,6 @@ SAFETY_RADIUS_M = 2.0                                                      # met
 
 # float: slope angle after which the portion of terrain is considered dangerous for the animals
 SLOPE_ANGLE_THRESHOLD = 30.0
-
-# set of tuples (longitude, latitude) defining the points marking the vertexes of the geofencing area
-# set to None to deactivate
-GEOFENCING_VERTEXES = NOT_SPECIFIED
 
 # -------------------------- HEALTH MONITORING PARAMETERS --------------------------
 
@@ -75,28 +61,6 @@ DRONE_SENSOR_HEIGHT_PIXELS = 3956  # standard Effective 20MP for 4/3 CMOS sensor
 
 ALL_INTERFACES = "0.0.0.0"
 
-RTMP = "rtmp"
-RTMPS = "rtmps"
-RTSP = "rtsp"
-RTSPS = "rtsps"
-HTTP = "http"
-HTTPS = "https"
-MQTT = "mqtt"
-MQTTS = "mqtts"
-WEBRTC = "webrtc"
-HLS = "hls"
-WS = "ws"
-WSS = "wss"
-
-POSTGRESQL = "postgresql"
-MYSQL = "mysql"
-SQLITE = "sqlite"
-
-AZURE = "azure"
-AWS = "aws"
-GOOGLE = "google"
-LOCAL = "local"
-
 HTTP_PORT = 80
 HTTPS_PORT = 8443
 MQTT_PORT = 1883
@@ -114,14 +78,9 @@ DB_COMMON_PORT = 5432
 # -------------------------- PROCESSES QUEUES SIZES --------------------------
 
 MAX_SIZE_FRAME_READER_OUT=3
-MAX_SIZE_TELEMETRY_READER_OUT=20
 MAX_SIZE_DETECTION_IN=3
 MAX_SIZE_SEGMENTATION_IN=3
 MAX_SIZE_GEO_IN=3
-MAX_SIZE_DETECTION_RESULTS=3
-MAX_SIZE_SEGMENTATION_RESULTS=3
-MAX_SIZE_GEO_RESULTS=3
-MAX_SIZE_MODELS_ALIGNMENT_RESULTS=6   # balance many fast with a few slow
 MAX_SIZE_DANGER_DETECTION_RESULT=3
 MAX_SIZE_VIDEO_STREAM=3
 MAX_SIZE_NOTIFICATIONS_STREAM=5
@@ -134,13 +93,8 @@ MAX_SIZE_VIDEO_STORAGE=3
 # VIDEO_STREAM_URL = "rtsp://[user[:password]@]host[:port]/path"
 # VIDEO_STREAM_URL = "rtsps://[user[:password]@]host[:port]/path"
 
-VIDEO_STREAM_READER_USERNAME = NOT_SPECIFIED  
-VIDEO_STREAM_READER_PASSWORD = NOT_SPECIFIED
-
 VIDEO_STREAM_READER_HOST = ALL_INTERFACES
-VIDEO_STREAM_READER_ALLOWED_PROTOCOLS = (RTSP, RTMP, RTMPS, RTSPS)
-VIDEO_STREAM_READER_PROTOCOL = RTSP                     # use rtsp by default
-VIDEO_STREAM_READER_PORT = RTSP_PORT                    # use rtsp by default
+VIDEO_STREAM_READER_PORT = RTSP_PORT
 VIDEO_STREAM_READER_STREAM_KEY = "drone"
 
 VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S = 5.0
@@ -151,8 +105,6 @@ VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S = 0.05                         # 50 ms
 VIDEO_STREAM_READER_FRAME_RETRY_DELAY = 0.05                            # 50 ms
 VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES = FPS                # 1 second worth of failures
 
-VIDEO_STREAM_READER_BUFFER_SIZE = 1
-
 VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO = 16.0/9.0
 VIDEO_STREAM_READER_PROCESSING_SHAPE = (1280, 720)  # (W,H)
 VIDEO_STREAM_READER_ORIGINAL_SHAPE = (1920, 1080)   # (W,H) expected original resolution for output buffer pre-allocation
@@ -161,24 +113,14 @@ VIDEO_STREAM_READER_ORIGINAL_SHAPE = (1920, 1080)   # (W,H) expected original re
 
 # -------------------------- TELEMETRY READER --------------------------
 
-TELEMETRY_LISTENER_USERNAME = NOT_SPECIFIED
-TELEMETRY_LISTENER_PASSWORD = NOT_SPECIFIED
-
 TELEMETRY_LISTENER_HOST = ALL_INTERFACES
-TELEMETRY_LISTENER_ALLOWED_PROTOCOLS = (MQTT, MQTTS)
-TELEMETRY_LISTENER_PROTOCOL = MQTT              # use mqtt by default
-TELEMETRY_LISTENER_PORT = MQTT_PORT             # use mqtt by default
+TELEMETRY_LISTENER_PORT = MQTT_PORT
 
 # QoS 0 (At most once): no acknowledgment from the receiver
 # QoS 1 (At least once):  ensures that messages are delivered at least once by requiring a PUBACK acknowledgment
 # QoS 2 (Exactly once): guarantees that each message is delivered exactly once by using a four-step handshake
 # (PUBLISH, PUBREC, PUBREL, PUBCOMP)
 TELEMETRY_LISTENER_QOS_LEVEL = 1
-
-# If the DJI broker requires a specific root certificate, download it and
-# specify its path here. If using a public broker with a standard certificate,
-# setting 'cert_reqs' to CERT_REQUIRED is often enough, but you may need 'ca_certs'.
-TELEMETRY_LISTENER_CERT_VALIDATION = ssl.CERT_REQUIRED  # for mqtts, ensure the broker's certificate is valid
 
 # Seconds to wait before attempting reconnection
 TELEMETRY_LISTENER_RECONNECT_DELAY = 5.0
@@ -212,11 +154,8 @@ TELEMETRY_LISTENER_TEMPLATE_TELEMETRY = {
 # -------------------------------------------------------------------
 # -------------------------- FRAME + TELEMETRY COMBINING ------------
 # -------------------------------------------------------------------
-FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE = MAX_SIZE_TELEMETRY_READER_OUT * 2    # double process input queue
+FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE = 40
 FRAMETELCOMB_MAX_TIME_DIFF = 0.15                   # 150 ms
-FRAMETELCOMB_QUEUE_PUT_MAX_RETRIES = 3              # 3
-FRAMETELCOMB_QUEUE_PUT_BACKOFF = 0.005              # 5 ms  (15 ms over 3 retries)
-
 # -------------------------------------------------------------------
 # -------------------------- PIPELINE QUEUE TIMEOUT -----------------
 # -------------------------------------------------------------------
@@ -252,12 +191,7 @@ WS_MANAGER_THREAD_CLOSE_TIMEOUT = 5.0                   # 5.0 s
 
 # -------------------------- ALERTS DB --------------------------
 
-DB_USERNAME = NOT_SPECIFIED              
-DB_PASSWORD = NOT_SPECIFIED              
-
 DB_HOST = ALL_INTERFACES
-DB_ALLOWED_SERVICES = (None, SQLITE, POSTGRESQL, MYSQL)
-DB_SERVICE = NOT_SPECIFIED                # don't use DB by default
 DB_PORT = DB_COMMON_PORT                  
 
 DB_MANAGER_QUEUE_SIZE = 5
@@ -277,13 +211,8 @@ VIDEO_WRITER_HANDOFF_TIMEOUT = 1.0
 
 # ------------------------- OUT VIDEO STREAM  --------------------------
 
-VIDEO_OUT_STREAM_USERNAME = NOT_SPECIFIED
-VIDEO_OUT_STREAM_PASSWORD = NOT_SPECIFIED
-
 VIDEO_OUT_STREAM_HOST = ALL_INTERFACES
-VIDEO_OUT_STREAM_ALLOWED_PROTOCOLS = (RTMP)    # (RTMP, RTMPS)
-VIDEO_OUT_STREAM_PROTOCOL = RTMP                     # use rtmp by default
-VIDEO_OUT_STREAM_PORT = RTMP_PORT                    # use rtmp by default
+VIDEO_OUT_STREAM_PORT = RTMP_PORT
 VIDEO_OUT_STREAM_STREAM_KEY = "annot"
 
 VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT = 0.5               # 0.5 s
@@ -293,25 +222,10 @@ VIDEO_OUT_STREAM_SHUTDOWN_TIMEOUT = 5.0                     # 5.0 s
 
 # ------------------------- OUT VIDEO STORE  --------------------------
 
-VIDEO_OUT_STORE_ALLOWED_SERVICES = (AWS, AZURE, GOOGLE, LOCAL)
-VIDEO_OUT_STORE_SERVICE = LOCAL                            # use local by default (safe for testing)
-
 VIDEO_OUT_STORE_DELETE_LOCAL_ON_SUCCESS = True
 VIDEO_OUT_STORE_QUEUE_GET_TIMEOUT = 3.0                     # 3.0 s
 VIDEO_OUT_STORE_MAX_UPLOAD_RETRIES = 3                      # 3 attempts
 VIDEO_OUT_STORE_RETRY_BACKOFF_TIME = 5.0                    # 5 s
-
-# Azure Blob Storage
-VIDEO_OUT_STORE_AZURE_CONNECTION_STRING = NOT_SPECIFIED
-VIDEO_OUT_STORE_AZURE_CONTAINER_NAME = NOT_SPECIFIED
-VIDEO_OUT_STORE_AZURE_BLOB_PREFIX = ""
-
-# AWS S3
-VIDEO_OUT_STORE_AWS_BUCKET_NAME = NOT_SPECIFIED
-VIDEO_OUT_STORE_AWS_KEY_PREFIX = ""
-VIDEO_OUT_STORE_AWS_ACCESS_KEY_ID = NOT_SPECIFIED
-VIDEO_OUT_STORE_AWS_SECRET_ACCESS_KEY = NOT_SPECIFIED
-VIDEO_OUT_STORE_AWS_REGION_NAME = NOT_SPECIFIED
 
 # Local storage (testing / fallback)
 VIDEO_OUT_STORE_LOCAL_TARGET_DIR = LOCAL_OUTPUT_DIR

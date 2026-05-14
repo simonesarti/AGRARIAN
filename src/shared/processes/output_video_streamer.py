@@ -1,8 +1,6 @@
 import multiprocessing as mp
 import multiprocessing.synchronize
 import logging
-from datetime import datetime
-from pathlib import Path
 from queue import Empty as QueueEmptyException
 from typing import Optional
 import cv2
@@ -46,7 +44,7 @@ class VideoProducerProcessConfig(BaseModel):
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
 
     # ------- Local file save --------
-    video_output_dir: str = "."
+    video_file_path: str
 
     # ------- RTMP stream (media_server_url=None to disable) --------
     media_server_url: Optional[str] = None
@@ -177,9 +175,7 @@ class VideoProducerProcess(mp.Process):
         self.writer = None
         self.stream_manager = None
 
-        # Build a datetime-stamped filename to avoid overwriting previous recordings
-        dt = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self._video_filename = str(Path(self.config.video_output_dir) / f"{dt}.mp4")
+        self._video_filename = self.config.video_file_path
 
         if self.config.media_server_url:
             self.stream_manager = VideoStreamManager(

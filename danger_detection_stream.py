@@ -1,4 +1,5 @@
 import multiprocessing as mp
+from datetime import datetime
 from pathlib import Path
 from time import sleep
 import logging
@@ -18,7 +19,11 @@ from src.shared.processes.video_storage_manager import (
     LocalStorageConfig, LocalStoragePersistenceProcess,
 )
 from src.shared.processes.frame_buffer import FrameBuffer
-from src.shared.processes.constants import ALERTS_FILE_NAME, LOCAL_OUTPUT_DIR, MQTTS, AZURE, AWS, LOCAL
+from src.shared.processes.constants import (
+    LOCAL_OUTPUT_DIR,
+    VIDEO_STREAM_READER_PROCESSING_SHAPE,
+    VIDEO_STREAM_READER_ORIGINAL_SHAPE,
+)
 from src.configs.utils import read_yaml_config
 
 
@@ -49,21 +54,21 @@ def _build_persistence_process(
     )
     service = s.video_out_store_service
 
-    if service == AZURE:
+    if service == "azure":
         config = AzureBlobStorageConfig(
-            connection_string=s.video_out_store_azure_connection_string,
+            connection_string=s.video_out_store_azure_connection_string.get_secret_value(),
             container_name=s.video_out_store_azure_container_name,
             blob_prefix=s.video_out_store_azure_blob_prefix,
             **base,
         )
         return AzureBlobStoragePersistenceProcess(input_queue=input_queue, error_event=error_event, config=config)
 
-    if service == AWS:
+    if service == "aws":
         config = S3StorageConfig(
             bucket_name=s.video_out_store_aws_bucket_name,
             key_prefix=s.video_out_store_aws_key_prefix,
             aws_access_key_id=s.video_out_store_aws_access_key_id,
-            aws_secret_access_key=s.video_out_store_aws_secret_access_key,
+            aws_secret_access_key=s.video_out_store_aws_secret_access_key.get_secret_value() if s.video_out_store_aws_secret_access_key else None,
             region_name=s.video_out_store_aws_region_name,
             **base,
         )
@@ -94,6 +99,8 @@ def main():
     output_dir.mkdir(exist_ok=True, parents=True)
     mqtt_certificates_dir = Path("certificates") / "mqtt"
 
+    session_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+
     # ============== EVENTS ==============
 
     error_event = mp.Event()
@@ -101,10 +108,13 @@ def main():
     # ============== FRAME BUFFER SHAPES ==============
     # Shapes are (H, W, C) — NumPy convention
 
-    _3ch = (s.video_stream_reader_processing_height, s.video_stream_reader_processing_width, 3)
-    _5ch = (s.video_stream_reader_processing_height, s.video_stream_reader_processing_width, 5)
-    _8ch = (s.video_stream_reader_processing_height, s.video_stream_reader_processing_width, 8)
-    _ann = (s.video_original_height, s.video_original_width, 3)
+    _proc_h, _proc_w = VIDEO_STREAM_READER_PROCESSING_SHAPE[1], VIDEO_STREAM_READER_PROCESSING_SHAPE[0]
+    _orig_h, _orig_w = VIDEO_STREAM_READER_ORIGINAL_SHAPE[1],   VIDEO_STREAM_READER_ORIGINAL_SHAPE[0]
+
+    _3ch = (_proc_h, _proc_w, 3)
+    _5ch = (_proc_h, _proc_w, 5)
+    _8ch = (_proc_h, _proc_w, 8)
+    _ann = (_orig_h, _orig_w, 3)
 
     # ============== FRAME BUFFERS ==============
     # n_slots matches the corresponding metadata queue maxsize: each queue entry
@@ -158,13 +168,13 @@ def main():
         mqtt_broker_host=s.telemetry_listener_host,
         mqtt_broker_port=s.telemetry_listener_port,
         mqtt_username=s.telemetry_listener_username,
-        mqtt_password=s.telemetry_listener_password,
+        mqtt_password=s.telemetry_listener_password.get_secret_value() if s.telemetry_listener_password else None,
         mqtt_qos_level=s.telemetry_listener_qos_level,
         mqtt_max_msg_wait_s=s.telemetry_listener_msg_wait_timeout,
         mqtt_reconnect_delay_s=s.telemetry_listener_reconnect_delay,
         mqtt_ca_certs_path=(
             str(mqtt_certificates_dir)
-            if s.telemetry_listener_protocol == MQTTS
+            if s.telemetry_listener_protocol == "mqtts"
             else None
         ),
         mqtt_max_incoming_messages=s.telemetry_listener_max_incoming_messages,
@@ -215,7 +225,7 @@ def main():
         alerts_jpeg_quality=s.alerts_jpeg_compression_quality,
         alerts_max_consecutive_failures=s.alerts_max_consecutive_failures,
         queue_get_timeout=s.alerts_queue_get_timeout,
-        log_file_path=str(output_dir / ALERTS_FILE_NAME),
+        log_file_path=str(output_dir / f"{session_ts}.log"),
         websocket_host=s.websocket_host,
         websocket_port=s.websocket_port,
         ws_ping_interval=s.ws_manager_ping_interval,
@@ -226,9 +236,9 @@ def main():
         database_host=s.db_host,
         database_port=s.db_port,
         database_worker_name=s.db_worker_name,
-        database_worker_password=s.db_worker_password,
+        database_worker_password=s.db_worker_password.get_secret_value() if s.db_worker_password else None,
         database_username=s.db_username,
-        database_password=s.db_password,
+        database_password=s.db_password.get_secret_value(),
         db_pool_size=s.db_manager_pool_size,
         db_max_overflow=s.db_manager_max_overflow,
         db_queue_get_timeout=s.db_manager_queue_wait_timeout,
@@ -240,7 +250,7 @@ def main():
     video_producer_config = VideoProducerProcessConfig(
         fps=s.fps,
         queue_timeout=s.pipeline_queue_timeout,
-        video_output_dir=str(output_dir),
+        video_file_path=str(output_dir / f"{session_ts}.mp4"),
         media_server_url=s.video_out_stream_url,
         stream_manager_queue_max_size=s.max_size_video_stream,
         stream_manager_ffmpeg_startup_timeout=s.video_out_stream_ffmpeg_startup_timeout,

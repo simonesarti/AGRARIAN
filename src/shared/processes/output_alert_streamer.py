@@ -4,7 +4,7 @@ from queue import Empty as QueueEmptyException
 import json
 import cv2
 import numpy as np
-from typing import Optional
+from typing import Literal, Optional
 import base64
 from datetime import datetime as dtt
 import logging
@@ -30,9 +30,6 @@ from src.shared.processes.constants import (
     DB_MANAGER_QUEUE_WAIT_TIMEOUT,
     DB_MANAGER_THREAD_CLOSE_TIMEOUT,
     DB_MANAGER_QUEUE_SIZE,
-    POSTGRESQL,
-    MYSQL,
-    SQLITE,
     DB_NAME,
     POISON_PILL,
 )
@@ -76,13 +73,13 @@ class NotificationsStreamWriterConfig(BaseModel):
     ws_thread_close_timeout: PositiveFloat = WS_MANAGER_THREAD_CLOSE_TIMEOUT
 
     # ------- Database connection (database_service=None to disable) --------
-    # Supported services: POSTGRESQL, MYSQL, SQLITE.
-    # For POSTGRESQL / MYSQL: database_host, database_port, database_worker_name,
+    # Supported services: "postgresql", "mysql", "sqlite".
+    # For postgresql / mysql: database_host, database_port, database_worker_name,
     #   and database_worker_password are used to build the SQLAlchemy connection URL.
-    # For SQLITE: connection params are ignored; the DB file is named DB_NAME.
+    # For sqlite: connection params are ignored; the DB file is named DB_NAME.
     # database_username / database_password are app-level credentials checked against
     #   the users table (distinct from the DB role credentials above).
-    database_service: Optional[str] = None
+    database_service: Optional[Literal["postgresql", "mysql", "sqlite"]] = None
     database_host: Optional[str] = None
     database_port: int = Field(default=DB_PORT, ge=1, le=65535)
     database_worker_name: Optional[str] = None    # DB role (connection credential)
@@ -160,11 +157,11 @@ class NotificationsStreamWriter(mp.Process):
             return None
         auth = f"{self.config.database_worker_name}:{self.config.database_worker_password}@"
         addr = f"{self.config.database_host}:{self.config.database_port}"
-        if self.config.database_service == POSTGRESQL:
+        if self.config.database_service == "postgresql":
             return f"postgresql://{auth}{addr}/{DB_NAME}"
-        elif self.config.database_service == MYSQL:
+        elif self.config.database_service == "mysql":
             return f"mysql+pymysql://{auth}{addr}/{DB_NAME}"
-        elif self.config.database_service == SQLITE:
+        elif self.config.database_service == "sqlite":
             return f"sqlite:///{DB_NAME}"
         else:
             logger.warning(f"Unknown database_service '{self.config.database_service}'; database output disabled.")

@@ -24,7 +24,6 @@ from src.shared.processes.constants import (
     PIPELINE_QUEUE_TIMEOUT,
     POISON_PILL,
     POISON_PILL_TIMEOUT,
-    UPSAMPLING_MODE,
 )
 
 
@@ -242,7 +241,7 @@ class DangerAnnotationWorker(mp.Process):
                 annotated_frame = cv2.resize(
                     src=frame,
                     dsize=meta.original_wh,     # (W, H) convention
-                    interpolation=UPSAMPLING_MODE,
+                    interpolation=cv2.INTER_LINEAR,
                 )
 
                 # ---- fan-out: write annotated frame to both consumers independently ----
