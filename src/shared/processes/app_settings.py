@@ -82,13 +82,28 @@ class AppSettings(BaseSettings):
     drone_sensor_height_pixels: PositiveInt   = DRONE_SENSOR_HEIGHT_PIXELS
 
     # ------------------------------------------------------------------ #
-    # DANGER DETECTION PARAMETERS
+    # DANGER DETECTION
     # ------------------------------------------------------------------ #
 
     safety_radius_m:       PositiveFloat = SAFETY_RADIUS_M
     slope_angle_threshold: float         = Field(default=SLOPE_ANGLE_THRESHOLD, ge=0, le=90)
     # Parsed from "(lon1, lat1), (lon2, lat2), ..." — leave empty/unset to disable geofencing
     geofencing_vertexes: Optional[list[tuple[float, float]]] = None
+
+    # ------------------------------------------------------------------ #
+    # HEALTH MONITORING — ANOMALY DETECTION
+    # ------------------------------------------------------------------ #
+
+    hm_anomaly_use_ae:              bool           = HM_ANOMALY_USE_AE
+    hm_anomaly_use_social:          bool           = HM_ANOMALY_USE_SOCIAL
+    hm_anomaly_ae_threshold:        PositiveFloat  = HM_ANOMALY_AE_THRESHOLD
+    hm_anomaly_social_threshold:    PositiveFloat  = HM_ANOMALY_SOCIAL_THRESHOLD
+    hm_anomaly_smoothing_window:    PositiveInt    = HM_ANOMALY_SMOOTHING_WINDOW
+    hm_anomaly_min_anomaly_duration: PositiveInt   = HM_ANOMALY_MIN_ANOMALY_DURATION
+    hm_anomaly_social_ema_alpha:    PositiveFloat  = HM_ANOMALY_SOCIAL_EMA_ALPHA
+    hm_anomaly_social_min_updates:  PositiveInt    = HM_ANOMALY_SOCIAL_MIN_UPDATES
+    hm_anomaly_social_min_herd:     PositiveInt    = HM_ANOMALY_SOCIAL_MIN_HERD
+    hm_anomaly_require_both:        bool           = HM_ANOMALY_REQUIRE_BOTH
 
     # ------------------------------------------------------------------ #
     # VIDEO STREAM READER
@@ -169,20 +184,7 @@ class AppSettings(BaseSettings):
     # Local (testing / no-cloud fallback)
     video_out_store_local_target_dir: str = VIDEO_OUT_STORE_LOCAL_TARGET_DIR
 
-    # ------------------------------------------------------------------ #
-    # HEALTH MONITORING — ANOMALY DETECTION
-    # ------------------------------------------------------------------ #
 
-    hm_anomaly_use_ae:              bool           = HM_ANOMALY_USE_AE
-    hm_anomaly_use_social:          bool           = HM_ANOMALY_USE_SOCIAL
-    hm_anomaly_ae_threshold:        PositiveFloat  = HM_ANOMALY_AE_THRESHOLD
-    hm_anomaly_social_threshold:    PositiveFloat  = HM_ANOMALY_SOCIAL_THRESHOLD
-    hm_anomaly_smoothing_window:    PositiveInt    = HM_ANOMALY_SMOOTHING_WINDOW
-    hm_anomaly_min_anomaly_duration: PositiveInt   = HM_ANOMALY_MIN_ANOMALY_DURATION
-    hm_anomaly_social_ema_alpha:    PositiveFloat  = HM_ANOMALY_SOCIAL_EMA_ALPHA
-    hm_anomaly_social_min_updates:  PositiveInt    = HM_ANOMALY_SOCIAL_MIN_UPDATES
-    hm_anomaly_social_min_herd:     PositiveInt    = HM_ANOMALY_SOCIAL_MIN_HERD
-    hm_anomaly_require_both:        bool           = HM_ANOMALY_REQUIRE_BOTH
 
     # ================================================================== #
     # FIELD VALIDATORS

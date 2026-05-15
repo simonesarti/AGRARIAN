@@ -71,19 +71,25 @@ def _annotate(frame: np.ndarray, tracks: list, r: FrameAnomalyResult) -> np.ndar
             label += f" soc={soc:.2f}"
         cv2.putText(frame, label, (x1, max(y1 - 6, 12)), _FONT, 0.42, color, 1, cv2.LINE_AA)
     
-    # confirmed_set = set(r.confirmed_ae_tracks) | set(r.confirmed_soc_tracks) | set(r.confirmed_both_tracks)
-    # elevated_set  = set(r.elevated_ae_tracks)  | set(r.elevated_soc_tracks)  | set(r.elevated_both_tracks)
-    # active_ids    = {t.track_id for t in tracks}
+    confirmed_set = set(r.confirmed_ae_tracks) | set(r.confirmed_soc_tracks) | set(r.confirmed_both_tracks)
+    elevated_set  = set(r.elevated_ae_tracks)  | set(r.elevated_soc_tracks)  | set(r.elevated_both_tracks)
+    active_ids    = {t.track_id for t in tracks}
 
-    # n_elevated  = len(elevated_set  & active_ids)
-    # n_confirmed = len(confirmed_set & active_ids)
-    # hud = (
-    #     f"Frame {r.frame_idx} | "
-    #     f"tracks={len(tracks)} | "
-    #     f"elevated={n_elevated} | "
-    #     f"confirmed={n_confirmed}"
-    # )
-    # cv2.putText(frame, hud, (8, 22), _FONT, 0.55, (0, 0, 0), 2, cv2.LINE_AA)
+    n_elevated  = len(elevated_set  & active_ids)
+    n_confirmed = len(confirmed_set & active_ids)
+    hud = (
+        f"Frame {r.frame_idx} | "
+        f"tracks={len(tracks)} | "
+        f"elevated={n_elevated} | "
+        f"confirmed={n_confirmed}"
+    )
+    (text_w, text_h), baseline = cv2.getTextSize(hud, _FONT, 0.55, 1)
+    pad = 4
+    cv2.rectangle(frame,
+                  (8 - pad, 22 - text_h - pad),
+                  (8 + text_w + pad, 22 + baseline + pad),
+                  (0, 0, 0), cv2.FILLED)
+    cv2.putText(frame, hud, (8, 22), _FONT, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
     return frame
 

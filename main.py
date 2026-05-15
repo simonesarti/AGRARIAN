@@ -1,14 +1,24 @@
 import logging
 import os
 import sys
+from pathlib import Path
 
 from src.shared.processes.constants import SUPPORTED_APP_MODES
 
+# ================================================================
+
+Path('./logs').mkdir(exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('./logs/main.log', mode='w'),
+    ],
 )
 logger = logging.getLogger("main")
+
+# ================================================================
 
 
 def main() -> None:

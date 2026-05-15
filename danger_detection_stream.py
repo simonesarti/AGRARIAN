@@ -42,6 +42,7 @@ from src.shared.processes.constants import (
     VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S,
     VIDEO_STREAM_READER_FRAME_RETRY_DELAY,
     VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES,
+    VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO,
     TELEMETRY_LISTENER_RECONNECT_DELAY,
     TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT,
     TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES,
@@ -74,12 +75,6 @@ from src.utils import read_yaml_config
 
 logger = logging.getLogger("main")
 
-if not logger.handlers:
-    _handler = logging.FileHandler('./logs/main_dd.log', mode='w')
-    _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-    logger.addHandler(_handler)
-    logger.setLevel(logging.INFO)
-
 # ================================================================
 
 
@@ -95,7 +90,7 @@ def main():
         detection_args    = read_yaml_config("configs/danger_detection/detector.yaml")
         segmentation_args = read_yaml_config("configs/danger_detection/segmenter.yaml")
     except Exception as e:
-        logger.critical(f"Failed to load YAML config: {e}", exc_info=True)
+        logger.critical(f"Failed to load models configs: {e}", exc_info=True)
         exit(1)
 
     dem_path              = Path("dem/dem.tif")
@@ -164,6 +159,8 @@ def main():
         frame_read_timeout_s=VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S,
         frame_read_retry_delay_s=VIDEO_STREAM_READER_FRAME_RETRY_DELAY,
         frame_read_max_consecutive_failures=VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES,
+        expected_aspect_ratio=VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO,
+        processing_shape=VIDEO_STREAM_READER_PROCESSING_SHAPE,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
