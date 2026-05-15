@@ -91,6 +91,7 @@ class AnomalyDetector:
         self._active_events: dict[int, Optional[AnomalyEvent]] = {}
         self._completed_events: list[AnomalyEvent] = []
 
+        # Stats loaded from the training checkpoint
         self._feat_mean: np.ndarray | None = None
         self._feat_std: np.ndarray | None = None
         self._ae_mean: float = 0.0
@@ -114,12 +115,15 @@ class AnomalyDetector:
         timestamp_ms: float,
     ) -> FrameAnomalyResult:
         # Purge state for absent tracks (mirrors FeatureExtractor.update()).
+        # Avoids reappearing track features from averaging with pre-disappearance stale values.
         for tid in list(self._ae_history.keys()):
             if tid not in track_features:
                 del self._ae_history[tid]
         for tid in list(self._social_history.keys()):
             if tid not in track_features:
                 del self._social_history[tid]
+
+        # Active events must be closed so that anomaly durations are not inflated by gaps.
         for tid in list(self._active_events.keys()):
             if tid not in track_features:
                 self._close_event(tid, frame_idx, timestamp_ms)
@@ -134,6 +138,7 @@ class AnomalyDetector:
                 confirmed_ae_tracks=[], confirmed_soc_tracks=[], confirmed_both_tracks=[],
             )
 
+        # Social stats are updated from ALL active tracks regardless of sequence lenght
         if self.cfg.use_social:
             latest = np.stack([self._normalize(tf.feature_sequence[-1]) for tf in track_features.values()], axis=0)
             self.social.update(latest)
@@ -141,6 +146,8 @@ class AnomalyDetector:
         ae_scores: dict[int, float] = {}
         social_scores: dict[int, float] = {}
 
+        # Only complete sequences are scored (both AE and social).
+        # Scores are smoothed
         for tid, tf in track_features.items():
             if len(tf.feature_sequence) < self._ae_seq_len:
                 continue
@@ -151,6 +158,7 @@ class AnomalyDetector:
             ae_scores[tid] = float(np.mean(self._ae_history[tid]))
             social_scores[tid] = float(np.mean(self._social_history[tid]))
 
+        # Collect tracks with elevated smoothed score for the current frame
         anomalous: list[int] = []
         for tid in ae_scores:
             ae_flagged = self.cfg.use_ae and ae_scores[tid] > self.cfg.ae_threshold
@@ -161,11 +169,12 @@ class AnomalyDetector:
             else:
                 self._close_event(tid, frame_idx, timestamp_ms)
 
-        confirmed: list[int] = [
-            tid for tid in anomalous
-            if (ev := self._active_events.get(tid)) is not None
-            and ev.end_frame - ev.start_frame + 1 >= self.cfg.min_anomaly_duration
-        ]
+        # Duration-confirmed subset: track's smoothed score remained elevated for a significat amount of time
+        confirmed: list[int] = []
+        for tid in anomalous:
+            ev = self._active_events.get(tid)
+            if ev is not None and ev.end_frame - ev.start_frame + 1 >= self.cfg.min_anomaly_duration:
+                confirmed.append(tid)
 
         ae_elevated_set  = {tid for tid in ae_scores if self.cfg.use_ae and ae_scores[tid] > self.cfg.ae_threshold}
         soc_elevated_set = {tid for tid in social_scores if self.cfg.use_social and social_scores[tid] > self.cfg.social_threshold}
@@ -201,6 +210,7 @@ class AnomalyDetector:
         self.social.reset()
 
     def _normalize(self, features: np.ndarray) -> np.ndarray:
+        # Apply training-set per-feature normalization.
         if self._feat_mean is None:
             return features
         return (features - self._feat_mean) / self._feat_std

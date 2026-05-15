@@ -83,7 +83,12 @@ class YOLOTracker:
         clss   = boxes.cls.cpu().numpy().astype(int)
 
         tracks = [
-            TrackState(track_id=int(tid), bbox=bbox.copy(), confidence=float(conf), class_id=int(cls))
+            TrackState(
+                track_id=int(tid),
+                bbox=bbox.copy(),
+                confidence=float(conf),
+                class_id=int(cls),
+            )
             for tid, bbox, conf, cls in zip(ids, bboxes, confs, clss)
         ]
         return tracks, H

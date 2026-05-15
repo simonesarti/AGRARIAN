@@ -77,21 +77,25 @@ class FeatureExtractor:
                 _, last_center, last_feat = self._history[tid][-1]
                 self._history[tid].append((frame_idx, last_center, last_feat))
 
+        # Reset the missed counter for tracks that are visible again
         for tid in active_ids:
             self._missed.pop(tid, None)
 
+        # if there are no active tracks, return only interpolated ones (if any)
         if not tracks:
             return {
                 tid: TrackFeatures(track_id=tid, feature_sequence=np.stack([s[2] for s in hist], axis=0))
                 for tid, hist in self._history.items()
             }
 
-        # World velocities for all active tracks.
+        # World velocities / displacements for all active tracks.
+        # warning: assumes equal temporal distance between processed frames (unlikely in pipeline)
         world_vels: dict[int, np.ndarray] = {}
         for t in tracks:
             wv = self._world_velocity(t.track_id, t.center, H_prev_to_curr)
             world_vels[t.track_id] = wv if wv is not None else np.zeros(2)
 
+        # ---- features construction ----
         N = len(tracks)
         centers = np.array([t.center for t in tracks])
         vel_arr = np.array([world_vels[t.track_id] for t in tracks])
@@ -127,6 +131,7 @@ class FeatureExtractor:
             avg_knn_dist,
         ]) * inv_max).astype(np.float32)
 
+        # add feature to track history
         result: dict[int, TrackFeatures] = {}
         for i, t in enumerate(tracks):
             if t.track_id not in self._history:
@@ -138,9 +143,13 @@ class FeatureExtractor:
                 feature_sequence=np.stack([s[2] for s in seq], axis=0),
             )
 
+        # Include in history interpolated tracks (currently absent but within interp_max_age)
         for tid, hist in self._history.items():
             if tid not in active_ids:
-                result[tid] = TrackFeatures(track_id=tid, feature_sequence=np.stack([s[2] for s in hist], axis=0))
+                result[tid] = TrackFeatures(
+                    track_id=tid, 
+                    feature_sequence=np.stack([s[2] for s in hist], axis=0),
+                )
 
         return result
 
@@ -148,9 +157,13 @@ class FeatureExtractor:
         if track_id not in self._history or len(self._history[track_id]) == 0:
             return None
         _, prev_center, _ = self._history[track_id][-1]
+        
+        # displacement = current_pos_in_current_ref_system - old_pos_in_current_ref_system
         if H is not None:
             prev_warped = cv2.perspectiveTransform(
                 prev_center.reshape(1, 1, 2).astype(np.float32), H
             ).reshape(2)
             return center - prev_warped
+        
+        # fallback when no homography is available
         return center - prev_center
