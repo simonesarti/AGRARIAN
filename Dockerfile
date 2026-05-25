@@ -49,4 +49,4 @@ RUN chmod -R 777 /app
 EXPOSE 8443
 
 # Set entrypoint
-ENTRYPOINT ["python", "main.py"]
+ENTRYPOINT ["python3", "main.py"]
