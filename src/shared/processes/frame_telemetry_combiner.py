@@ -175,9 +175,11 @@ class FrameTelemetryCombiner(mp.Process):
             # Using a timeout allows periodic checks of the stopping conditions.
             # This does not catch MqttError — that propagates to the outer worker.
             try:
-                async with asyncio.timeout(self.config.mqtt_max_msg_wait_s):
-                    message = await anext(client.messages)
-                    logger.debug(f"MQTT message received on topic {message.topic.value}")
+                message = await asyncio.wait_for(
+                    anext(client.messages),
+                    timeout=self.config.mqtt_max_msg_wait_s,
+                )
+                logger.debug(f"MQTT message received on topic {message.topic.value}")
             except asyncio.TimeoutError:
                 # No message within timeout window — loop back to check stop conditions
                 logger.debug(
@@ -547,10 +549,21 @@ if __name__ == "__main__":
 
     import numpy as np
     from time import sleep
+    from queue import Empty as QueueEmptyException
 
     FRAME_SHAPE = (720, 1280, 3)  # (H, W, C) — numpy convention
     N_SLOTS = 3
-    N_FRAMES = 30
+
+    # Producer & Consumer read frequency — set manually to test slow/medium/fast consumer behaviour.
+    # slow=10, medium=30, fast=50  (fps)
+    PRODUCER_FPS = 20
+    CONSUMER_FPS = 30
+
+    # Set to True to trigger error_event after 10 s, testing clean error-path shutdown.
+    TRIGGER_ERROR_AFTER_10S = False
+
+    _PRODUCER_FRAME_INTERVAL = 1.0 / PRODUCER_FPS
+    _CONSUMER_FRAME_INTERVAL = 1.0 / CONSUMER_FPS
 
     error_event = mp.Event()
 
@@ -576,9 +589,10 @@ if __name__ == "__main__":
     )
 
     def producer_loop():
-        """Push fake frames into the input shared memory buffer."""
+        """Push fake frames continuously into the input shared memory buffer."""
         frame_id = 0
-        for _ in range(N_FRAMES):
+        while not error_event.is_set():
+            iter_start = time()
             slot = input_frame_buffer.acquire()
             if slot is not None:
                 frame = np.random.randint(0, 256, FRAME_SHAPE, dtype=np.uint8)
@@ -593,20 +607,30 @@ if __name__ == "__main__":
                     input_meta_queue.put(meta, timeout=1.0)
                 except Exception:
                     input_frame_buffer.release(slot)
+            else:
+                print(f"[Producer] No free input slot — frame {frame_id} dropped.")
             frame_id += 1
-            sleep(1 / 30)
-        # Signal end-of-stream
+            elapsed = time() - iter_start
+            remaining = _PRODUCER_FRAME_INTERVAL - elapsed
+            if remaining > 0:
+                sleep(remaining)
+        # Signal end-of-stream after error or external stop
         input_meta_queue.put(POISON_PILL)
+        print("[Producer] Stopped.")
 
     def consumer_loop():
         """Drain the output queue and release output slots."""
         frames_received = 0
+        start = time()
         while True:
+            iter_start = time()
             try:
                 msg = output_meta_queue.get(timeout=5.0)
-            except Exception:
-                print("[Consumer] Timed out waiting for output. Stopping.")
-                break
+            except QueueEmptyException:
+                if error_event.is_set():
+                    break
+                print("[Consumer] Queue empty, retrying ...")
+                continue
             if isinstance(msg, str) and msg == POISON_PILL:
                 output_meta_queue.put(POISON_PILL)  # re-queue for any additional downstream consumers
                 print(f"[Consumer] Poison pill received. {frames_received} frames processed.")
@@ -616,11 +640,23 @@ if __name__ == "__main__":
             assert isinstance(msg, CombinedSlotMetadata)
             output_frame_buffer.release(msg.slot_index)
             frames_received += 1
+            elapsed = time() - start
             print(
                 f"[Consumer] frame_id={msg.frame_id} "
                 f"slot={msg.slot_index} "
-                f"telemetry={'yes' if msg.telemetry else 'None'}"
+                f"telemetry={'yes' if msg.telemetry else 'None'} "
+                f"fps={frames_received / elapsed:.1f}"
             )
+            # Throttle to the configured consumer fps
+            elapsed_iter = time() - iter_start
+            remaining = _CONSUMER_FRAME_INTERVAL - elapsed_iter
+            if remaining > 0:
+                sleep(remaining)
+
+    def error_trigger():
+        sleep(10)
+        print("[ErrorTrigger] Setting error event after 10 s.")
+        error_event.set()
 
     prod_thread = threading.Thread(target=producer_loop, daemon=True)
     cons_thread = threading.Thread(target=consumer_loop, daemon=True)
@@ -634,6 +670,10 @@ if __name__ == "__main__":
 
     print("[Main] Starting producer ...")
     prod_thread.start()
+
+    if TRIGGER_ERROR_AFTER_10S:
+        error_trigger_thread = threading.Thread(target=error_trigger, daemon=True)
+        error_trigger_thread.start()
 
     combiner.join()
     prod_thread.join(timeout=5.0)
