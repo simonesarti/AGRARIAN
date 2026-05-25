@@ -46,22 +46,11 @@ tests/
 
 # Project specific directories
 assets/
-experiments/
-outputs/
 
 # Logs — never bake log files into the image
 logs/
 
-# Exclude all src subdirs, then re-include only what is needed
-src/*/
-!src/danger_detection/
-!src/health_monitoring/
-!src/shared/
-
-# Exclude all configs subdirs, then re-include only what is needed
-configs/*/
-!configs/danger_detection/
-!configs/health_monitoring/
+# configs and src are included in full — both pipelines are in the same image
 
 # Root-level Python files — exclude dev/utility scripts, keep pipeline entrypoints
 *.py
