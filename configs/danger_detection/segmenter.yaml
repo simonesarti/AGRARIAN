@@ -2,7 +2,7 @@
 
 # str: Path to the model checkpoint file.
 # Specifies the .onnx file for the model to be used during inference.
-model_checkpoint: 'checkpoints/danger_detection/segmentation_1280_720.onnx'
+model_checkpoint: 'checkpoints/segmentation_1280_720.onnx'
 
 # list[int] or null: Indexes of classes to ignore
 suppress_classes: null

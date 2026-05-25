@@ -212,7 +212,7 @@ class WebSocketManager:
             logger.error(f"Error in WebSocket event loop: {e}", exc_info=True)
         finally:
             self._loop.close()
-            logger.debug("Asyncio event loop closed")
+            logger.info("Asyncio event loop closed")
 
     def start(self):
         """Start the WebSocket server in a separate thread."""

@@ -1,6 +1,6 @@
 # Path to the trained AE checkpoint.
 # If null, reconstruction scores are uncalibrated (social scorer still runs).
-weights_path: checkpoints/health_monitoring/ae.pt
+weights_path: checkpoints/hm_ae.pt
 
 # Device for AE inference: "cpu", "cuda:0", "mps"
 device: cuda:0

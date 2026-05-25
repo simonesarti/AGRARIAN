@@ -2,7 +2,7 @@
 
 # str: Path to the model checkpoint file.
 # Specifies the .pt file for the model to be used during inference.
-model_checkpoint: 'checkpoints/danger_detection/detection_1280_720_yolo11m.pt'
+model_checkpoint: 'checkpoints/detection_1280_720_yolo11m.pt'
 
 # str: Path to the tracker configuration file.
 # Specifies the .yaml file containing the tracker configuration.

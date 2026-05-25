@@ -2,8 +2,8 @@
 
 # str: Path to the model checkpoint file.
 # Specifies the .pt file for the model to be used during inference.
-model_checkpoint: 'checkpoints/danger_detection/detection_1280_720_yolo11m.pt'
-#model_checkpoint: 'checkpoints/danger_detection/detection_1920_1080_yolo11m.pt'
+model_checkpoint: 'checkpoints/detection_1280_720_yolo11m.pt'
+#model_checkpoint: 'checkpoints/detection_1920_1080_yolo11m.pt'
 
 # int: Image/video (height, width) during inference.
 # All images/videos will be resized to this height before being given to the model (doesn't affect output image/video size).

@@ -109,19 +109,16 @@ class StreamVideoReader(mp.Process):
         """
         Set up video capture with appropriate settings for video streams.
         """
-        cap = cv2.VideoCapture(self.config.video_stream_url)
+        import os
+        # CAP_PROP_OPEN_TIMEOUT_MSEC / CAP_PROP_READ_TIMEOUT_MSEC are no-ops for the FFmpeg
+        # backend. Pass the timeouts via FFmpeg options instead — stimeout is in microseconds.
+        open_us  = int(self.config.connect_open_timeout_s * 1_000_000)
+        read_us  = int(self.config.frame_read_timeout_s  * 1_000_000)
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+            f"rtsp_transport;tcp|stimeout;{open_us}|timeout;{read_us}"
+        )
 
-        if not cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.config.connect_open_timeout_s * 1000):
-            logger.warning(
-                "CAP_PROP_OPEN_TIMEOUT_MSEC not supported by this OpenCV backend — "
-                "connection timeout is backend-defined."
-            )
-
-        if not cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.config.frame_read_timeout_s * 1000):
-            logger.warning(
-                "CAP_PROP_READ_TIMEOUT_MSEC not supported by this OpenCV backend — "
-                "cap.read() timeout is backend-defined."
-            )
+        cap = cv2.VideoCapture(self.config.video_stream_url, cv2.CAP_FFMPEG)
 
         # CAP_PROP_BUFFERSIZE is a no-op for RTSP/FFmpeg backend; buffer is managed by FFmpeg internally
         # cap.set(cv2.CAP_PROP_BUFFERSIZE, ...)
