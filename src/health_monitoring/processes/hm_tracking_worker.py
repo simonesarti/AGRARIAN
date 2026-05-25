@@ -27,7 +27,7 @@ if not logger.handlers:
     _handler = logging.FileHandler('./logs/hm_tracking.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
 
 # ================================================================
 

@@ -43,7 +43,7 @@ if not logger.handlers:  # Avoid duplicate handlers
     _handler = logging.FileHandler('./logs/alert_out.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
 
 
 # ================================================================
