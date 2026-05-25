@@ -6,6 +6,11 @@ runs/
 wandb/
 data/
 
+# Runtime-only directories — created on the host and mounted as Docker volumes
+dem/
+processing_results/
+certificates/
+
 # to do
 TODO.md
 
