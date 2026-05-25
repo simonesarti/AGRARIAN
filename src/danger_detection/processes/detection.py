@@ -259,10 +259,24 @@ if __name__ == "__main__":
 
     import numpy as np
     import threading
+    from queue import Empty as QueueEmptyException
 
     FRAME_SHAPE = (720, 1280, 3)  # (H, W, C) — numpy convention
     N_SLOTS = 3
-    N_FRAMES = 10
+    PRODUCER_FPS = 30             # fixed: simulates real stream cadence
+
+    # Consumer read frequency — set manually to test slow/medium/fast consumer behaviour.
+    # slow=10, medium=30, fast=50  (fps)
+    CONSUMER_FPS = 20
+
+    # Set to True to put a poison pill on the input queue after 10 s, testing clean shutdown.
+    TRIGGER_POISON_PILL_AFTER_10S = False
+
+    # Set to True to trigger error_event after 10 s, testing clean error-path shutdown.
+    TRIGGER_ERROR_AFTER_10S = True
+
+    _PRODUCER_FRAME_INTERVAL = 1.0 / PRODUCER_FPS
+    _CONSUMER_FRAME_INTERVAL = 1.0 / CONSUMER_FPS
 
     error_event = mp.Event()
 
@@ -273,7 +287,7 @@ if __name__ == "__main__":
     output_frame_buffer = FrameBuffer(frame_shape=FRAME_SHAPE, n_slots=N_SLOTS)
 
     config = DetectionWorkerConfig(
-        model_checkpoint="models/detector.pt",
+        model_checkpoint="checkpoints/detection_1280_720_yolo11m.pt",
     )
 
     worker = DetectionWorker(
@@ -286,14 +300,16 @@ if __name__ == "__main__":
     )
 
     def producer_loop():
-        """Push fake frames into the input shared memory buffer."""
-        for i in range(N_FRAMES):
+        """Push fake frames continuously into the input shared memory buffer."""
+        frame_id = 0
+        while not error_event.is_set():
+            iter_start = time()
             slot = input_frame_buffer.acquire()
             if slot is not None:
                 frame = np.random.randint(0, 256, FRAME_SHAPE, dtype=np.uint8)
                 input_frame_buffer.write(slot, frame)
                 meta = CombinedSlotMetadata(
-                    frame_id=i,
+                    frame_id=frame_id,
                     timestamp=time(),
                     original_wh=(1920, 1080),
                     slot_index=slot,
@@ -303,19 +319,29 @@ if __name__ == "__main__":
                     input_meta_queue.put(meta, timeout=1.0)
                 except Exception:
                     input_frame_buffer.release(slot)
-            sleep(1 / 10)
-        # Signal end-of-stream
+            else:
+                print(f"[Producer] No free input slot — frame {frame_id} dropped.")
+            frame_id += 1
+            elapsed = time() - iter_start
+            remaining = _PRODUCER_FRAME_INTERVAL - elapsed
+            if remaining > 0:
+                sleep(remaining)
         input_meta_queue.put(POISON_PILL)
+        print("[Producer] Stopped.")
 
     def consumer_loop():
         """Drain the output queue and release output slots."""
         frames_received = 0
+        start = time()
         while True:
+            iter_start = time()
             try:
-                msg = output_meta_queue.get(timeout=10.0)
-            except Exception:
-                print("[Consumer] Timed out. Stopping.")
-                break
+                msg = output_meta_queue.get(timeout=5.0)
+            except QueueEmptyException:
+                if error_event.is_set():
+                    break
+                print("[Consumer] Queue empty, retrying ...")
+                continue
             if isinstance(msg, str) and msg == POISON_PILL:
                 output_meta_queue.put(POISON_PILL)  # re-queue for any additional downstream consumers
                 print(f"[Consumer] Poison pill received. {frames_received} frames processed.")
@@ -325,11 +351,27 @@ if __name__ == "__main__":
             assert isinstance(msg, DetectionSlotMetadata)
             output_frame_buffer.release(msg.slot_index)
             frames_received += 1
+            elapsed = time() - start
             print(
                 f"[Consumer] frame_id={msg.frame_id} "
                 f"detections={len(msg.classes)} "
-                f"slot={msg.slot_index}"
+                f"slot={msg.slot_index} "
+                f"fps={frames_received / elapsed:.1f}"
             )
+            elapsed_iter = time() - iter_start
+            remaining = _CONSUMER_FRAME_INTERVAL - elapsed_iter
+            if remaining > 0:
+                sleep(remaining)
+
+    def poison_pill_trigger():
+        sleep(10)
+        print("[PoisonPillTrigger] Putting poison pill on input queue after 10 s.")
+        input_meta_queue.put(POISON_PILL)
+
+    def error_trigger():
+        sleep(10)
+        print("[ErrorTrigger] Setting error event after 10 s.")
+        error_event.set()
 
     prod_thread = threading.Thread(target=producer_loop, daemon=True)
     cons_thread = threading.Thread(target=consumer_loop, daemon=True)
@@ -343,6 +385,12 @@ if __name__ == "__main__":
 
     print("[Main] Starting producer ...")
     prod_thread.start()
+
+    if TRIGGER_POISON_PILL_AFTER_10S:
+        threading.Thread(target=poison_pill_trigger, daemon=True).start()
+
+    if TRIGGER_ERROR_AFTER_10S:
+        threading.Thread(target=error_trigger, daemon=True).start()
 
     worker.join()
     prod_thread.join(timeout=5.0)

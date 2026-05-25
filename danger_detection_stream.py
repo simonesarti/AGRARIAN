@@ -188,12 +188,14 @@ def main():
 
     # Model configs are loaded from YAML; Pydantic validates checkpoint path etc.
     detection_config    = DetectionWorkerConfig(
-        **detection_args,
+        model_checkpoint=detection_args.pop("model_checkpoint"),
+        predict_args=detection_args,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
     segmentation_config = SegmentationWorkerConfig(
-        **segmentation_args,
+        model_checkpoint=segmentation_args.pop("model_checkpoint"),
+        predict_args=segmentation_args,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
