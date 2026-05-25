@@ -28,10 +28,12 @@ from src.shared.processes.constants import (
 
 logger = logging.getLogger("main.stream_video_in")
 
-if not logger.handlers:  # Avoid duplicate handlers
-    video_handler = logging.FileHandler('./logs/stream_video_in.log', mode='w')
-    video_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-    logger.addHandler(video_handler)
+if not logger.handlers:
+    from pathlib import Path
+    Path('./logs').mkdir(exist_ok=True)
+    _handler = logging.FileHandler('./logs/stream_video_in.log', mode='w')
+    _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logger.addHandler(_handler)
     logger.setLevel(logging.DEBUG)
 
 # ================================================================
@@ -110,15 +112,15 @@ class StreamVideoReader(mp.Process):
         cap = cv2.VideoCapture(self.config.video_stream_url)
 
         if not cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.config.connect_open_timeout_s * 1000):
-            raise ConnectionError(
-                "Failed to set CAP_PROP_OPEN_TIMEOUT_MSEC: "
-                "blocking behavior on connection is undefined"
+            logger.warning(
+                "CAP_PROP_OPEN_TIMEOUT_MSEC not supported by this OpenCV backend — "
+                "connection timeout is backend-defined."
             )
 
         if not cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.config.frame_read_timeout_s * 1000):
-            raise ConnectionError(
-                "Failed to set CAP_PROP_READ_TIMEOUT_MSEC: "
-                "blocking behavior on cap.read() is undefined"
+            logger.warning(
+                "CAP_PROP_READ_TIMEOUT_MSEC not supported by this OpenCV backend — "
+                "cap.read() timeout is backend-defined."
             )
 
         # CAP_PROP_BUFFERSIZE is a no-op for RTSP/FFmpeg backend; buffer is managed by FFmpeg internally
@@ -386,12 +388,22 @@ class StreamVideoReader(mp.Process):
 
 if __name__ == "__main__":
 
+    import threading
     from time import time
 
-    VIDEO_STREAM_URL = "rtsp://0.0.0.0:8554/annot"
+    VIDEO_STREAM_URL = "rtsp://0.0.0.0:8554/drone"
     FRAME_SHAPE = (720, 1280, 3)   # (H, W, C) — numpy convention
     N_SLOTS = 3
     META_QUEUE_SIZE = 3
+
+    # Consumer read frequency — set manually to test slow/medium/fast consumer behaviour.
+    # slow=10, medium=30, fast=50  (fps)
+    CONSUMER_FPS = 30
+
+    # Set to True to trigger error_event after 10 s, testing clean error-path shutdown.
+    TRIGGER_ERROR_AFTER_10S = True
+
+    _CONSUMER_FRAME_INTERVAL = 1.0 / CONSUMER_FPS
 
     error_event = mp.Event()
     output_meta_queue = mp.Queue(maxsize=META_QUEUE_SIZE)
@@ -408,13 +420,19 @@ if __name__ == "__main__":
 
     def consumer_loop():
         """Simple consumer: reads frames from shared memory and logs throughput."""
+        from queue import Empty as QueueEmptyException
         frames_received = 0
         start = time()
         while True:
+            iter_start = time()
             try:
                 msg = output_meta_queue.get(timeout=5.0)
-            except Exception:
-                break
+            except QueueEmptyException:
+                if error_event.is_set():
+                    break
+                # Stream may be temporarily unavailable — keep waiting
+                print("[Consumer] Queue empty (stream down?), retrying ...")
+                continue
             if isinstance(msg, str) and msg == POISON_PILL:
                 output_meta_queue.put(POISON_PILL)  # re-queue for any other consumer
                 break
@@ -430,10 +448,23 @@ if __name__ == "__main__":
                 f"slot={msg.slot_index} "
                 f"fps={frames_received / elapsed:.1f}"
             )
+            # Throttle to the configured consumer fps
+            elapsed_iter = time() - iter_start
+            remaining = _CONSUMER_FRAME_INTERVAL - elapsed_iter
+            if remaining > 0:
+                sleep(remaining)
 
-    import threading
+    def error_trigger():
+        sleep(10)
+        print("[ErrorTrigger] Setting error event after 10 s.")
+        error_event.set()
+
     consumer_thread = threading.Thread(target=consumer_loop, daemon=True)
     consumer_thread.start()
+
+    if TRIGGER_ERROR_AFTER_10S:
+        error_trigger_thread = threading.Thread(target=error_trigger, daemon=True)
+        error_trigger_thread.start()
 
     reader.start()
     reader.join()
