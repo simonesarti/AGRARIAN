@@ -32,6 +32,7 @@ var/
 
 # Virtual environment
 .env
+.env.example
 .venv/
 venv/
 
@@ -39,31 +40,34 @@ venv/
 .idea/
 .vscode/
 
+# Test / dev artifacts
+tests/
+.pytest_cache/
+
 # Project specific directories
 assets/
 experiments/
 outputs/
-tests/
 
-# - exclude partially
-checkpoints/*/
-configs/*/
-logs/*/
+# Logs — never bake log files into the image
+logs/
+
+# Exclude all src subdirs, then re-include only what is needed
 src/*/
-
-# - keep these components
-!checkpoints/danger_detection/
-!configs/danger_detection/
-!logs/danger_detection/
-!src/configs/
 !src/danger_detection/
+!src/health_monitoring/
 !src/shared/
 
+# Exclude all configs subdirs, then re-include only what is needed
+configs/*/
+!configs/danger_detection/
+!configs/health_monitoring/
 
-# Project specific files
-README.md
+# Root-level Python files — exclude dev/utility scripts, keep pipeline entrypoints
 *.py
-*.sh
-
-# keep these files:
+!main.py
 !danger_detection_stream.py
+!health_monitoring_stream.py
+
+# Shell scripts
+*.sh
