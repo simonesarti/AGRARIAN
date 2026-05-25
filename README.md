@@ -115,6 +115,43 @@ docker run --rm \
 
 ---
 
+## Local Testing
+
+Commands for running both apps from the project directory, mounting subdirectories of the repo as volumes and using the local `.env` file. Logs and outputs land directly in the project tree for easy inspection.
+
+### Test: danger detection
+
+Place `dem.tif` and `dem_mask.tif` in the project's `dem/` directory before running.
+
+```bash
+docker run --rm \
+  --gpus all \
+  --env-file .env \
+  -e APP_MODE=danger_detection \
+  -p 8443:8443 \
+  -v ./dem:/app/dem \
+  -v ./logs:/app/logs \
+  -v ./processing_results:/app/processing_results \
+  agrarian
+```
+
+Add `-v ./certificates/mqtt:/app/certificates/mqtt` if testing with `TELEMETRY_LISTENER_PROTOCOL=mqtts`.
+
+### Test: health monitoring
+
+```bash
+docker run --rm \
+  --gpus all \
+  --env-file .env \
+  -e APP_MODE=health_monitoring \
+  -p 8443:8443 \
+  -v ./logs:/app/logs \
+  -v ./processing_results:/app/processing_results \
+  agrarian
+```
+
+---
+
 ## Outputs
 
 After a session, the following files are written to the mounted volumes.
