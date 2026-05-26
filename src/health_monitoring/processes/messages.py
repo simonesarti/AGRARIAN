@@ -2,6 +2,8 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Optional
 
+from src.health_monitoring.anomaly_detection.detector import FrameAnomalyResult
+
 
 @dataclass
 class HMTrackingSlotMetadata:
@@ -40,4 +42,4 @@ class HMAnomalySlotMetadata:
     original_wh: tuple[int, int]
     slot_index: int
     tracks: list               # list[TrackState]
-    anomaly_result: object     # FrameAnomalyResult
+    anomaly_result: FrameAnomalyResult

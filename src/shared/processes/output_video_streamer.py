@@ -32,7 +32,7 @@ if not logger.handlers:  # Avoid duplicate handlers
     video_handler = logging.FileHandler('./logs/video_out.log', mode='w')
     video_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(video_handler)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
 # ================================================================
 

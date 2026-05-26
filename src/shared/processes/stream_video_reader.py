@@ -34,7 +34,7 @@ if not logger.handlers:
     _handler = logging.FileHandler('./logs/stream_video_in.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
 # ================================================================
 

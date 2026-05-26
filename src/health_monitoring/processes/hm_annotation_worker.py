@@ -28,7 +28,7 @@ if not logger.handlers:
     _handler = logging.FileHandler('./logs/hm_annotation.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
 # ================================================================
 
@@ -201,8 +201,9 @@ class HMAnnotationWorker(mp.Process):
                     interpolation=cv2.INTER_LINEAR,
                 )
 
-                # Build alert message from confirmed anomalous tracks.
-                confirmed = r.anomalous_tracks
+                # Build alert message: only confirmed tracks visible in this frame.
+                active_ids = {t.track_id for t in meta.tracks}
+                confirmed = sorted(tid for tid in r.anomalous_tracks if tid in active_ids)
                 alert_msg = f"Anomaly: tracks {confirmed}" if confirmed else ""
 
                 predict_time = time() - predict_start

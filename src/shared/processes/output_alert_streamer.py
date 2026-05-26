@@ -43,7 +43,7 @@ if not logger.handlers:  # Avoid duplicate handlers
     _handler = logging.FileHandler('./logs/alert_out.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
 
 # ================================================================
@@ -403,15 +403,19 @@ class NotificationsStreamWriter(mp.Process):
 
                 # ---- read frame from shared memory and release slot immediately ----
                 # read() returns a copy, so the slot can be freed right away.
+                logger.info("tried to read data from buffer")
                 frame = self.input_frame_buffer.read(meta.slot_index)
                 self.input_frame_buffer.release(meta.slot_index)
+                logger.info("slot released")
 
                 # ---- cooldown check and alert dispatch ----
                 try:
                     if meta.alert_msg:
                         since_last = meta.timestamp - last_alert_timestamp
                         if since_last >= self.config.alerts_cooldown_s:
+                            logger.info("tried to process alert")
                             self._process_alert(frame, meta)
+                            logger.info("processed alert")
                             last_alert_timestamp = meta.timestamp
                             alert_count += 1
                             logger.debug(
@@ -426,6 +430,7 @@ class NotificationsStreamWriter(mp.Process):
 
                     # reset consecutive failure counter on any successful pass through this frame
                     consecutive_failures = 0
+                    logger.info("no alert msg")
 
                 except Exception as e:
                     consecutive_failures += 1

@@ -29,7 +29,7 @@ if not logger.handlers:
     _handler = logging.FileHandler('./logs/hm_anomaly.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
 # ================================================================
 

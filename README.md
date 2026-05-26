@@ -53,7 +53,9 @@ Populate the `dem` directory on the host before starting the container:
 
 ```bash
 docker run --rm \
+  --name agrarian \
   --gpus all \
+  --shm-size=128m \
   --env-file .env \
   -e APP_MODE=danger_detection \
   -p 8443:8443 \
@@ -95,7 +97,9 @@ Health monitoring does not use telemetry — no MQTT broker or certificates are 
 
 ```bash
 docker run --rm \
+  --name agrarian \
   --gpus all \
+  --shm-size=256m \
   --env-file .env \
   -e APP_MODE=health_monitoring \
   -p 8443:8443 \
@@ -115,6 +119,26 @@ docker run --rm \
 
 ---
 
+## Container Networking
+
+When multiple containers are running on the default bridge network, use their IP addresses to communicate between them (the default bridge does not support DNS name resolution).
+
+Find the IP of every running container:
+
+```bash
+docker inspect -f '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $(docker ps -q)
+```
+
+Or for a single container by name:
+
+```bash
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' <container-name>
+```
+
+Use the resolved IP in `.env` for `VIDEO_STREAM_READER_HOST`, `TELEMETRY_LISTENER_HOST`, `VIDEO_OUT_STREAM_HOST`, and `DB_HOST` as appropriate.
+
+---
+
 ## Local Testing
 
 Commands for running both apps from the project directory, mounting subdirectories of the repo as volumes and using the local `.env` file. Logs and outputs land directly in the project tree for easy inspection.
@@ -125,7 +149,9 @@ Place `dem.tif` and `dem_mask.tif` in the project's `dem/` directory before runn
 
 ```bash
 docker run --rm \
+  --name agrarian \
   --gpus all \
+  --shm-size=256m \
   --env-file .env \
   -e APP_MODE=danger_detection \
   -p 8443:8443 \
@@ -141,7 +167,9 @@ Add `-v ./certificates/mqtt:/app/certificates/mqtt` if testing with `TELEMETRY_L
 
 ```bash
 docker run --rm \
+  --name agrarian \
   --gpus all \
+  --shm-size=128m \
   --env-file .env \
   -e APP_MODE=health_monitoring \
   -p 8443:8443 \

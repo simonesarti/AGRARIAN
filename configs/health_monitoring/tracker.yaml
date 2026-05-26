@@ -127,3 +127,5 @@ show_boxes: false
 # If null, the line width is automatically adjusted based on image size.
 # Range: null or any positive integer.
 line_width: null
+
+verbose: false
