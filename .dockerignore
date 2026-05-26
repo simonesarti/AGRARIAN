@@ -61,5 +61,6 @@ engine/
 !danger_detection_stream.py
 !health_monitoring_stream.py
 !export_yolo.py
+!test_engine_perf.py
 # Shell scripts
 *.sh
