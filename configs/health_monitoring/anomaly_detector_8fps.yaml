@@ -22,7 +22,7 @@ features:
 # AE model architecture — must match the trained checkpoint.
 model:
   feature_dim: 9
-  hidden_dim: 128
-  latent_dim: 64
+  hidden_dim: 64
+  latent_dim: 48
   num_layers: 2
   dropout: 0.2
