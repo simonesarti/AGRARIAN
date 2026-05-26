@@ -5,6 +5,7 @@ outputs/
 runs/
 wandb/
 data/
+engine/
 
 # Runtime-only directories — created on the host and mounted as Docker volumes
 dem/
