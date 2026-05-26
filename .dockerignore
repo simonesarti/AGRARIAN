@@ -50,6 +50,9 @@ assets/
 # Logs — never bake log files into the image
 logs/
 
+# Engine
+engine/
+
 # configs and src are included in full — both pipelines are in the same image
 
 # Root-level Python files — exclude dev/utility scripts, keep pipeline entrypoints
@@ -57,6 +60,6 @@ logs/
 !main.py
 !danger_detection_stream.py
 !health_monitoring_stream.py
-
+!export_yolo.py
 # Shell scripts
 *.sh
