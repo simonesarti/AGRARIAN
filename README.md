@@ -99,7 +99,7 @@ Health monitoring does not use telemetry — no MQTT broker or certificates are 
 docker run --rm \
   --name agrarian \
   --gpus all \
-  --shm-size=256m \
+  --shm-size=128m \
   --env-file .env \
   -e APP_MODE=health_monitoring \
   -p 8443:8443 \
@@ -151,7 +151,7 @@ Place `dem.tif` and `dem_mask.tif` in the project's `dem/` directory before runn
 docker run --rm \
   --name agrarian \
   --gpus all \
-  --shm-size=256m \
+  --shm-size=128m \
   --env-file .env \
   -e APP_MODE=danger_detection \
   -p 8443:8443 \
