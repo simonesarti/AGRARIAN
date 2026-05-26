@@ -51,7 +51,8 @@ assets/
 logs/
 
 # Engine
-engine/
+engine310/
+engine312/
 
 # configs and src are included in full — both pipelines are in the same image
 
