@@ -227,7 +227,7 @@ def main():
     )
 
     video_producer_config = VideoProducerProcessConfig(
-        fps=FPS,
+        fps=round(FPS / (_frame_skip + 1)),
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         video_file_path=str(output_dir / f"{session_ts}.mp4"),
         media_server_url=s.video_out_stream_url,
