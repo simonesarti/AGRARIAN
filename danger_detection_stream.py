@@ -186,9 +186,18 @@ def main():
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
-    # Model configs are loaded from YAML; Pydantic validates checkpoint path etc.
+    # Resolve detector checkpoint: use TensorRT engine if present, otherwise .pt from yaml.
+    _yaml_det_checkpoint = detection_args.pop("model_checkpoint")
+    _det_engine_path = Path("engine") / (Path(_yaml_det_checkpoint).stem + ".engine")
+    if _det_engine_path.is_file():
+        _det_checkpoint = str(_det_engine_path)
+        logger.info(f"TensorRT engine found at {_det_engine_path}. Using engine for detector.")
+    else:
+        _det_checkpoint = _yaml_det_checkpoint
+        logger.info(f"No TensorRT engine at {_det_engine_path}. Using .pt checkpoint for detector.")
+
     detection_config    = DetectionWorkerConfig(
-        model_checkpoint=detection_args.pop("model_checkpoint"),
+        model_checkpoint=_det_checkpoint,
         predict_args=detection_args,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
