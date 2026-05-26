@@ -262,6 +262,9 @@ class LocalStoragePersistenceProcess(VideoPersistenceProcess):
     def _upload_file(self, file_path: str) -> bool:
         os.makedirs(self.config.target_directory, exist_ok=True)
         target_path = os.path.join(self.config.target_directory, os.path.basename(file_path))
+        if os.path.abspath(file_path) == os.path.abspath(target_path):
+            logger.info(f"File already at target location, skipping copy: '{file_path}'")
+            return True
         shutil.copy2(file_path, target_path)
         logger.info(f"File copied to local storage: '{target_path}'")
         return True
