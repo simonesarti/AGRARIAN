@@ -2,15 +2,19 @@
 # If null, reconstruction scores are uncalibrated (social scorer still runs).
 weights_path: checkpoints/hm_ae.pt
 
+# Frames discarded by the tracker between each processed frame (0 = track every frame).
+# Must be consistent with the effective fps these parameters were tuned for.
+frame_skip: 0
+
 # Device for AE inference: "cpu", "cuda:0", "mps"
 device: cuda:0
 
 # Feature extraction settings — must match the trained checkpoint.
 features:
-  # Frames of trajectory history fed to the AE.  @ 30 fps ≈ 10 s.
-  sequence_length: 300
   # K topological nearest neighbours used for relative velocity / position features.
   local_context_k: 5
+  # Frames of trajectory history fed to the AE.  @ 30 fps ≈ 10 s.
+  sequence_length: 300
   # Frames a track may be absent before its history is discarded.
   # During the gap the last known feature vector is repeated.
   interp_max_age: 8

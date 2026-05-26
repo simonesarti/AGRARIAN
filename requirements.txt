@@ -20,6 +20,7 @@ scikit-image==0.25.0
 scipy==1.15.0
 shapely==2.1.2
 sqlalchemy==2.0.49
+tensorrt-cu13
 tqdm==4.67.3
 ultralytics==8.4.50
 websocket-client==1.9.0

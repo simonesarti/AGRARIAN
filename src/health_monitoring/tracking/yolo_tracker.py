@@ -54,7 +54,7 @@ class YOLOTracker:
 
     def load(self) -> None:
         from ultralytics import YOLO
-        self._model = YOLO(self._model_checkpoint)
+        self._model = YOLO(self._model_checkpoint, task="detect")
 
     def update(self, frame: np.ndarray) -> tuple[list[TrackState], Optional[np.ndarray]]:
         """

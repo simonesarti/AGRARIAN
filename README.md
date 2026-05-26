@@ -88,10 +88,16 @@ Only port 8443 is published with `-p` — it is the only port the container list
 
 Health monitoring does not use telemetry — no MQTT broker or certificates are needed.
 
-| Container path              | R/W | Required | Contents                                              |
-|-----------------------------|-----|----------|-------------------------------------------------------|
-| `/app/logs`                 | W   | No       | Per-process log files, one per pipeline stage         |
-| `/app/processing_results`   | W   | No       | Session video (`.mp4`) and alert log (`.log`)         |
+| Container path              | R/W | Required          | Contents                                                                    |
+|-----------------------------|-----|-------------------|-----------------------------------------------------------------------------|
+| `/app/logs`                 | W   | No                | Per-process log files, one per pipeline stage                               |
+| `/app/processing_results`   | W   | No                | Session video (`.mp4`) and alert log (`.log`)                               |
+| `/app/engine`               | R   | Engine mode only  | TensorRT `.engine` file compiled for the host GPU (see tracker mode below)  |
+
+**Tracker mode** is selected automatically at startup based on the presence of a compiled engine file:
+
+- **Engine mode** — place `detection_1280_720_yolo11m.engine` (compiled for the host GPU) in a directory on the host and mount it to `/app/engine`. The pipeline runs at full frame rate with no frame skipping.
+- **Fallback mode** — when the `.engine` file is absent, the `.pt` checkpoint bundled in the image is used and 1 in 4 frames is tracked to compensate for higher inference latency.
 
 ### Health monitoring: run command
 
@@ -107,6 +113,8 @@ docker run --rm \
   -v /path/to/processing_results:/app/processing_results \
   agrarian
 ```
+
+Add `-v /path/to/engine:/app/engine` when using a TensorRT engine (engine mode above).
 
 ### Health monitoring: network
 
@@ -177,6 +185,8 @@ docker run --rm \
   -v ./processing_results:/app/processing_results \
   agrarian
 ```
+
+Add `-v ./engine:/app/engine` when testing with a TensorRT engine.
 
 ---
 

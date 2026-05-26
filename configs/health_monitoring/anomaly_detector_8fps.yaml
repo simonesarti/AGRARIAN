@@ -1,0 +1,28 @@
+# Path to the trained AE checkpoint.
+# If null, reconstruction scores are uncalibrated (social scorer still runs).
+weights_path: checkpoints/hm_ae_8fps.pt
+
+# Frames discarded by the tracker between each processed frame (0 = track every frame).
+# Must be consistent with the effective fps these parameters were tuned for.
+frame_skip: 3
+
+# Device for AE inference: "cpu", "cuda:0", "mps"
+device: cuda:0
+
+# Feature extraction settings — must match the trained checkpoint.
+features:
+  # K topological nearest neighbours used for relative velocity / position features.
+  local_context_k: 5
+  # Frames of trajectory history fed to the AE.  @ 8 fps ≈ 10 s.
+  sequence_length: 80
+  # Frames a track may be absent before its history is discarded.
+  # During the gap the last known feature vector is repeated.
+  interp_max_age: 4
+
+# AE model architecture — must match the trained checkpoint.
+model:
+  feature_dim: 9
+  hidden_dim: 128
+  latent_dim: 64
+  num_layers: 2
+  dropout: 0.2

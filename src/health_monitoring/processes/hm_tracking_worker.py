@@ -6,7 +6,7 @@ from queue import Full as QueueFullException
 from time import time
 from typing import Optional
 
-from pydantic import BaseModel, PositiveFloat
+from pydantic import BaseModel, NonNegativeInt, PositiveFloat
 
 from src.health_monitoring.tracking.yolo_tracker import YOLOTracker
 from src.health_monitoring.processes.messages import HMTrackingSlotMetadata
@@ -37,6 +37,8 @@ class HMTrackingWorkerConfig(BaseModel):
 
     model_checkpoint: str
     track_kwargs: dict = {}     # YOLO inference params (conf, iou, tracker, imgsz, …)
+    # Frames discarded between each tracked frame (0 = track every frame, 3 = 1 in 4).
+    frame_skip: NonNegativeInt = 0
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
@@ -91,6 +93,8 @@ class HMTrackingWorker(mp.Process):
             tracker.load()
             logger.info("YOLO tracker loaded.")
 
+            _skip_countdown = 0
+
             while not self.error_event.is_set():
 
                 iter_start = time()
@@ -107,6 +111,14 @@ class HMTrackingWorker(mp.Process):
                     break
 
                 assert isinstance(meta, FrameSlotMetadata)
+
+                # ---- frame skipping ----
+                if _skip_countdown > 0:
+                    _skip_countdown -= 1
+                    self.input_frame_buffer.release(meta.slot_index)
+                    logger.debug(f"Frame {meta.frame_id} skipped.")
+                    continue
+                _skip_countdown = self.config.frame_skip
 
                 get_time = time() - iter_start
 

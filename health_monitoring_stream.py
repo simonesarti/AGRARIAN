@@ -78,9 +78,16 @@ def main():
         logger.critical(f"Configuration error: {e}", exc_info=True)
         exit(1)
 
+    _engine_path = Path("engine/detection_1280_720_yolo11m.engine")
+    _use_engine  = _engine_path.is_file()
+    _anomaly_cfg_file = (
+        "configs/health_monitoring/anomaly_detector_30fps.yaml" if _use_engine
+        else "configs/health_monitoring/anomaly_detector_8fps.yaml"
+    )
+
     try:
         tracking_args          = read_yaml_config("configs/health_monitoring/tracker.yaml")
-        anomaly_detection_args = read_yaml_config("configs/health_monitoring/anomaly_detector.yaml")
+        anomaly_detection_args = read_yaml_config(_anomaly_cfg_file)
     except Exception as e:
         logger.critical(f"Failed to load models configs: {e}", exc_info=True)
         exit(1)
@@ -133,6 +140,16 @@ def main():
 
     # ============== BUILD PROCESS CONFIGS ==============
 
+    # Resolve tracker checkpoint; frame_skip comes from the anomaly detector config.
+    _yaml_checkpoint = tracking_args.pop("model_checkpoint")
+    _frame_skip = anomaly_detection_args.pop("frame_skip")
+    if _use_engine:
+        _tracking_checkpoint = str(_engine_path)
+        logger.info(f"TensorRT engine found at {_engine_path}. Using engine (frame_skip={_frame_skip}).")
+    else:
+        _tracking_checkpoint = _yaml_checkpoint
+        logger.info(f"No TensorRT engine at {_engine_path}. Using .pt checkpoint (frame_skip={_frame_skip}).")
+
     video_reader_config = StreamVideoReaderConfig(
         video_stream_url=s.video_stream_reader_url,
         connect_open_timeout_s=VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S,
@@ -147,10 +164,11 @@ def main():
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
-    _tracking_checkpoint = tracking_args.pop("model_checkpoint")
+    assert isinstance(_tracking_checkpoint, str), "tracking checkpoint must be a non-empty string"
     tracking_config = HMTrackingWorkerConfig(
         model_checkpoint=_tracking_checkpoint,
         track_kwargs=tracking_args,
+        frame_skip=_frame_skip,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
