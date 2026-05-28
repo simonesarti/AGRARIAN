@@ -57,7 +57,7 @@ class DetectorWrapper:
 
     def predict(self, frame):
         logger.info(f"Predict args: {self.predict_args}")
-        detection_results = self.detector.predict(source=frame, verbose=False, **self.predict_args)
+        detection_results = self.detector.predict(source=frame, **self.predict_args)
         return postprocess_detection_results(detection_results)
 
 
