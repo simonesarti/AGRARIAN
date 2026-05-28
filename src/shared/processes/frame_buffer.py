@@ -25,9 +25,15 @@ class FrameBuffer:
         else:
             # no free slot — drop frame, consumer is too slow
 
-    Consumer:
+    Consumer (copy, release immediately):
         meta = meta_queue.get()
         frame = buf.read(meta.slot_index)
+        buf.release(meta.slot_index)
+
+    Consumer (zero-copy view, release after last use):
+        meta = meta_queue.get()
+        view = buf.view(meta.slot_index)
+        # ... all operations that read from view ...
         buf.release(meta.slot_index)
 
     Cleanup:
@@ -76,6 +82,14 @@ class FrameBuffer:
         """Return a copy of the frame stored in the given slot."""
         src = np.ndarray(self.frame_shape, dtype=self.dtype, buffer=self._shm[slot_idx].buf)
         return src.copy()
+
+    def view(self, slot_idx: int) -> np.ndarray:
+        """Return a zero-copy view of the frame stored in the given slot.
+
+        The caller must not call release() until all reads from the returned
+        array (and any views derived from it) are complete.
+        """
+        return np.ndarray(self.frame_shape, dtype=self.dtype, buffer=self._shm[slot_idx].buf)
 
     def release(self, slot_idx: int) -> None:
         """Return a slot to the free pool once the consumer is done with it."""

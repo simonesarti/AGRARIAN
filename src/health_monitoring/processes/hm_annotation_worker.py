@@ -183,15 +183,14 @@ class HMAnnotationWorker(mp.Process):
 
                 get_time = time() - iter_start
 
-                # ---- read frame and release input slot ----
+                # ---- zero-copy view of input slot ----
                 predict_start = time()
 
-                frame = self.input_frame_buffer.read(meta.slot_index)
-                self.input_frame_buffer.release(meta.slot_index)
+                frame = self.input_frame_buffer.view(meta.slot_index)
 
                 r: FrameAnomalyResult = meta.anomaly_result
 
-                # ---- annotate (in-place on the copy returned by read()) ----
+                # ---- annotate (in-place on the shared memory view) ----
                 _annotate(frame, meta.tracks, r)
 
                 # ---- upscale to original video resolution ----
@@ -200,6 +199,7 @@ class HMAnnotationWorker(mp.Process):
                     dsize=meta.original_wh,     # (W, H)
                     interpolation=cv2.INTER_LINEAR,
                 )
+                self.input_frame_buffer.release(meta.slot_index)
 
                 # Build alert message: only confirmed tracks visible in this frame.
                 active_ids = {t.track_id for t in meta.tracks}

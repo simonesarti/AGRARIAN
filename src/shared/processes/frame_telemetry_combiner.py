@@ -429,11 +429,8 @@ class FrameTelemetryCombiner(mp.Process):
 
                 assert isinstance(meta, FrameSlotMetadata)
 
-                # ---- read frame from input shared memory and immediately release the slot ----
-                # release() is called right after read() so that the upstream producer
-                # can reuse the slot as quickly as possible
-                frame = self.input_frame_buffer.read(meta.slot_index)
-                self.input_frame_buffer.release(meta.slot_index)
+                # ---- zero-copy view of input slot ----
+                frame = self.input_frame_buffer.view(meta.slot_index)
 
                 # ---- find the best-matching telemetry by timestamp ----
                 # The lock must be held during the entire search+prune operation
@@ -457,8 +454,7 @@ class FrameTelemetryCombiner(mp.Process):
                 # ---- acquire an output slot and write the frame to output shared memory ----
                 out_slot = self.output_frame_buffer.acquire()
                 if out_slot is None:
-                    # No free output slot — the downstream consumer is too slow.
-                    # Drop this frame so the next one can be written when a slot is freed.
+                    self.input_frame_buffer.release(meta.slot_index)
                     logger.warning(
                         f"No free slot in output frame buffer. "
                         f"Frame {meta.frame_id} discarded. Consumer too slow?"
@@ -466,6 +462,7 @@ class FrameTelemetryCombiner(mp.Process):
                     continue
 
                 self.output_frame_buffer.write(out_slot, frame)
+                self.input_frame_buffer.release(meta.slot_index)
 
                 # ---- put lightweight combined metadata on the output queue ----
                 out_meta = CombinedSlotMetadata(

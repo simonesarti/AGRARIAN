@@ -117,9 +117,8 @@ class AnnotationWorker(mp.Process):
 
                 get_start = time()
 
-                # ---- read and immediately release input slot ----
-                stacked = self.input_frame_buffer.read(meta.slot_index)
-                self.input_frame_buffer.release(meta.slot_index)
+                # ---- zero-copy view of input slot ----
+                stacked = self.input_frame_buffer.view(meta.slot_index)
 
                 frame            = np.ascontiguousarray(stacked[:, :, :3])
                 danger_mask      = stacked[:, :, 3]
@@ -138,6 +137,7 @@ class AnnotationWorker(mp.Process):
                     draw_safety_areas(frame, meta.boxes_centers, meta.safety_radius_pixels)
 
                 draw_dangerous_area(frame, danger_mask, intersection_mask, color_danger_frame, color_intersect_frame, danger_buf, overlay_buf)
+                self.input_frame_buffer.release(meta.slot_index)
                 draw_detections(frame, meta.classes, meta.boxes_corner1, meta.boxes_corner2)
                 draw_count(meta.classes, meta.num_classes, meta.classes_names, frame)
                 

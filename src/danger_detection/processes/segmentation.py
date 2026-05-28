@@ -153,9 +153,8 @@ class SegmentationWorker(mp.Process):
 
                 get_start = time()
 
-                # ---- read frame from input shared memory and immediately release the slot ----
-                frame = self.input_frame_buffer.read(meta.slot_index)
-                self.input_frame_buffer.release(meta.slot_index)
+                # ---- zero-copy view of input slot ----
+                frame = self.input_frame_buffer.view(meta.slot_index)
 
                 # ---- run ONNX segmentation ----
                 predict_start = time()
@@ -171,6 +170,7 @@ class SegmentationWorker(mp.Process):
                     ],
                     axis=2,
                 )
+                self.input_frame_buffer.release(meta.slot_index)
 
                 # ---- acquire an output slot and write the stacked array ----
                 out_slot = self.output_frame_buffer.acquire()

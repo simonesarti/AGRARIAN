@@ -207,11 +207,10 @@ class VideoProducerProcess(mp.Process):
 
                 assert isinstance(meta, AnnotationSlotMetadata)
 
-                # ---- read frame from shared memory and release slot immediately ----
-                frame = self.input_frame_buffer.read(meta.slot_index)
-                self.input_frame_buffer.release(meta.slot_index)
-
+                # ---- zero-copy view of input slot ----
+                frame = self.input_frame_buffer.view(meta.slot_index)
                 self._process_frame(frame)
+                self.input_frame_buffer.release(meta.slot_index)
 
         except Exception as e:
             logger.critical(f"Critical error in VideoProducerProcess: {e}", exc_info=True)

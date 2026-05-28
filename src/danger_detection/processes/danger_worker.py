@@ -119,11 +119,10 @@ class DangerWorker(mp.Process):
 
                 get_time = time() - iter_start
 
-                # ---- read and immediately release input slot ----
+                # ---- zero-copy view of input slot ----
                 detect_start = time()
 
-                stacked = self.input_frame_buffer.read(meta.slot_index)
-                self.input_frame_buffer.release(meta.slot_index)
+                stacked = self.input_frame_buffer.view(meta.slot_index)
 
                 frame         = stacked[:, :, :3]
                 roads_mask    = stacked[:, :, 3]
@@ -155,6 +154,7 @@ class DangerWorker(mp.Process):
 
                 out_slot = self.output_frame_buffer.acquire()
                 if out_slot is None:
+                    self.input_frame_buffer.release(meta.slot_index)
                     logger.warning(
                         f"No free slot in output frame buffer. "
                         f"Frame {meta.frame_id} dropped. Consumer too slow?"
@@ -167,10 +167,13 @@ class DangerWorker(mp.Process):
                     )
                     continue
 
-                out = np.empty((frame_height, frame_width, 5), dtype=np.uint8)
-                out[:, :, :3] = frame
-                out[:, :, 3]  = danger_mask
-                out[:, :, 4]  = intersection_mask
+                out = np.concatenate([
+                    frame,
+                    danger_mask[:, :, np.newaxis],
+                    intersection_mask[:, :, np.newaxis]],
+                    axis=2,
+                )
+                self.input_frame_buffer.release(meta.slot_index)
                 self.output_frame_buffer.write(out_slot, out)
 
                 out_meta = DangerSlotMetadata(

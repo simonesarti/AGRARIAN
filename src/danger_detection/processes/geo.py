@@ -159,9 +159,8 @@ class GeoWorker(mp.Process):
 
                 get_start = time()
 
-                # ---- read stacked (H, W, 5) slot and immediately release it ----
-                stacked_in = self.input_frame_buffer.read(meta.slot_index)
-                self.input_frame_buffer.release(meta.slot_index)
+                # ---- zero-copy view of input slot ----
+                stacked_in = self.input_frame_buffer.view(meta.slot_index)
 
                 # ---- one-time frame-dimension setup from the first slot read ----
                 if frame_width is None:
@@ -344,6 +343,7 @@ class GeoWorker(mp.Process):
                     ],
                     axis=2,
                 )
+                self.input_frame_buffer.release(meta.slot_index)
 
                 # ---- acquire an output slot and write the stacked array ----
                 out_slot = self.output_frame_buffer.acquire()

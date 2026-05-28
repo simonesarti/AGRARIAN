@@ -122,11 +122,10 @@ class HMTrackingWorker(mp.Process):
 
                 get_time = time() - iter_start
 
-                # ---- read frame and release input slot ----
+                # ---- zero-copy view of input slot ----
                 predict_start = time()
 
-                frame = self.input_frame_buffer.read(meta.slot_index)
-                self.input_frame_buffer.release(meta.slot_index)
+                frame = self.input_frame_buffer.view(meta.slot_index)
 
                 tracks, H = tracker.update(frame)
 
@@ -139,6 +138,7 @@ class HMTrackingWorker(mp.Process):
 
                 out_slot = self.output_frame_buffer.acquire()
                 if out_slot is None:
+                    self.input_frame_buffer.release(meta.slot_index)
                     logger.warning(
                         f"No free slot in output frame buffer. "
                         f"Frame {meta.frame_id} dropped. Consumer too slow?"
@@ -146,6 +146,7 @@ class HMTrackingWorker(mp.Process):
                     continue
 
                 self.output_frame_buffer.write(out_slot, frame)
+                self.input_frame_buffer.release(meta.slot_index)
                 out_meta = HMTrackingSlotMetadata(
                     frame_id=meta.frame_id,
                     timestamp=meta.timestamp,

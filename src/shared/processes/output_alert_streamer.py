@@ -401,12 +401,10 @@ class NotificationsStreamWriter(mp.Process):
 
                 assert isinstance(meta, AnnotationSlotMetadata)
 
-                # ---- read frame from shared memory and release slot immediately ----
-                # read() returns a copy, so the slot can be freed right away.
+                # ---- zero-copy view of input slot ----
                 logger.info("tried to read data from buffer")
-                frame = self.input_frame_buffer.read(meta.slot_index)
-                self.input_frame_buffer.release(meta.slot_index)
-                logger.info("slot released")
+                frame = self.input_frame_buffer.view(meta.slot_index)
+                logger.info("slot acquired (zero-copy)")
 
                 # ---- cooldown check and alert dispatch ----
                 try:
@@ -430,9 +428,10 @@ class NotificationsStreamWriter(mp.Process):
 
                     # reset consecutive failure counter on any successful pass through this frame
                     consecutive_failures = 0
-                    logger.info("no alert msg")
+                    self.input_frame_buffer.release(meta.slot_index)
 
                 except Exception as e:
+                    self.input_frame_buffer.release(meta.slot_index)
                     consecutive_failures += 1
                     if consecutive_failures < self.config.alerts_max_consecutive_failures:
                         logger.warning(
