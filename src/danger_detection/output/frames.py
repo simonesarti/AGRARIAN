@@ -15,10 +15,14 @@ CLASS_COLOR = [BLUE, PURPLE]
 
 
 # generate the constant images based on the frame shape and color
-def get_danger_intersect_colored_frames(shape) -> tuple[np.ndarray, np.ndarray]:
-    color_danger_frame = np.full(shape, RED, dtype=np.uint8)
-    color_intersect_frame = np.full(shape, YELLOW, dtype=np.uint8)
-    return color_danger_frame, color_intersect_frame
+def get_danger_intersect_colored_frames(shape) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    red_quarter    = tuple(int(c * 0.25) for c in RED)
+    yellow_quarter = tuple(int(c * 0.25) for c in YELLOW)
+    color_danger_frame    = np.full(shape, red_quarter,    dtype=np.uint8)
+    color_intersect_frame = np.full(shape, yellow_quarter, dtype=np.uint8)
+    danger_buf  = np.zeros(shape, dtype=np.uint8)
+    overlay_buf = np.zeros(shape, dtype=np.uint8)
+    return color_danger_frame, color_intersect_frame, danger_buf, overlay_buf
 
 def draw_safety_areas(
         annotated_frame,
@@ -47,17 +51,18 @@ def draw_dangerous_area(
         intersection,
         color_danger_frame,
         color_intersect_frame,
+        danger_buf,
+        overlay_buf,
 ):
-    # colored frames are precomputed to save time, color is always the same
-    # Use cv2.bitwise_and with the masks directly.
-    danger_overlay = cv2.bitwise_and(color_danger_frame, color_danger_frame, mask=dangerous_mask_no_intersection)
-    intersect_overlay = cv2.bitwise_and(color_intersect_frame, color_intersect_frame, mask=intersection)
-
-    # Combine the overlays (if regions overlap, the colors will add).
-    overlay = cv2.add(danger_overlay, intersect_overlay)
-
-    # Blend the overlay with the original frame.
-    cv2.addWeighted(annotated_frame, 0.75, overlay, 0.25, 0, annotated_frame)
+    danger_buf.fill(0)
+    overlay_buf.fill(0)
+    cv2.bitwise_and(color_danger_frame,    color_danger_frame,    dst=danger_buf,  mask=dangerous_mask_no_intersection)
+    cv2.bitwise_and(color_intersect_frame, color_intersect_frame, dst=overlay_buf, mask=intersection)
+    cv2.add(danger_buf, overlay_buf, dst=overlay_buf)
+    
+    cv2.add(annotated_frame, overlay_buf, dst=annotated_frame)
+    # alternative with dimming: avoids saturation on bright pixels, ~1.23x faster than addWeighted (needs extra quarter_buf pre-allocated at setup)
+    # np.right_shift(annotated_frame, 2, out=quarter_buf); cv2.subtract(annotated_frame, quarter_buf, dst=annotated_frame); cv2.add(annotated_frame, overlay_buf, dst=annotated_frame)
 
 
 def draw_count(
@@ -122,46 +127,3 @@ def draw_count(
 
     return annotated_frame
 
-
-def annotate_and_save_frame(
-        annotated_writer,
-        output_dir,
-        frame,
-        frame_id,
-        cooldown_has_passed,
-        danger_exists,
-        num_classes,
-        classes_names,
-        classes,
-        boxes_centers,
-        boxes_corner1,
-        boxes_corner2,
-        safety_radius_pixels,
-        danger_mask,
-        intersection_mask,
-        color_danger_frame,
-        color_intersect_frame,
-):
-
-    # create copy of the original frame on which to draw
-    annotated_frame = frame.copy()
-
-    # draw safety circles
-    draw_safety_areas(annotated_frame, boxes_centers, safety_radius_pixels)
-
-    # Overlay dangerous areas (in red) and intersections (in yellow) on the annotated frame
-    draw_dangerous_area(annotated_frame, danger_mask, intersection_mask, color_danger_frame, color_intersect_frame)
-
-    # draw detection boxes
-    draw_detections(annotated_frame, classes, boxes_corner1, boxes_corner2)
-
-    # draw animal count
-    draw_count(classes, num_classes, classes_names, annotated_frame)
-
-    # save the annotated frame into video
-    annotated_writer.write(annotated_frame)
-
-    # save single image to better identify the exact frame if danger exists
-    if cooldown_has_passed and danger_exists:
-        annotated_img_path = Path(output_dir, f"danger_frame_{frame_id}_annotated.jpg")
-        cv2.imwrite(annotated_img_path, annotated_frame)

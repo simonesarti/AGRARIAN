@@ -10,7 +10,8 @@ from src.shared.processes.frame_telemetry_combiner import FrameTelemetryCombiner
 from src.danger_detection.processes.detection import DetectionWorker, DetectionWorkerConfig
 from src.danger_detection.processes.segmentation import SegmentationWorker, SegmentationWorkerConfig
 from src.danger_detection.processes.geo import GeoWorker, GeoWorkerConfig
-from src.danger_detection.processes.danger_annotation import DangerAnnotationWorker, DangerAnnotationWorkerConfig
+from src.danger_detection.processes.danger_worker import DangerWorker, DangerWorkerConfig
+from src.danger_detection.processes.annotation_worker import AnnotationWorker, AnnotationWorkerConfig
 from src.shared.processes.output_alert_streamer import NotificationsStreamWriter, NotificationsStreamWriterConfig
 from src.shared.processes.output_video_streamer import VideoProducerProcess, VideoProducerProcessConfig
 from src.shared.processes.video_storage_manager import (
@@ -124,7 +125,8 @@ def main():
     combiner_to_detection_buf     = FrameBuffer(_3ch, n_slots=MAX_SIZE_DETECTION_IN)
     detection_to_segmentation_buf = FrameBuffer(_3ch, n_slots=MAX_SIZE_SEGMENTATION_IN)
     segmentation_to_geo_buf       = FrameBuffer(_5ch, n_slots=MAX_SIZE_GEO_IN)
-    geo_to_annotation_buf         = FrameBuffer(_8ch, n_slots=MAX_SIZE_DANGER_DETECTION_RESULT)
+    geo_to_danger_buf             = FrameBuffer(_8ch, n_slots=MAX_SIZE_DANGER_DETECTION_RESULT)
+    danger_to_annotation_buf      = FrameBuffer(_5ch, n_slots=MAX_SIZE_DANGER_DETECTION_RESULT)
     annotation_to_alert_buf       = FrameBuffer(_ann, n_slots=MAX_SIZE_NOTIFICATIONS_STREAM)
     annotation_to_video_buf       = FrameBuffer(_ann, n_slots=MAX_SIZE_VIDEO_STREAM)
 
@@ -133,7 +135,8 @@ def main():
         combiner_to_detection_buf,
         detection_to_segmentation_buf,
         segmentation_to_geo_buf,
-        geo_to_annotation_buf,
+        geo_to_danger_buf,
+        danger_to_annotation_buf,
         annotation_to_alert_buf,
         annotation_to_video_buf,
     ]
@@ -144,7 +147,8 @@ def main():
     combiner_to_detection_q     = mp.Queue(maxsize=MAX_SIZE_DETECTION_IN)
     detection_to_segmentation_q = mp.Queue(maxsize=MAX_SIZE_SEGMENTATION_IN)
     segmentation_to_geo_q       = mp.Queue(maxsize=MAX_SIZE_GEO_IN)
-    geo_to_annotation_q         = mp.Queue(maxsize=MAX_SIZE_DANGER_DETECTION_RESULT)
+    geo_to_danger_q             = mp.Queue(maxsize=MAX_SIZE_DANGER_DETECTION_RESULT)
+    danger_to_annotation_q      = mp.Queue(maxsize=MAX_SIZE_DANGER_DETECTION_RESULT)
     annotation_to_alert_q       = mp.Queue(maxsize=MAX_SIZE_NOTIFICATIONS_STREAM)
     annotation_to_video_q       = mp.Queue(maxsize=MAX_SIZE_VIDEO_STREAM)
     video_to_persistence_q      = mp.Queue(maxsize=1)
@@ -228,7 +232,12 @@ def main():
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
-    danger_annotation_config = DangerAnnotationWorkerConfig(
+    danger_worker_config = DangerWorkerConfig(
+        queue_timeout=PIPELINE_QUEUE_TIMEOUT,
+        poison_pill_timeout=POISON_PILL_TIMEOUT,
+    )
+
+    annotation_worker_config = AnnotationWorkerConfig(
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
@@ -345,21 +354,30 @@ def main():
         geo_process = GeoWorker(
             input_meta_queue=segmentation_to_geo_q,
             input_frame_buffer=segmentation_to_geo_buf,
-            output_meta_queue=geo_to_annotation_q,
-            output_frame_buffer=geo_to_annotation_buf,
+            output_meta_queue=geo_to_danger_q,
+            output_frame_buffer=geo_to_danger_buf,
             error_event=error_event,
             config=geo_config,
         )
 
-        danger_annotation_process = DangerAnnotationWorker(
-            input_meta_queue=geo_to_annotation_q,
-            input_frame_buffer=geo_to_annotation_buf,
+        danger_process = DangerWorker(
+            input_meta_queue=geo_to_danger_q,
+            input_frame_buffer=geo_to_danger_buf,
+            output_meta_queue=danger_to_annotation_q,
+            output_frame_buffer=danger_to_annotation_buf,
+            error_event=error_event,
+            config=danger_worker_config,
+        )
+
+        annotation_process = AnnotationWorker(
+            input_meta_queue=danger_to_annotation_q,
+            input_frame_buffer=danger_to_annotation_buf,
             alert_output_meta_queue=annotation_to_alert_q,
             alert_output_frame_buffer=annotation_to_alert_buf,
             video_output_meta_queue=annotation_to_video_q,
             video_output_frame_buffer=annotation_to_video_buf,
             error_event=error_event,
-            config=danger_annotation_config,
+            config=annotation_worker_config,
         )
 
         alert_writer_process = NotificationsStreamWriter(
@@ -398,7 +416,8 @@ def main():
         detection_process,
         segmentation_process,
         geo_process,
-        danger_annotation_process,
+        danger_process,
+        annotation_process,
         alert_writer_process,
         video_producer_process,
         video_persistence_process,

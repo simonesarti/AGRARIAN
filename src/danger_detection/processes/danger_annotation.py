@@ -179,7 +179,7 @@ class DangerAnnotationWorker(mp.Process):
                 self.input_frame_buffer.release(meta.slot_index)
 
                 # ---- split channels ----
-                frame = stacked[:, :, :3]                  # BGR frame (processing resolution)
+                frame = np.ascontiguousarray(stacked[:, :, :3])   # BGR frame (processing resolution)
                 roads_mask = stacked[:, :, 3]
                 vehicles_mask = stacked[:, :, 4]
                 nodata_dem_mask = stacked[:, :, 5]

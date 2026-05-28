@@ -77,3 +77,31 @@ class GeoSlotMetadata:
     boxes_corner1: np.ndarray  # (N, 2)
     boxes_corner2: np.ndarray  # (N, 2)
     safety_radius_pixels: int
+
+
+@dataclass
+class DangerSlotMetadata:
+    """
+    Message carrying a shared-memory frame slot reference and computed danger results.
+    Passed between DangerWorker and AnnotationWorker.
+
+    The slot points to a (H, W, 5) array in shared memory:
+        channels 0-2 : BGR frame (processing resolution, unchanged)
+        channel  3   : danger_mask      (uint8, 0/1)
+        channel  4   : intersection_mask (uint8, 0/1)
+
+    alert_msg is the human-readable danger description (e.g. "Roads & Vehicles"),
+    or an empty string when no danger is detected.
+    """
+    frame_id: int
+    timestamp: float
+    original_wh: tuple[int, int]
+    slot_index: int
+    classes_names: dict
+    num_classes: int
+    classes: np.ndarray
+    boxes_centers: np.ndarray
+    boxes_corner1: np.ndarray
+    boxes_corner2: np.ndarray
+    safety_radius_pixels: int
+    alert_msg: str
