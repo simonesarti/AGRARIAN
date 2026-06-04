@@ -124,12 +124,15 @@ class DangerWorker(mp.Process):
 
                 stacked = self.input_frame_buffer.view(meta.slot_index)
 
-                frame         = stacked[:, :, :3]
-                roads_mask    = stacked[:, :, 3]
-                vehicles_mask = stacked[:, :, 4]
-                nodata_dem_mask  = stacked[:, :, 5]
-                geofencing_mask  = stacked[:, :, 6]
-                slope_mask       = stacked[:, :, 7]
+                frame = stacked[:, :, :3]
+                # Gather all 5 mask channels in a single contiguous copy to avoid
+                # repeated scatter-gather over strided SHM pages in create_dangerous_intersections_masks.
+                masks = np.ascontiguousarray(stacked[:, :, 3:])
+                roads_mask       = masks[:, :, 0]
+                vehicles_mask    = masks[:, :, 1]
+                nodata_dem_mask  = masks[:, :, 2]
+                geofencing_mask  = masks[:, :, 3]
+                slope_mask       = masks[:, :, 4]
 
                 frame_height, frame_width = frame.shape[:2]
 

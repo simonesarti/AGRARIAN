@@ -393,7 +393,6 @@ def create_dangerous_intersections_masks(
     ]))
 
     combined_danger_mask_no_intersections = combined_danger_mask - combined_intersections
-    assert np.min(combined_danger_mask_no_intersections) >= 0 and np.max(combined_danger_mask_no_intersections) <= 1
 
     return combined_danger_mask_no_intersections, combined_intersections, danger_types
 

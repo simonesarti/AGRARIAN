@@ -206,8 +206,18 @@ def main():
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
+    # Resolve segmentation checkpoint: use TensorRT engine if present, otherwise .onnx from yaml.
+    _yaml_seg_checkpoint = segmentation_args.pop("model_checkpoint")
+    _seg_engine_path = Path("engine") / (Path(_yaml_seg_checkpoint).stem + ".engine")
+    if _seg_engine_path.is_file():
+        _seg_checkpoint = str(_seg_engine_path)
+        logger.info(f"TensorRT engine found at {_seg_engine_path}. Using engine for segmentation.")
+    else:
+        _seg_checkpoint = _yaml_seg_checkpoint
+        logger.info(f"No TensorRT engine at {_seg_engine_path}. Using .onnx checkpoint for segmentation.")
+
     segmentation_config = SegmentationWorkerConfig(
-        model_checkpoint=segmentation_args.pop("model_checkpoint"),
+        model_checkpoint=_seg_checkpoint,
         predict_args=segmentation_args,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
