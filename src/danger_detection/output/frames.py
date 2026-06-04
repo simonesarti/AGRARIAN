@@ -54,15 +54,10 @@ def draw_dangerous_area(
         danger_buf,
         overlay_buf,
 ):
-    danger_buf.fill(0)
-    overlay_buf.fill(0)
-    cv2.bitwise_and(color_danger_frame,    color_danger_frame,    dst=danger_buf,  mask=dangerous_mask_no_intersection)
-    cv2.bitwise_and(color_intersect_frame, color_intersect_frame, dst=overlay_buf, mask=intersection)
-    cv2.add(danger_buf, overlay_buf, dst=overlay_buf)
-    
-    cv2.add(annotated_frame, overlay_buf, dst=annotated_frame)
-    # alternative with dimming: avoids saturation on bright pixels, ~1.23x faster than addWeighted (needs extra quarter_buf pre-allocated at setup)
-    # np.right_shift(annotated_frame, 2, out=quarter_buf); cv2.subtract(annotated_frame, quarter_buf, dst=annotated_frame); cv2.add(annotated_frame, overlay_buf, dst=annotated_frame)
+    cv2.add(annotated_frame, color_danger_frame,    dst=danger_buf)
+    cv2.add(annotated_frame, color_intersect_frame, dst=overlay_buf)
+    cv2.copyTo(danger_buf,  dangerous_mask_no_intersection, annotated_frame)
+    cv2.copyTo(overlay_buf, intersection,                   annotated_frame)
 
 
 def draw_count(

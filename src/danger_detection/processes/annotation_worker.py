@@ -130,27 +130,33 @@ class AnnotationWorker(mp.Process):
                     color_danger_frame, color_intersect_frame, danger_buf, overlay_buf = get_danger_intersect_colored_frames(shape=frame.shape)
                     logger.info(f"Annotation process setup with frame size W×H = {frame_width}×{frame_height}")
 
-                # ---- annotate ----
-                annotate_start = time()
+                t_get = time()
 
+                # ---- annotate ----
                 if meta.safety_radius_pixels > 0:
                     draw_safety_areas(frame, meta.boxes_centers, meta.safety_radius_pixels)
+                t_safety = time()
 
                 draw_dangerous_area(frame, danger_mask, intersection_mask, color_danger_frame, color_intersect_frame, danger_buf, overlay_buf)
+                t_danger = time()
+
                 self.input_frame_buffer.release(meta.slot_index)
+
                 draw_detections(frame, meta.classes, meta.boxes_corner1, meta.boxes_corner2)
+                t_detections = time()
+
                 draw_count(meta.classes, meta.num_classes, meta.classes_names, frame)
-                
+                t_count = time()
+
                 # ---- upscale to original resolution ----
                 annotated_frame = cv2.resize(
                     src=frame,
                     dsize=meta.original_wh,
                     interpolation=cv2.INTER_LINEAR,
                 )
+                t_resize = time()
 
                 # ---- fan-out: write annotated frame to both consumers independently----
-                append_start = time()
-
                 danger_exists = bool(meta.alert_msg)
 
                 # -- Alert output --
@@ -179,6 +185,7 @@ class AnnotationWorker(mp.Process):
                         logger.error(
                             f"Alert output metadata queue full. Frame {meta.frame_id} dropped for alert writer. Consumer too slow or stopped?"
                         )
+                t_alert_write = time()
 
                 # -- Video output --
                 video_slot = self.video_output_frame_buffer.acquire()
@@ -208,12 +215,18 @@ class AnnotationWorker(mp.Process):
                         )
 
                 iter_end = time()
+
+                def ms(a, b): return f"{(b - a) * 1000:.2f}"
                 logger.debug(
-                    f"frame {meta.frame_id} processed in {(iter_end - iter_start) * 1000:.2f} ms, "
-                    f"of which --> "
-                    f"GET: {(annotate_start - get_start) * 1000:.2f} ms, "
-                    f"ANNOTATE: {(append_start - annotate_start) * 1000:.2f} ms, "
-                    f"PROPAGATE: {(iter_end - append_start) * 1000:.2f} ms."
+                    f"frame {meta.frame_id} processed in {ms(iter_start, iter_end)} ms  |  "
+                    f"GET(ascontiguous): {ms(get_start, t_get)} ms  |  "
+                    f"safety_circles: {ms(t_get, t_safety)} ms  |  "
+                    f"danger_overlay: {ms(t_safety, t_danger)} ms  |  "
+                    f"detections: {ms(t_danger, t_detections)} ms  |  "
+                    f"count: {ms(t_detections, t_count)} ms  |  "
+                    f"resize: {ms(t_count, t_resize)} ms  |  "
+                    f"alert_write: {ms(t_resize, t_alert_write)} ms  |  "
+                    f"video_write: {ms(t_alert_write, iter_end)} ms"
                 )
 
             if not self.error_event.is_set():
