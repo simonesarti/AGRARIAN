@@ -75,10 +75,6 @@ def close_tifs(tif_files):
             tif.close()
 
 
-def merge_3d_mask(mask_3d):
-    return np.logical_or.reduce(mask_3d, axis=0).astype(np.uint8)
-
-
 def extract_dem_window(dem_tif, dem_mask_tif, center_lonlat, rectangle_lonlat):
     """
     Extracts a square window from a raster that fully encompasses a rotated rectangle.
@@ -349,52 +345,46 @@ def create_dangerous_intersections_masks(
     dem_nodata_danger_mask,
     geofencing_danger_mask,
     slope_danger_mask,
-
 ):
+    # pre-allocate danger type list
+    danger_types = []
+    
+    # Combined danger mask: single-pass bitwise OR chain
+    combined_danger = (
+        segment_roads_danger_mask      |
+        segment_vehicles_danger_mask   |
+        dem_nodata_danger_mask         |
+        geofencing_danger_mask         |
+        slope_danger_mask
+    ).astype(np.uint8)
 
-    # create the safety mask
+    # Early exit: no valid safety radius or no boxes means no animals or no telemetry.
+    # There cannot be an intersection if there is no safety area
+    if safety_radius_pixels <= 0 or len(boxes_centers) == 0:
+        return combined_danger, np.zeros((frame_height, frame_width), dtype=np.uint8), danger_types
+
+    # create safety mask
     safety_mask = create_safety_mask(frame_height, frame_width, boxes_centers, safety_radius_pixels)
 
-    # create the intersection mask between safety areas and dangerous areas masks
-    intersection_roads = np.logical_and(safety_mask, segment_roads_danger_mask)
-    intersection_vehicles = np.logical_and(safety_mask, segment_vehicles_danger_mask)
-    intersection_nodata = np.logical_and(safety_mask, dem_nodata_danger_mask)
-    intersection_geofencing = np.logical_and(safety_mask, geofencing_danger_mask)
-    intersection_slope = np.logical_and(safety_mask, slope_danger_mask)
+    # Combined intersection: safety circles overlapping any danger layer.
+    combined_intersections = (safety_mask & combined_danger).astype(np.uint8)
 
-    danger_types = []
-    if np.any(intersection_roads > 0):
-        danger_types.append("Roads")
-    if np.any(intersection_vehicles > 0):
-        danger_types.append("Vehicles")
-    if np.any(intersection_nodata > 0):
-        danger_types.append("Missing elevation data")
-    if np.any(intersection_geofencing > 0):
-        danger_types.append("Out of geo-fenced area")
-    if np.any(intersection_slope > 0):
-        danger_types.append("Steep slope")
+    # Per-danger checks
+    if combined_intersections.any():
+        if (safety_mask & segment_roads_danger_mask).any():
+            danger_types.append("Roads")
+        if (safety_mask & segment_vehicles_danger_mask).any():
+            danger_types.append("Vehicles")
+        if (safety_mask & dem_nodata_danger_mask).any():
+            danger_types.append("Missing elevation data")
+        if (safety_mask & geofencing_danger_mask).any():
+            danger_types.append("Out of geo-fenced area")
+        if (safety_mask & slope_danger_mask).any():
+            danger_types.append("Steep slope")
 
-    # compute combined danger mask
-    combined_danger_mask = merge_3d_mask(np.stack([
-        segment_roads_danger_mask,
-        segment_vehicles_danger_mask,
-        dem_nodata_danger_mask,
-        geofencing_danger_mask,
-        slope_danger_mask,
-    ]))
+    combined_danger_no_intersections = combined_danger - combined_intersections
 
-    # compute combined intersection mask
-    combined_intersections = merge_3d_mask(np.stack([
-        intersection_roads,
-        intersection_vehicles,
-        intersection_nodata,
-        intersection_geofencing,
-        intersection_slope
-    ]))
-
-    combined_danger_mask_no_intersections = combined_danger_mask - combined_intersections
-
-    return combined_danger_mask_no_intersections, combined_intersections, danger_types
+    return combined_danger_no_intersections, combined_intersections, danger_types
 
 
 def create_safety_mask(frame_height, frame_width, boxes_centers, safety_radius = -1):
