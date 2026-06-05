@@ -9,9 +9,98 @@ Drone-based livestock monitoring pipeline with two operating modes, selected at 
 
 ---
 
+## Pipeline Architecture
+
+Both pipelines are chains of `multiprocessing.Process` workers connected by shared-memory frame buffers. All IPC passes through two buffer classes defined in [src/shared/processes/frame_buffer.py](src/shared/processes/frame_buffer.py):
+
+- **`FrameBuffer`** — a pool of N POSIX shared memory slots, each holding one `(H, W, 3)` BGR frame. Workers call `acquire()` → `write()` → enqueue metadata; the downstream worker calls `view()` (zero-copy read into SHM) → process → `release()`.
+- **`MultiFrameBuffer`** — two independent POSIX SHM regions per slot (primary for the frame, secondary for a mask stack), governed by a single slot pool. The primary region is `(H, W, 3)` HWC (cv2-native, always contiguous); the secondary is `(N, H, W)` CHW so that each mask `mask_view[i]` is a contiguous `(H, W)` slice. This layout eliminates intermediate `np.concatenate` allocations and `np.ascontiguousarray` copies.
+
+Each hop has its own N-slot pool. When a downstream consumer is too slow to free slots, the producer drops the current frame at that hop — slow stages never stall faster ones.
+
+### Danger Detection
+
+```text
+      Video Reader
+           │
+          FB
+           │
+        Combiner
+           │
+          FB
+           │
+        Detection
+           │
+          FB
+           │
+      Segmentation
+           │
+  MFB [roads, vehicles]
+           │
+          Geo
+           │
+  MFB [roads, vehicles, nodata, geofencing, slope]
+           │
+     Danger Worker
+           │
+  MFB [danger, intersection]
+           │
+   Annotation Worker
+         ┌─┴─┐
+         │   │
+        FB   FB
+         │   │
+      Alert  Video
+      Writer Producer
+```
+
+`FB` = `FrameBuffer((H,W,3))`, `MFB` = `MultiFrameBuffer`
+
+Segmentation and geo inference use TensorRT. Both the YOLO detection process and the TensorRT process run on the GPU concurrently via NVIDIA MPS — start `nvidia-cuda-mps-control` on the host before launching the container.
+
+### Health Monitoring
+
+```text
+     Video Reader
+          │
+         FB
+          │
+       Detection
+          │
+         FB
+          │
+       Tracking
+          │
+         FB
+          │
+  Anomaly Detector
+          │
+         FB
+          │
+  Annotation Worker
+        ┌─┴─┐
+        │   │
+       FB   FB
+        │   │
+     Alert  Video
+     Writer Producer
+```
+
+In engine mode (TensorRT `.engine` file present) every frame is tracked; in fallback mode (`.pt` checkpoint) 1 in 4 frames is tracked to compensate for higher inference latency. Health monitoring does not require NVIDIA MPS.
+
+---
+
 ## Prerequisites
 
 - Docker with NVIDIA Container Toolkit (`nvidia-docker2` or `--gpus` support)
+- NVIDIA MPS (required for danger detection, to share the GPU between YOLO and TensorRT processes):
+
+  ```bash
+  sudo nvidia-cuda-mps-control -d          # start MPS daemon on the host
+  # ... run the container ...
+  echo quit | sudo nvidia-cuda-mps-control  # stop MPS daemon when done
+  ```
+
 - A `.env` file — copy `.env.example` and fill in your deployment values:
 
   ```bash
