@@ -1,16 +1,15 @@
-FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu22.04
+FROM nvcr.io/nvidia/tensorrt:25.03-py3
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies (including Python, which is not in the nvidia/cuda base)
-RUN apt update && apt install -y \
-    python3 \
-    python3-pip \
+# TensorRT, cuDNN, CUDA 12.9, and Python 3.12 are pre-installed in the base image.
+# Install only system-level dependencies not already present.
+RUN apt-get update && apt-get install -y \
     ffmpeg \
     libx264-dev \
     libavcodec-dev \
     libavformat-dev \
-    libavutil-dev \ 
+    libavutil-dev \
     libswscale-dev \
     libsm6 \
     libxext6 \
@@ -26,16 +25,15 @@ RUN apt update && apt install -y \
 
 ENV LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc.so"
 
-# Set the working directory
 WORKDIR /app
 
-# Install PyTorch separately so this heavy layer is cached independently of app changes
+# Install PyTorch separately so this heavy layer is cached independently of app changes.
+# cu126 wheels are backward-compatible with the CUDA 12.9 runtime in this image.
 RUN pip install --no-cache-dir \
-    torch==2.12.0+cu130 \
-    torchvision==0.27.0+cu130 \
-    --index-url https://download.pytorch.org/whl/cu130
+    torch==2.6.0+cu126 \
+    torchvision==0.21.0+cu126 \
+    --index-url https://download.pytorch.org/whl/cu126
 
-# Copy requirements and install remaining Python dependencies
 COPY ./requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 

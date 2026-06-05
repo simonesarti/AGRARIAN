@@ -5,7 +5,6 @@ outputs/
 runs/
 wandb/
 data/
-engine/
 
 # Runtime-only directories — created on the host and mounted as Docker volumes
 dem/
@@ -18,7 +17,7 @@ TODO.md
 # Singularity image
 agrarian.sif
 
-# Base yolo checkpoints
+# checkpoints
 *.pt
 *.onnx
 *.engine
