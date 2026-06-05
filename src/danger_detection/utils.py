@@ -266,8 +266,8 @@ def compute_slope_mask_horn(elev_array, pixel_size, slope_threshold_deg):
 def create_geofencing_mask_runtime(frame_width, frame_height, transform, polygon):
 
     # Use rasterio.features.rasterize to create an array of shape (H, W)
-    # The inside of the polygon will be burned with a value of 0
-    # all external pixels will be 1
+    # The inside of the polygon will be set to 0 (OK)
+    # The inside of the polygon will be set to 1 (OUT OF BOUNDS)
     mask = rasterize(
         [(polygon, 0)],  # list of (geometry, value)
         out_shape=(frame_height, frame_width),

@@ -203,7 +203,7 @@ class GeoWorker(mp.Process):
                             safety_radius_pixels = int(
                                 self.config.input_args["safety_radius_m"] / meters_per_pixel_est
                             )
-                            logger.warning(
+                            logger.info(
                                 f"Frame {meta.frame_id}: no telemetry — safety radius estimated from "
                                 f"{len(meta.classes)} bbox(es). "
                                 f"Median max bbox dim: {median_max_dim_px:.1f} px, "
