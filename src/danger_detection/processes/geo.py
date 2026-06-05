@@ -22,7 +22,7 @@ from src.danger_detection.utils import (
     map_window_onto_drone_frame,
 )
 from src.danger_detection.processes.messages import SegmentationSlotMetadata, GeoSlotMetadata
-from src.shared.processes.frame_buffer import FrameBuffer
+from src.shared.processes.frame_buffer import FrameBuffer, MultiFrameBuffer
 from src.shared.processes.constants import (
     PIPELINE_QUEUE_TIMEOUT,
     POISON_PILL,
@@ -76,13 +76,15 @@ class GeoWorker(mp.Process):
     """
     Geo-analysis process in the danger detection pipeline.
 
-    Reads a stacked (H, W, 5) slot from the upstream FrameBuffer (frame + segmentation
-    masks), runs DEM-based slope, no-data, and geofencing analysis using the frame's
-    matched telemetry, then writes a (H, W, 8) slot to the downstream FrameBuffer:
-        channels 0-4 : forwarded unchanged from segmentation
-        channel  5   : nodata_dem_mask  (uint8, 0/1)
-        channel  6   : geofencing_mask  (uint8, 0/1)
-        channel  7   : slope_mask       (uint8, 0/1)
+    Reads a MultiFrameBuffer slot from SegmentationWorker:
+        primary   (H, W, 3) : BGR frame
+        secondary (2, H, W) : [0] roads_mask, [1] vehicles_mask
+
+    Runs DEM-based slope, no-data, and geofencing analysis, then writes a
+    MultiFrameBuffer slot for DangerWorker:
+        primary   (H, W, 3) : BGR frame (forwarded unchanged)
+        secondary (5, H, W) : [0] roads_mask, [1] vehicles_mask,
+                               [2] nodata_dem_mask, [3] geofencing_mask, [4] slope_mask
 
     When telemetry is None, geo masks default to all-zeros and safety_radius_pixels to -1.
 
@@ -99,9 +101,9 @@ class GeoWorker(mp.Process):
     def __init__(
             self,
             input_meta_queue: mp.Queue,
-            input_frame_buffer: FrameBuffer,
+            input_frame_buffer: MultiFrameBuffer,
             output_meta_queue: mp.Queue,
-            output_frame_buffer: FrameBuffer,
+            output_frame_buffer: MultiFrameBuffer,
             error_event: multiprocessing.synchronize.Event,
             config: GeoWorkerConfig,
     ):
@@ -162,12 +164,12 @@ class GeoWorker(mp.Process):
 
                 get_start = time()
 
-                # ---- zero-copy view of input slot ----
-                stacked_in = self.input_frame_buffer.view(meta.slot_index)
+                # ---- zero-copy views of input slot ----
+                frame_view, seg_mask_view = self.input_frame_buffer.view(meta.slot_index)
 
                 # ---- one-time frame-dimension setup from the first slot read ----
                 if frame_width is None:
-                    frame_height, frame_width = stacked_in.shape[:2]
+                    frame_height, frame_width = frame_view.shape[:2]
                     frame_corners = np.array([
                         [0, 0],                                 # upper left
                         [frame_width - 1, 0],                   # upper right
@@ -336,28 +338,24 @@ class GeoWorker(mp.Process):
                     else:
                         geofencing_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
 
-                # ---- stack geo masks onto the forwarded (H, W, 5) array → (H, W, 8) ----
-                stacked_out = np.concatenate(
-                    [
-                        stacked_in,
-                        nodata_dem_mask[:, :, np.newaxis],
-                        geofencing_mask[:, :, np.newaxis],
-                        slope_mask[:, :, np.newaxis],
-                    ],
-                    axis=2,
-                )
-                self.input_frame_buffer.release(meta.slot_index)
-
-                # ---- acquire an output slot and write the stacked array ----
+                # ---- write frame and all masks directly into the output slot ----
                 out_slot = self.output_frame_buffer.acquire()
                 if out_slot is None:
+                    self.input_frame_buffer.release(meta.slot_index)
                     logger.warning(
                         f"No free slot in output frame buffer. "
                         f"Frame {meta.frame_id} discarded. Consumer too slow?"
                     )
                     continue
 
-                self.output_frame_buffer.write(out_slot, stacked_out)
+                frame_dst, mask_dst = self.output_frame_buffer.view(out_slot)
+                np.copyto(frame_dst, frame_view)
+                mask_dst[0] = seg_mask_view[0]   # roads_mask
+                mask_dst[1] = seg_mask_view[1]   # vehicles_mask
+                self.input_frame_buffer.release(meta.slot_index)
+                mask_dst[2] = nodata_dem_mask
+                mask_dst[3] = geofencing_mask
+                mask_dst[4] = slope_mask
 
                 # ---- build and enqueue output metadata ----
                 out_meta = GeoSlotMetadata(

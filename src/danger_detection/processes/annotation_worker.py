@@ -6,7 +6,6 @@ from queue import Full as QueueFullException
 from time import time
 
 import cv2
-import numpy as np
 from pydantic import BaseModel, PositiveFloat
 
 from src.danger_detection.output.frames import (
@@ -18,7 +17,7 @@ from src.danger_detection.output.frames import (
 )
 from src.danger_detection.processes.messages import DangerSlotMetadata
 from src.shared.processes.messages import AnnotationSlotMetadata
-from src.shared.processes.frame_buffer import FrameBuffer
+from src.shared.processes.frame_buffer import FrameBuffer, MultiFrameBuffer
 from src.shared.processes.constants import (
     PIPELINE_QUEUE_TIMEOUT,
     POISON_PILL,
@@ -51,10 +50,9 @@ class AnnotationWorker(mp.Process):
     """
     Annotation stage of the danger detection pipeline.
 
-    Reads a (H, W, 5) stacked slot from DangerWorker:
-        channels 0-2 : BGR frame (processing resolution)
-        channel  3   : danger_mask
-        channel  4   : intersection_mask
+    Reads a MultiFrameBuffer slot from DangerWorker:
+        primary   (H, W, 3) : BGR frame (processing resolution)
+        secondary (2, H, W) : [0] danger_mask, [1] intersection_mask
 
     Draws all overlays (safety circles, danger/intersection areas, detection boxes,
     animal count) on the processing-resolution frame, then upscales to original
@@ -67,7 +65,7 @@ class AnnotationWorker(mp.Process):
     def __init__(
             self,
             input_meta_queue: mp.Queue,
-            input_frame_buffer: FrameBuffer,
+            input_frame_buffer: MultiFrameBuffer,
             alert_output_meta_queue: mp.Queue,
             alert_output_frame_buffer: FrameBuffer,
             video_output_meta_queue: mp.Queue,
@@ -120,12 +118,12 @@ class AnnotationWorker(mp.Process):
 
                 get_start = time()
 
-                # ---- zero-copy view of input slot ----
-                stacked = self.input_frame_buffer.view(meta.slot_index)
-
-                frame            = np.ascontiguousarray(stacked[:, :, :3])
-                danger_mask      = stacked[:, :, 3]
-                intersection_mask = stacked[:, :, 4]
+                # ---- zero-copy views of input slot ----
+                # frame: contiguous (H, W, 3) HWC view — no copy needed
+                # mask_view[0]/[1]: contiguous (H, W) views from CHW secondary SHM
+                frame, mask_view = self.input_frame_buffer.view(meta.slot_index)
+                danger_mask       = mask_view[0]
+                intersection_mask = mask_view[1]
 
                 frame_height, frame_width = frame.shape[:2]
 
@@ -222,7 +220,7 @@ class AnnotationWorker(mp.Process):
                 def ms(a, b): return f"{(b - a) * 1000:.2f}"
                 logger.debug(
                     f"frame {meta.frame_id} processed in {ms(iter_start, iter_end)} ms  |  "
-                    f"GET(ascontiguous): {ms(get_start, t_get)} ms  |  "
+                    f"GET: {ms(get_start, t_get)} ms  |  "
                     f"safety_circles: {ms(t_get, t_safety)} ms  |  "
                     f"danger_overlay: {ms(t_safety, t_danger)} ms  |  "
                     f"detections: {ms(t_danger, t_detections)} ms  |  "

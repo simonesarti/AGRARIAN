@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, PositiveFloat, field_validator
 
 from src.danger_detection.segmentation.segmentation import create_onnx_segmentation_session, perform_segmentation
 from src.danger_detection.processes.messages import DetectionSlotMetadata, SegmentationSlotMetadata
-from src.shared.processes.frame_buffer import FrameBuffer
+from src.shared.processes.frame_buffer import FrameBuffer, MultiFrameBuffer
 from src.shared.processes.constants import (
     PIPELINE_QUEUE_TIMEOUT,
     POISON_PILL,
@@ -71,10 +71,9 @@ class SegmentationWorker(mp.Process):
     Segmentation process in the danger detection pipeline.
 
     Reads frames from the upstream FrameBuffer (H, W, 3), runs ONNX road/vehicle
-    segmentation, and writes a stacked (H, W, 5) array to the downstream FrameBuffer:
-        channels 0-2 : BGR frame (forwarded unchanged)
-        channel  3   : roads_mask  (uint8, values 0/1)
-        channel  4   : vehicles_mask (uint8, values 0/1)
+    segmentation, and writes to a MultiFrameBuffer slot for GeoWorker:
+        primary   (H, W, 3) : BGR frame (forwarded unchanged)
+        secondary (2, H, W) : [0] roads_mask, [1] vehicles_mask  (uint8, values 0/1)
 
     Detection metadata (bounding boxes, class IDs) received from DetectionSlotMetadata
     is forwarded unchanged in SegmentationSlotMetadata alongside the new slot reference.
@@ -94,7 +93,7 @@ class SegmentationWorker(mp.Process):
             input_meta_queue: mp.Queue,
             input_frame_buffer: FrameBuffer,
             output_meta_queue: mp.Queue,
-            output_frame_buffer: FrameBuffer,
+            output_frame_buffer: MultiFrameBuffer,
             error_event: multiprocessing.synchronize.Event,
             config: SegmentationWorkerConfig,
     ):
@@ -163,28 +162,21 @@ class SegmentationWorker(mp.Process):
                 predict_start = time()
                 roads_mask, vehicles_mask = segmenter.predict(frame)
 
-                # ---- stack frame and masks into a single (H, W, 5) array ----
-                # Roads and vehicles masks come out as (H, W); add channel dim before stacking.
-                stacked = np.concatenate(
-                    [
-                        frame,
-                        roads_mask[:, :, np.newaxis],
-                        vehicles_mask[:, :, np.newaxis],
-                    ],
-                    axis=2,
-                )
-                self.input_frame_buffer.release(meta.slot_index)
-
-                # ---- acquire an output slot and write the stacked array ----
+                # ---- write frame and masks directly into the output slot ----
                 out_slot = self.output_frame_buffer.acquire()
                 if out_slot is None:
+                    self.input_frame_buffer.release(meta.slot_index)
                     logger.warning(
                         f"No free slot in output frame buffer. "
                         f"Frame {meta.frame_id} discarded. Consumer too slow?"
                     )
                     continue
 
-                self.output_frame_buffer.write(out_slot, stacked)
+                frame_dst, mask_dst = self.output_frame_buffer.view(out_slot)
+                np.copyto(frame_dst, frame)
+                self.input_frame_buffer.release(meta.slot_index)    # release as soon as possible
+                mask_dst[0] = roads_mask
+                mask_dst[1] = vehicles_mask
 
                 # ---- build and enqueue output metadata ----
                 out_meta = SegmentationSlotMetadata(

@@ -10,7 +10,7 @@ from pydantic import BaseModel, PositiveFloat
 
 from src.danger_detection.utils import create_dangerous_intersections_masks
 from src.danger_detection.processes.messages import GeoSlotMetadata, DangerSlotMetadata
-from src.shared.processes.frame_buffer import FrameBuffer
+from src.shared.processes.frame_buffer import FrameBuffer, MultiFrameBuffer
 from src.shared.processes.constants import (
     PIPELINE_QUEUE_TIMEOUT,
     POISON_PILL,
@@ -43,21 +43,17 @@ class DangerWorker(mp.Process):
     """
     Danger detection stage of the danger detection pipeline.
 
-    Reads a (H, W, 8) stacked slot from GeoWorker:
-        channels 0-2 : BGR frame (processing resolution)
-        channel  3   : roads_mask
-        channel  4   : vehicles_mask
-        channel  5   : nodata_dem_mask
-        channel  6   : geofencing_mask
-        channel  7   : slope_mask
+    Reads a MultiFrameBuffer slot from GeoWorker:
+        primary   (H, W, 3) : BGR frame (processing resolution)
+        secondary (5, H, W) : [0] roads_mask, [1] vehicles_mask,
+                               [2] nodata_dem_mask, [3] geofencing_mask, [4] slope_mask
 
     Intersects per-animal safety circles with each danger layer to compute the
     danger_mask, intersection_mask, and the list of active danger types.
 
-    Writes a (H, W, 5) stacked slot to AnnotationWorker:
-        channels 0-2 : BGR frame (unchanged)
-        channel  3   : danger_mask
-        channel  4   : intersection_mask
+    Writes to a MultiFrameBuffer slot for AnnotationWorker:
+        primary   (H, W, 3) : BGR frame (unchanged)
+        secondary (2, H, W) : [0] danger_mask, [1] intersection_mask
 
     The alert_msg string (e.g. "Roads & Vehicles") travels in DangerSlotMetadata.
     
@@ -76,9 +72,9 @@ class DangerWorker(mp.Process):
     def __init__(
             self,
             input_meta_queue: mp.Queue,
-            input_frame_buffer: FrameBuffer,
+            input_frame_buffer: MultiFrameBuffer,
             output_meta_queue: mp.Queue,
-            output_frame_buffer: FrameBuffer,
+            output_frame_buffer: MultiFrameBuffer,
             error_event: multiprocessing.synchronize.Event,
             config: DangerWorkerConfig,
     ):
@@ -122,21 +118,16 @@ class DangerWorker(mp.Process):
 
                 get_time = time() - iter_start
 
-                # ---- zero-copy view of input slot ----
-                
+                # ---- zero-copy views of input slot ----
+                # frame: contiguous (H, W, 3); mask_view[n]: contiguous (H, W) each
                 collect_start = time()
 
-                stacked = self.input_frame_buffer.view(meta.slot_index)
-
-                frame = stacked[:, :, :3]
-                # Gather all 5 mask channels in a single contiguous copy to avoid
-                # repeated scatter-gather over strided SHM pages in create_dangerous_intersections_masks.
-                masks = np.ascontiguousarray(stacked[:, :, 3:])
-                roads_mask       = masks[:, :, 0]
-                vehicles_mask    = masks[:, :, 1]
-                nodata_dem_mask  = masks[:, :, 2]
-                geofencing_mask  = masks[:, :, 3]
-                slope_mask       = masks[:, :, 4]
+                frame, mask_view = self.input_frame_buffer.view(meta.slot_index)
+                roads_mask      = mask_view[0]
+                vehicles_mask   = mask_view[1]
+                nodata_dem_mask = mask_view[2]
+                geofencing_mask = mask_view[3]
+                slope_mask      = mask_view[4]
 
                 frame_height, frame_width = frame.shape[:2]
 
@@ -178,13 +169,12 @@ class DangerWorker(mp.Process):
                     )
                     continue
 
-                # Write directly into the output slot — eliminates the 4.61 MB
-                # intermediate array that np.concatenate would allocate.
-                # Input slot must be held until frame data is copied into output slot.
-                dst = self.output_frame_buffer.view(out_slot)
-                np.copyto(dst[:, :, :3], frame)
-                dst[:, :, 3] = danger_mask
-                dst[:, :, 4] = intersection_mask
+                # Write directly into the output slot — no intermediate allocation.
+                # Input slot must be held until both arrays are copied.
+                frame_dst, mask_dst = self.output_frame_buffer.view(out_slot)
+                np.copyto(frame_dst, frame)
+                mask_dst[0] = danger_mask
+                mask_dst[1] = intersection_mask
                 self.input_frame_buffer.release(meta.slot_index)
 
                 out_meta = DangerSlotMetadata(

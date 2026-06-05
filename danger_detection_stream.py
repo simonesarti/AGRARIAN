@@ -22,7 +22,7 @@ from src.shared.processes.video_storage_manager import (
     LocalStorageConfig,
     LocalStoragePersistenceProcess,
 )
-from src.shared.processes.frame_buffer import FrameBuffer
+from src.shared.processes.frame_buffer import FrameBuffer, MultiFrameBuffer
 from src.shared.processes.constants import (
     LOCAL_OUTPUT_DIR,
     VIDEO_STREAM_READER_PROCESSING_SHAPE,
@@ -113,8 +113,6 @@ def main():
     _orig_h, _orig_w = VIDEO_STREAM_READER_ORIGINAL_SHAPE[1],   VIDEO_STREAM_READER_ORIGINAL_SHAPE[0]
 
     _3ch = (_proc_h, _proc_w, 3)
-    _5ch = (_proc_h, _proc_w, 5)
-    _8ch = (_proc_h, _proc_w, 8)
     _ann = (_orig_h, _orig_w, 3)
 
     # ============== FRAME BUFFERS ==============
@@ -124,9 +122,21 @@ def main():
     reader_to_combiner_buf        = FrameBuffer(_3ch, n_slots=MAX_SIZE_FRAME_READER_OUT)
     combiner_to_detection_buf     = FrameBuffer(_3ch, n_slots=MAX_SIZE_DETECTION_IN)
     detection_to_segmentation_buf = FrameBuffer(_3ch, n_slots=MAX_SIZE_SEGMENTATION_IN)
-    segmentation_to_geo_buf       = FrameBuffer(_5ch, n_slots=MAX_SIZE_GEO_IN)
-    geo_to_danger_buf             = FrameBuffer(_8ch, n_slots=MAX_SIZE_DANGER_DETECTION_RESULT)
-    danger_to_annotation_buf      = FrameBuffer(_5ch, n_slots=MAX_SIZE_DANGER_DETECTION_RESULT)
+    segmentation_to_geo_buf       = MultiFrameBuffer(
+        primary_shape=_3ch,
+        secondary_shape=(2, _proc_h, _proc_w),
+        n_slots=MAX_SIZE_GEO_IN,
+    )
+    geo_to_danger_buf             = MultiFrameBuffer(
+        primary_shape=_3ch,
+        secondary_shape=(5, _proc_h, _proc_w),
+        n_slots=MAX_SIZE_DANGER_DETECTION_RESULT,
+    )
+    danger_to_annotation_buf      = MultiFrameBuffer(
+        primary_shape=_3ch,
+        secondary_shape=(2, _proc_h, _proc_w),
+        n_slots=MAX_SIZE_DANGER_DETECTION_RESULT,
+    )
     annotation_to_alert_buf       = FrameBuffer(_ann, n_slots=MAX_SIZE_NOTIFICATIONS_STREAM)
     annotation_to_video_buf       = FrameBuffer(_ann, n_slots=MAX_SIZE_VIDEO_STREAM)
 
