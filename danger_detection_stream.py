@@ -153,6 +153,36 @@ def main():
     annotation_to_video_q       = mp.Queue(maxsize=MAX_SIZE_VIDEO_STREAM)
     video_to_persistence_q      = mp.Queue(maxsize=1)
 
+    # ============== CPU AFFINITY ASSIGNMENTS ==============
+    # i7-12850HX: 8 P-cores (logical 0-15, HT pairs) + 8 E-cores (logical 16-23, no HT).
+    # Heavy processes → dedicated P-core (one logical per physical, avoiding HT sibling).
+    # Fast / IO-bound processes → E-cores.
+    # Set to None to disable pinning for a process.
+
+    _CPU = {
+        "video_reader":   16,   # E-core — IO-bound (RTSP read + resize)
+        "combiner":       17,   # E-core — IO-bound (MQTT + frame forward)
+        "detection":       0,   # P-core 0 — GPU orchestration (YOLO)
+        "segmentation":    2,   # P-core 1 — GPU orchestration (TRT/ONNX)
+        "geo":             4,   # P-core 2 — CPU-bound (rasterio DEM)
+        "danger":          6,   # P-core 3 — CPU-bound (mask operations)
+        "annotation":      8,   # P-core 4 — CPU-bound (cv2 drawing + resize)
+        "alert_writer":   18,   # E-core — IO-bound (WebSocket + DB)
+        "video_producer": 10,   # P-core 5 — CPU-bound (FFmpeg H.264 encoding)
+    }
+
+    _CPU = {
+        "video_reader":   None,   # E-core — IO-bound (RTSP read + resize)
+        "combiner":       None,   # E-core — IO-bound (MQTT + frame forward)
+        "detection":       None,   # P-core 0 — GPU orchestration (YOLO)
+        "segmentation":    None,   # P-core 1 — GPU orchestration (TRT/ONNX)
+        "geo":             None,   # P-core 2 — CPU-bound (rasterio DEM)
+        "danger":          None,   # P-core 3 — CPU-bound (mask operations)
+        "annotation":      None,   # P-core 4 — CPU-bound (cv2 drawing + resize)
+        "alert_writer":   None,   # E-core — IO-bound (WebSocket + DB)
+        "video_producer": None,   # P-core 5 — CPU-bound (FFmpeg H.264 encoding)
+    }
+
     # ============== BUILD PROCESS CONFIGS ==============
 
     video_reader_config = StreamVideoReaderConfig(
@@ -167,6 +197,7 @@ def main():
         processing_shape=VIDEO_STREAM_READER_PROCESSING_SHAPE,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
+        cpu_affinity=_CPU["video_reader"],
     )
 
     combiner_config = FrameTelemetryCombinerConfig(
@@ -188,6 +219,7 @@ def main():
         max_time_diff_s=FRAMETELCOMB_MAX_TIME_DIFF,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
+        cpu_affinity=_CPU["combiner"],
     )
 
     # Resolve detector checkpoint: use TensorRT engine if present, otherwise .pt from yaml.
@@ -205,6 +237,7 @@ def main():
         predict_args=detection_args,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
+        cpu_affinity=_CPU["detection"],
     )
     # Resolve segmentation checkpoint: use TensorRT engine if present, otherwise .onnx from yaml.
     _yaml_seg_checkpoint = segmentation_args.pop("model_checkpoint")
@@ -221,6 +254,7 @@ def main():
         predict_args=segmentation_args,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
+        cpu_affinity=_CPU["segmentation"],
     )
 
     geo_config = GeoWorkerConfig(
@@ -240,16 +274,19 @@ def main():
         },
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
+        cpu_affinity=_CPU["geo"],
     )
 
     danger_worker_config = DangerWorkerConfig(
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
+        cpu_affinity=_CPU["danger"],
     )
 
     annotation_worker_config = AnnotationWorkerConfig(
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
+        cpu_affinity=_CPU["annotation"],
     )
 
     alert_writer_config = NotificationsStreamWriterConfig(
@@ -277,6 +314,7 @@ def main():
         db_thread_close_timeout=DB_MANAGER_THREAD_CLOSE_TIMEOUT,
         db_alerts_queue_size=DB_MANAGER_QUEUE_SIZE,
         video_stream_url=s.video_out_stream_url,
+        cpu_affinity=_CPU["alert_writer"],
     )
 
     video_producer_config = VideoProducerProcessConfig(
@@ -290,6 +328,7 @@ def main():
         stream_manager_startup_timeout=VIDEO_OUT_STREAM_STARTUP_TIMEOUT,
         stream_manager_shutdown_timeout=VIDEO_OUT_STREAM_SHUTDOWN_TIMEOUT,
         storage_manager_handoff_timeout=VIDEO_WRITER_HANDOFF_TIMEOUT,
+        cpu_affinity=_CPU["video_producer"],
     )
 
     _persistence_base = dict(

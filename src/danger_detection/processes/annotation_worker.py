@@ -34,7 +34,7 @@ if not logger.handlers:
     _handler = logging.FileHandler('./logs/danger_annotation.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.WARNING)
 
 # ================================================================
 
@@ -44,6 +44,7 @@ class AnnotationWorkerConfig(BaseModel):
 
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
+    cpu_affinity: int | None = None
 
 
 class AnnotationWorker(mp.Process):
@@ -88,6 +89,8 @@ class AnnotationWorker(mp.Process):
         self.work_finished = mp.Event()
 
     def run(self):
+        from src.shared.processes.cpu_affinity import pin_to_core
+        pin_to_core(self.config.cpu_affinity)
         logger.info("Danger annotation process started.")
         poison_pill_received = False
 

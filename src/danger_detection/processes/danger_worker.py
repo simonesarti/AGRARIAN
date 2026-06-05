@@ -26,7 +26,7 @@ if not logger.handlers:
     _handler = logging.FileHandler('./logs/danger_detection.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.WARNING)
 
 # ================================================================
 
@@ -36,6 +36,7 @@ class DangerWorkerConfig(BaseModel):
 
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
+    cpu_affinity: int | None = None
 
 
 class DangerWorker(mp.Process):
@@ -93,6 +94,8 @@ class DangerWorker(mp.Process):
         self.work_finished = mp.Event()
 
     def run(self):
+        from src.shared.processes.cpu_affinity import pin_to_core
+        pin_to_core(self.config.cpu_affinity)
         logger.info("Danger detection process started.")
         poison_pill_received = False
 
@@ -120,7 +123,8 @@ class DangerWorker(mp.Process):
                 get_time = time() - iter_start
 
                 # ---- zero-copy view of input slot ----
-                detect_start = time()
+                
+                collect_start = time()
 
                 stacked = self.input_frame_buffer.view(meta.slot_index)
 
@@ -136,6 +140,8 @@ class DangerWorker(mp.Process):
 
                 frame_height, frame_width = frame.shape[:2]
 
+                detect_start = time()
+
                 danger_mask, intersection_mask, danger_types = create_dangerous_intersections_masks(
                     frame_height=frame_height,
                     frame_width=frame_width,
@@ -150,6 +156,7 @@ class DangerWorker(mp.Process):
 
                 alert_msg = " & ".join(danger_types) if danger_types else ""
 
+                collect_time = detect_start - collect_start
                 detect_time = time() - detect_start
 
                 # ---- write (H, W, 5) output slot ----
@@ -165,19 +172,20 @@ class DangerWorker(mp.Process):
                     logger.debug(
                         f"frame {meta.frame_id} processed in {(time() - iter_start) * 1000:.2f} ms, "
                         f"of which --> GET: {get_time * 1000:.2f} ms, "
+                        f"COLLECT: {collect_time * 1000:.2f} ms, "
                         f"DETECT: {detect_time * 1000:.2f} ms, "
                         f"PROPAGATE: skipped (no slot)."
                     )
                     continue
 
-                out = np.concatenate([
-                    frame,
-                    danger_mask[:, :, np.newaxis],
-                    intersection_mask[:, :, np.newaxis]],
-                    axis=2,
-                )
+                # Write directly into the output slot — eliminates the 4.61 MB
+                # intermediate array that np.concatenate would allocate.
+                # Input slot must be held until frame data is copied into output slot.
+                dst = self.output_frame_buffer.view(out_slot)
+                np.copyto(dst[:, :, :3], frame)
+                dst[:, :, 3] = danger_mask
+                dst[:, :, 4] = intersection_mask
                 self.input_frame_buffer.release(meta.slot_index)
-                self.output_frame_buffer.write(out_slot, out)
 
                 out_meta = DangerSlotMetadata(
                     frame_id=meta.frame_id,
@@ -211,6 +219,7 @@ class DangerWorker(mp.Process):
                     f"frame {meta.frame_id} processed in {(iter_end - iter_start) * 1000:.2f} ms, "
                     f"of which --> "
                     f"GET: {get_time * 1000:.2f} ms, "
+                    f"COLLECT: {collect_time * 1000:.2f} ms, "
                     f"DETECT: {detect_time * 1000:.2f} ms, "
                     f"PROPAGATE: {(iter_end - append_start) * 1000:.2f} ms."
                 )

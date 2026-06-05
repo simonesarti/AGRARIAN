@@ -43,7 +43,7 @@ if not logger.handlers:  # Avoid duplicate handlers
     _handler = logging.FileHandler('./logs/alert_out.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.WARNING)
 
 
 # ================================================================
@@ -94,6 +94,7 @@ class NotificationsStreamWriterConfig(BaseModel):
     # Video stream URL written to the flights table so the UI can fetch it from the DB.
     # Should match the media_server_url passed to VideoProducerProcess.
     video_stream_url: Optional[str] = None
+    cpu_affinity: int | None = None
 
 
 
@@ -355,6 +356,8 @@ class NotificationsStreamWriter(mp.Process):
 
     def run(self):
         """Main process loop."""
+        from src.shared.processes.cpu_affinity import pin_to_core
+        pin_to_core(self.config.cpu_affinity)
 
         alert_count = 0
         consecutive_failures = 0

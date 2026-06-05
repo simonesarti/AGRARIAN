@@ -43,7 +43,7 @@ if not logger.handlers:  # Avoid duplicate handlers
     _handler = logging.FileHandler('./logs/frame_telemetry_combiner.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.WARNING)
 
 # ================================================================
 
@@ -72,6 +72,7 @@ class FrameTelemetryCombinerConfig(BaseModel):
 
     # Shutdown
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
+    cpu_affinity: int | None = None
 
 
 
@@ -321,7 +322,7 @@ class FrameTelemetryCombiner(mp.Process):
             Best-matching telemetry dict, or None if no entry within max_time_diff_s.
         """
         if not self._telemetry_deque:
-            logger.warning(f"No telemetry available for matching at timestamp {frame_timestamp:.3f}")
+            logger.info(f"No telemetry available for matching at timestamp {frame_timestamp:.3f}")
             return None
 
         best_match = None
@@ -385,6 +386,8 @@ class FrameTelemetryCombiner(mp.Process):
 
     def run(self) -> None:
         """Main process entry point."""
+        from src.shared.processes.cpu_affinity import pin_to_core
+        pin_to_core(self.config.cpu_affinity)
         logger.info("FrameTelemetryCombiner process started")
 
         # Initialize threading primitives inside run() — they belong to this child process
