@@ -10,7 +10,6 @@ from rasterio import RasterioIOError
 import cv2
 import numpy as np
 from geopy.distance import geodesic
-from scipy.ndimage import convolve
 
 from typing import Optional, Union, Tuple
 
@@ -234,32 +233,38 @@ def compute_slope_mask_horn(elev_array, pixel_size, slope_threshold_deg):
     """
     # Ensure the input has the expected shape and remove the singleton dimension.
     assert elev_array.ndim == 3 and elev_array.shape[0] == 1, "Input must be of shape (1, H, W)"
+
+    # arctan(sqrt(dx²+dy²)) is always in [0°, 90°), so no pixel can ever exceed
+    # a threshold of 90° or more. Guard here because tan(θ) is negative for
+    # θ ∈ (90°, 270°): squaring would produce a spuriously plausible positive
+    # tan_threshold_sq and flip large portions of the mask incorrectly.
+    if slope_threshold_deg >= 90.0:
+        return np.zeros_like(elev_array, dtype=np.uint8)
+
     elev_array = elev_array[0]
 
     # Define Horn's kernels for x and y gradients
     kernel_x = np.array([[-1, 0, 1],
                          [-2, 0, 2],
-                         [-1, 0, 1]]) / (8 * pixel_size)
+                         [-1, 0, 1]], dtype=elev_array.dtype) / (8 * pixel_size)
 
     kernel_y = np.array([[-1, -2, -1],
                          [0, 0, 0],
-                         [1, 2, 1]]) / (8 * pixel_size)
+                         [1, 2, 1]], dtype=elev_array.dtype) / (8 * pixel_size)
 
-    # Compute gradients using convolution with edge handling directly in convolve
-    dx = convolve(elev_array, kernel_x, mode='nearest')
-    dy = convolve(elev_array, kernel_y, mode='nearest')
+    # cv2.filter2D (cross-correlation, BORDER_REPLICATE) is ~2× faster than
+    # scipy.ndimage.convolve on float32.  The sign of dx/dy is negated vs scipy
+    # (correlation vs convolution), but dx²+dy² is unchanged so the mask is identical.
+    dx = cv2.filter2D(elev_array, -1, kernel_x, borderType=cv2.BORDER_REPLICATE)
+    dy = cv2.filter2D(elev_array, -1, kernel_y, borderType=cv2.BORDER_REPLICATE)
 
-    # Calculate slope in radians using Horn's formula
-    slope_radians = np.arctan(np.sqrt(dx ** 2 + dy ** 2))
+    # slope > threshold_deg  ↔  dx²+dy² > tan(threshold_rad)²
+    # Both arctan and sqrt are strictly monotone and dx²+dy² ≥ 0, so the
+    # threshold can be pre-squared once, eliminating three per-pixel
+    # transcendental passes (sqrt, arctan, degrees).
+    tan_threshold_sq = np.tan(np.radians(slope_threshold_deg)) ** 2
+    mask = (dx ** 2 + dy ** 2 > tan_threshold_sq).astype(np.uint8)
 
-    # Convert to degrees
-    slope_degrees = np.degrees(slope_radians)
-
-    # Create mask where slope exceeds threshold
-    # Extract the portion corresponding to the original array
-    mask = (slope_degrees > slope_threshold_deg).astype(np.uint8)
-
-    # Return the mask with the original 3D shape (1, H, W).
     return mask[np.newaxis, :, :]
 
 

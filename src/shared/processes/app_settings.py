@@ -86,7 +86,7 @@ class AppSettings(BaseSettings):
     # ------------------------------------------------------------------ #
 
     safety_radius_m:       PositiveFloat = SAFETY_RADIUS_M
-    slope_angle_threshold: float         = Field(default=SLOPE_ANGLE_THRESHOLD, ge=0, le=90)
+    slope_angle_threshold: float         = Field(default=SLOPE_ANGLE_THRESHOLD, ge=0, lt=90)
     # Parsed from "(lon1, lat1), (lon2, lat2), ..." — leave empty/unset to disable geofencing
     geofencing_vertexes: Optional[list[tuple[float, float]]] = None
 

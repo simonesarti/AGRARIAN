@@ -134,6 +134,13 @@ class GeoWorker(mp.Process):
             dem_mask_path=self.config.input_args["dem_mask"],
         )
 
+        # Build geofencing polygon once — it is constant for the lifetime of the process.
+        geofencing_polygon = (
+            Polygon(self.config.input_args["geofencing_vertexes"])
+            if self.config.input_args["geofencing_vertexes"] is not None
+            else None
+        )
+
         # Placeholders, populated from the first frame received.
         frame_width = None
         frame_height = None
@@ -324,14 +331,14 @@ class GeoWorker(mp.Process):
 
                     # ============== CREATE GEOFENCING MASK ========================
 
-                    if self.config.input_args["geofencing_vertexes"] is not None:
+                    if geofencing_polygon is not None:
                         # compute geofencing directly on the full size frame
                         # independently of other two masks for flexibility (slower), as it should not require the dem data
                         geofencing_mask = create_geofencing_mask_runtime(
                             frame_width=frame_width,
                             frame_height=frame_height,
                             transform=frame_transform,
-                            polygon=Polygon(self.config.input_args["geofencing_vertexes"]),
+                            polygon=geofencing_polygon,
                         )
                     else:
                         geofencing_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
