@@ -42,7 +42,6 @@ class VideoProducerProcessConfig(BaseModel):
 
     fps: PositiveInt = FPS
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
-    cpu_affinity: int | None = None
 
     # ------- Local file save --------
     video_file_path: str
@@ -168,8 +167,7 @@ class VideoProducerProcess(mp.Process):
             self.error_event.set()
 
     def run(self):
-        from src.shared.processes.cpu_affinity import pin_to_core
-        pin_to_core(self.config.cpu_affinity)
+
         logger.info("VideoProducerProcess started.")
 
         poison_pill_received = False

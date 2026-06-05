@@ -69,7 +69,6 @@ class GeoWorkerConfig(BaseModel):
 
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
-    cpu_affinity: int | None = None
 
 
 class GeoWorker(mp.Process):
@@ -124,8 +123,7 @@ class GeoWorker(mp.Process):
         """
         Main loop of the process: opens DEM files once, then processes frames.
         """
-        from src.shared.processes.cpu_affinity import pin_to_core
-        pin_to_core(self.config.cpu_affinity)
+
         logger.info("Geo-handling process started.")
         poison_pill_received = False
 

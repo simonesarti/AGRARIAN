@@ -72,7 +72,6 @@ class FrameTelemetryCombinerConfig(BaseModel):
 
     # Shutdown
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
-    cpu_affinity: int | None = None
 
 
 
@@ -386,8 +385,7 @@ class FrameTelemetryCombiner(mp.Process):
 
     def run(self) -> None:
         """Main process entry point."""
-        from src.shared.processes.cpu_affinity import pin_to_core
-        pin_to_core(self.config.cpu_affinity)
+
         logger.info("FrameTelemetryCombiner process started")
 
         # Initialize threading primitives inside run() — they belong to this child process

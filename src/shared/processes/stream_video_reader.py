@@ -61,7 +61,6 @@ class StreamVideoReaderConfig(BaseModel):
     # Output
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
-    cpu_affinity: int | None = None
 
     @field_validator('processing_shape')
     @classmethod
@@ -128,8 +127,7 @@ class StreamVideoReader(mp.Process):
 
     def run(self):
         """Main process loop."""
-        from src.shared.processes.cpu_affinity import pin_to_core
-        pin_to_core(self.config.cpu_affinity)
+
 
         # connection failure counters
         total_connection_failures = 0

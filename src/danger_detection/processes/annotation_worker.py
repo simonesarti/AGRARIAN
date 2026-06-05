@@ -6,6 +6,7 @@ from queue import Full as QueueFullException
 from time import time
 
 import cv2
+import numpy as np
 from pydantic import BaseModel, PositiveFloat
 
 from src.danger_detection.output.frames import (
@@ -43,7 +44,6 @@ class AnnotationWorkerConfig(BaseModel):
 
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
-    cpu_affinity: int | None = None
 
 
 class AnnotationWorker(mp.Process):
@@ -87,8 +87,7 @@ class AnnotationWorker(mp.Process):
         self.work_finished = mp.Event()
 
     def run(self):
-        from src.shared.processes.cpu_affinity import pin_to_core
-        pin_to_core(self.config.cpu_affinity)
+
         logger.info("Danger annotation process started.")
         poison_pill_received = False
 
@@ -96,6 +95,7 @@ class AnnotationWorker(mp.Process):
         color_intersect_frame = None
         danger_buf = None
         overlay_buf = None
+        _resize_buf = None
 
         try:
 
@@ -129,6 +129,8 @@ class AnnotationWorker(mp.Process):
 
                 if color_danger_frame is None:
                     color_danger_frame, color_intersect_frame, danger_buf, overlay_buf = get_danger_intersect_colored_frames(shape=frame.shape)
+                    orig_w, orig_h = meta.original_wh
+                    _resize_buf = np.empty((orig_h, orig_w, 3), dtype=np.uint8)
                     logger.info(f"Annotation process setup with frame size W×H = {frame_width}×{frame_height}")
 
                 t_get = time()
@@ -150,9 +152,10 @@ class AnnotationWorker(mp.Process):
                 t_count = time()
 
                 # ---- upscale to original resolution ----
-                annotated_frame = cv2.resize(
+                cv2.resize(
                     src=frame,
                     dsize=meta.original_wh,
+                    dst=_resize_buf,
                     interpolation=cv2.INTER_LINEAR,
                 )
                 t_resize = time()
@@ -168,7 +171,7 @@ class AnnotationWorker(mp.Process):
                         f"Frame {meta.frame_id} dropped for alert writer. Consumer too slow?"
                     )
                 else:
-                    self.alert_output_frame_buffer.write(alert_slot, annotated_frame)
+                    self.alert_output_frame_buffer.write(alert_slot, _resize_buf)
                     alert_meta = AnnotationSlotMetadata(
                         frame_id=meta.frame_id,
                         timestamp=meta.timestamp,
@@ -196,7 +199,7 @@ class AnnotationWorker(mp.Process):
                         f"Frame {meta.frame_id} dropped for video writer. Consumer too slow?"
                     )
                 else:
-                    self.video_output_frame_buffer.write(video_slot, annotated_frame)
+                    self.video_output_frame_buffer.write(video_slot, _resize_buf)
                     video_meta = AnnotationSlotMetadata(
                         frame_id=meta.frame_id,
                         timestamp=meta.timestamp,

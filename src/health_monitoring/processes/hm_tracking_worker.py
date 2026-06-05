@@ -81,6 +81,7 @@ class HMTrackingWorker(mp.Process):
         self.work_finished = mp.Event()
 
     def run(self):
+
         logger.info("HM tracking process started.")
         poison_pill_received = False
 

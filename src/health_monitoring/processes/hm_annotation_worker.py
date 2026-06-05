@@ -159,8 +159,11 @@ class HMAnnotationWorker(mp.Process):
         self.work_finished = mp.Event()
 
     def run(self):
+
         logger.info("HM annotation process started.")
         poison_pill_received = False
+
+        _resize_buf = None
 
         try:
 
@@ -194,9 +197,14 @@ class HMAnnotationWorker(mp.Process):
                 _annotate(frame, meta.tracks, r)
 
                 # ---- upscale to original video resolution ----
-                annotated_frame = cv2.resize(
+                if _resize_buf is None:
+                    orig_w, orig_h = meta.original_wh
+                    _resize_buf = np.empty((orig_h, orig_w, 3), dtype=np.uint8)
+
+                cv2.resize(
                     src=frame,
-                    dsize=meta.original_wh,     # (W, H)
+                    dsize=meta.original_wh,
+                    dst=_resize_buf,
                     interpolation=cv2.INTER_LINEAR,
                 )
                 self.input_frame_buffer.release(meta.slot_index)
@@ -219,7 +227,7 @@ class HMAnnotationWorker(mp.Process):
                         f"Frame {meta.frame_id} dropped for alert writer. Consumer too slow?"
                     )
                 else:
-                    self.alert_output_frame_buffer.write(alert_slot, annotated_frame)
+                    self.alert_output_frame_buffer.write(alert_slot, _resize_buf)
                     alert_meta = AnnotationSlotMetadata(
                         frame_id=meta.frame_id,
                         timestamp=meta.timestamp,
@@ -244,7 +252,7 @@ class HMAnnotationWorker(mp.Process):
                         f"Frame {meta.frame_id} dropped for video writer. Consumer too slow?"
                     )
                 else:
-                    self.video_output_frame_buffer.write(video_slot, annotated_frame)
+                    self.video_output_frame_buffer.write(video_slot, _resize_buf)
                     video_meta = AnnotationSlotMetadata(
                         frame_id=meta.frame_id,
                         timestamp=meta.timestamp,
