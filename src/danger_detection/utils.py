@@ -85,12 +85,13 @@ def extract_dem_window(dem_tif, dem_mask_tif, center_lonlat, rectangle_lonlat):
         rectangle_lonlat (numpy.ndarray): (4,2) array of (longitude, latitude) rectangle corners.
 
     """
-    # --- Step 1: Convert center point to pixel coordinates ---
+    # --- Step 1 & 2: Convert center and rectangle corners to pixel coordinates in one call ---
     transform = dem_tif.transform
-    center_y, center_x = rowcol(transform=transform, xs=center_lonlat[0], ys=center_lonlat[1])
-
-    # --- Step 2: Convert rectangle corners to pixel coordinates ---
-    pixel_coords_yx = np.array([rowcol(transform=transform, xs=lon, ys=lat) for lon, lat in rectangle_lonlat])
+    all_xs = np.array([center_lonlat[0], *rectangle_lonlat[:, 0]])
+    all_ys = np.array([center_lonlat[1], *rectangle_lonlat[:, 1]])
+    rows, cols = rowcol(transform=transform, xs=all_xs, ys=all_ys)
+    center_y, center_x = rows[0], cols[0]
+    pixel_coords_yx = np.column_stack([rows[1:], cols[1:]])
 
     # Compute the maximum pixel distance from the center
     pixel_dists = np.linalg.norm(pixel_coords_yx - np.array([center_y, center_x]), axis=1)
