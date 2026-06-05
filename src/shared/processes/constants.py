@@ -32,6 +32,15 @@ SAFETY_RADIUS_M = 2.0                                                      # met
 # float: slope angle after which the portion of terrain is considered dangerous for the animals
 SLOPE_ANGLE_THRESHOLD = 30.0
 
+# float: buffer scale factor for the DEM window cache in GeoWorker.
+# On a cache miss an oversized window is extracted; larger values reduce miss
+# frequency at the cost of more memory and a slower initial extraction.
+# 0.5 means doubling the size of the frame (adds 0.5 to the left and to the right), 
+# which guarantees that a squared frame, even if rotated by 45 degrees will fit in the DEM window
+# larger buffer increases the cache hit probability for longer, but also increases 
+# the initial extraction time and memory usage.
+GEO_DEM_CACHE_BUFFER_SCALE = 4.0
+
 # -------------------------- HEALTH MONITORING PARAMETERS --------------------------
 
 # Anomaly detection defaults

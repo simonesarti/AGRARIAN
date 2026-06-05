@@ -24,6 +24,7 @@ from src.danger_detection.utils import (
 from src.danger_detection.processes.messages import SegmentationSlotMetadata, GeoSlotMetadata
 from src.shared.processes.frame_buffer import FrameBuffer, MultiFrameBuffer
 from src.shared.processes.constants import (
+    GEO_DEM_CACHE_BUFFER_SCALE,
     PIPELINE_QUEUE_TIMEOUT,
     POISON_PILL,
     POISON_PILL_TIMEOUT,
@@ -41,6 +42,20 @@ if not logger.handlers:  # Avoid duplicate handlers
     logger.setLevel(logging.WARNING)
 
 # ================================================================
+
+def _footprint_within_bounds(corners_lonlat: np.ndarray, bounds) -> bool:
+    """Return True if all four frame corners lie inside the window bounds."""
+    if bounds is None:
+        return False
+    min_lon, min_lat, max_lon, max_lat = bounds
+    return (
+        corners_lonlat[:, 0].min() >= min_lon and
+        corners_lonlat[:, 0].max() <= max_lon and
+        corners_lonlat[:, 1].min() >= min_lat and
+        corners_lonlat[:, 1].max() <= max_lat
+    )
+
+
 
 
 class GeoWorkerConfig(BaseModel):
@@ -69,6 +84,7 @@ class GeoWorkerConfig(BaseModel):
 
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
+    dem_cache_buffer_scale: PositiveFloat = GEO_DEM_CACHE_BUFFER_SCALE
 
 
 class GeoWorker(mp.Process):
@@ -146,6 +162,19 @@ class GeoWorker(mp.Process):
         frame_height = None
         frame_corners = None
 
+        # DEM window cache — populated on first extraction, reused while the
+        # drone field of view stays within the cached geographic bounds.
+        dem_cache_bounds = None            # (min_lon, min_lat, max_lon, max_lat)
+        dem_cache_masks_window = None      # (2, W, W): [nodata_mask, slope_mask]
+        dem_cache_window_transform = None  # Affine transform for the cached window
+
+        # Exact-match cache — if telemetry repeats (drone stationary),
+        # skip every geo computation and reuse masks directly.
+        prev_tel_key = None        # (lat, lon, alt, yaw) tuple
+        prev_nodata_mask = None    # (H, W) uint8
+        prev_slope_mask = None     # (H, W) uint8
+        prev_geofencing_mask = None  # (H, W) uint8
+
         try:
 
             while not self.error_event.is_set():
@@ -175,11 +204,12 @@ class GeoWorker(mp.Process):
                 # ---- one-time frame-dimension setup from the first slot read ----
                 if frame_width is None:
                     frame_height, frame_width = frame_view.shape[:2]
+                    # frame corners are stored in (x,y) format
                     frame_corners = np.array([
                         [0, 0],                                 # upper left
                         [frame_width - 1, 0],                   # upper right
                         [frame_width - 1, frame_height - 1],    # bottom right
-                        [0, frame_height - 1],                  # bootm left
+                        [0, frame_height - 1],                  # bottom left
                     ])
                     logger.info(f"Geo worker setup with frame size W×H = {frame_width}×{frame_height}")
 
@@ -277,71 +307,98 @@ class GeoWorker(mp.Process):
                         drone_bl=tuple(corners_coordinates[3]),  # (lon, lat) for bottom-left corner
                     )
 
-                    # ============== COMPUTE DEM (+MASK) WINDOW ENCOMPASSING THE FRAME  ===================================
+                    # ============== EXACT-MATCH CACHE  ===================================
+                    # If telemetry is identical to the previous frame, all geo masks are
+                    # guaranteed to be identical — skip every geo computation.
+                    tel_key = (
+                        telemetry["latitude"],
+                        telemetry["longitude"],
+                        telemetry["rel_alt"],
+                        telemetry["gb_yaw"],
+                    )
 
-                    if dem_tif is not None:
-                        center_coords = (telemetry["longitude"], telemetry["latitude"])
-
-                        dem_window, dem_mask_window, dem_window_transform, dem_window_bounds, dem_window_size = extract_dem_window(
-                            dem_tif=dem_tif,
-                            dem_mask_tif=dem_mask_tif,
-                            center_lonlat=center_coords,
-                            rectangle_lonlat=corners_coordinates,
-                        )
-                        # dem_window and dem_mask_window are (1,dem_window_size,dem_window_size) arrays
-                        assert dem_window.shape == (1, dem_window_size, dem_window_size)
-                        assert dem_mask_window.shape == (1, dem_window_size, dem_window_size)
-
-                        # find the distance in meters between two points on opposite side of the window at the drone latitude
-                        dem_window_size_m = get_window_size_m(telemetry["latitude"], dem_window_bounds)
-                        # compute the resolution of each dem pixel in meters
-                        dem_pixel_size_m = dem_window_size_m / dem_window_size
-
-                        # ============== COMPUTE SLOPE MASK FROM DEM WINDOW ===================================
-
-                        # compute the slope mask using the dem window and info about the resolution of each pixel
-                        slope_mask_window = compute_slope_mask_horn(
-                            elev_array=dem_window,
-                            pixel_size=dem_pixel_size_m,
-                            slope_threshold_deg=self.config.input_args["slope_angle_threshold"],
-                        )
-
-                        # ============== ROTATE & UPSCALE MASKS USING FRAME TRANSFORM ========================
-                        # stack the dem_nodata and dem_slope masks to form a (2, dem_window_size, dem_window_size) mask array
-                        masks_window = np.concatenate((dem_mask_window, slope_mask_window), axis=0)
-                        assert masks_window.shape == (2, dem_window_size, dem_window_size)
-
-                        # rotate and resample using the frame coordinates to obtain a (frame_height, frame_width) version of the
-                        # previously created mask, that matches the frame data
-                        combined = map_window_onto_drone_frame(
-                            window=masks_window,
-                            window_transform=dem_window_transform,
-                            dst_transform=frame_transform,
-                            output_shape=(masks_window.shape[2], frame_height, frame_width),
-                            crs=dem_tif.crs,
-                        )
-
-                        # separate the two masks
-                        nodata_dem_mask = combined[0]
-                        slope_mask = combined[1]
+                    if tel_key == prev_tel_key:
+                        nodata_dem_mask = prev_nodata_mask
+                        slope_mask      = prev_slope_mask
+                        geofencing_mask = prev_geofencing_mask
+                        logger.debug(f"Frame {meta.frame_id}: exact telemetry match — reusing previous geo masks.")
 
                     else:
-                        nodata_dem_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
-                        slope_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+                        # ============== DEM MASKS (with window cache)  ===========================
+                        if dem_tif is not None:
+                            center_coords = (telemetry["longitude"], telemetry["latitude"])
 
-                    # ============== CREATE GEOFENCING MASK ========================
+                            if _footprint_within_bounds(corners_coordinates, dem_cache_bounds):
+                                # Cache hit: frame footprint is still inside the previously
+                                # extracted oversized DEM window — skip I/O and slope computation.
+                                logger.debug(f"Frame {meta.frame_id}: DEM window cache hit.")
+                            else:
+                                # Cache miss: extract an oversized window, compute slope once,
+                                # store both masks at window resolution for subsequent frames.
+                                logger.debug(f"Frame {meta.frame_id}: DEM window cache miss — re-extracting.")
+                                dem_window, dem_mask_window, dem_window_transform, dem_window_bounds, dem_window_size = extract_dem_window(
+                                    dem_tif=dem_tif,
+                                    dem_mask_tif=dem_mask_tif,
+                                    center_lonlat=center_coords,
+                                    rectangle_lonlat=corners_coordinates,
+                                    buffer_scale=self.config.dem_cache_buffer_scale,
+                                ) # masks shape are (1,window_size, window_size)
 
-                    if geofencing_polygon is not None:
-                        # compute geofencing directly on the full size frame
-                        # independently of other two masks for flexibility (slower), as it should not require the dem data
-                        geofencing_mask = create_geofencing_mask_runtime(
-                            frame_width=frame_width,
-                            frame_height=frame_height,
-                            transform=frame_transform,
-                            polygon=geofencing_polygon,
-                        )
-                    else:
-                        geofencing_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+                                # find the distance in meters between two points on opposite sides of
+                                # the window at the drone latitude, then derive the DEM pixel size
+                                dem_window_size_m = get_window_size_m(telemetry["latitude"], dem_window_bounds)
+                                dem_pixel_size_m  = dem_window_size_m / dem_window_size
+
+                                # ============== COMPUTE SLOPE MASK FROM DEM WINDOW ===================================
+                                # compute the slope mask using the dem window and the resolution of each pixel
+                                slope_mask_window = compute_slope_mask_horn(
+                                    elev_array=dem_window,
+                                    pixel_size=dem_pixel_size_m,
+                                    slope_threshold_deg=self.config.input_args["slope_angle_threshold"],
+                                )
+
+                                # stack the dem_nodata and dem_slope masks into a (2, W, W) array and cache
+                                dem_cache_masks_window     = np.concatenate((dem_mask_window, slope_mask_window), axis=0)
+                                dem_cache_window_transform = dem_window_transform
+                                dem_cache_bounds           = dem_window_bounds
+
+                            # ============== ROTATE & UPSCALE MASKS USING FRAME TRANSFORM ========================
+                            # rotate and resample the cached window masks using the frame corner coordinates
+                            # to obtain a (frame_height, frame_width) version that aligns with the drone frame
+                            combined = map_window_onto_drone_frame(
+                                window=dem_cache_masks_window,
+                                window_transform=dem_cache_window_transform,
+                                dst_transform=frame_transform,
+                                output_shape=(2, frame_height, frame_width),
+                                crs=dem_tif.crs,
+                            )
+                            # separate the two masks
+                            nodata_dem_mask = combined[0]
+                            slope_mask      = combined[1]
+
+                        else:
+                            nodata_dem_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+                            slope_mask      = np.zeros((frame_height, frame_width), dtype=np.uint8)
+
+                        # ============== CREATE GEOFENCING MASK ========================
+                        # compute geofencing directly on the full size frame, independently
+                        # of the DEM masks. Does not require DEM data, but does require
+                        # known drone lat/lon to build the frame transform.
+                        if geofencing_polygon is not None:
+                            geofencing_mask = create_geofencing_mask_runtime(
+                                frame_width=frame_width,
+                                frame_height=frame_height,
+                                transform=frame_transform,
+                                polygon=geofencing_polygon,
+                            )
+                        else:
+                            geofencing_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+
+                        # Update exact-match cache.
+                        prev_tel_key         = tel_key
+                        prev_nodata_mask     = nodata_dem_mask
+                        prev_slope_mask      = slope_mask
+                        prev_geofencing_mask = geofencing_mask
 
                 # ---- write frame and all masks directly into the output slot ----
                 out_slot = self.output_frame_buffer.acquire()

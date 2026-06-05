@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from rasterio.warp import reproject, Resampling
 from rasterio.transform import rowcol
@@ -13,6 +14,7 @@ from geopy.distance import geodesic
 
 from typing import Optional, Union, Tuple
 
+_logger = logging.getLogger(__name__)
 
 __all__ = [
     "open_dem_tifs",
@@ -74,7 +76,7 @@ def close_tifs(tif_files):
             tif.close()
 
 
-def extract_dem_window(dem_tif, dem_mask_tif, center_lonlat, rectangle_lonlat):
+def extract_dem_window(dem_tif, dem_mask_tif, center_lonlat, rectangle_lonlat, buffer_scale: float = 0.5):
     """
     Extracts a square window from a raster that fully encompasses a rotated rectangle.
 
@@ -91,16 +93,22 @@ def extract_dem_window(dem_tif, dem_mask_tif, center_lonlat, rectangle_lonlat):
     all_ys = np.array([center_lonlat[1], *rectangle_lonlat[:, 1]])
     rows, cols = rowcol(transform=transform, xs=all_xs, ys=all_ys)
     center_y, center_x = rows[0], cols[0]
-    pixel_coords_yx = np.column_stack([rows[1:], cols[1:]])
+    rows_corners, cols_corners = rows[1:], cols[1:]
 
-    # Compute the maximum pixel distance from the center
-    pixel_dists = np.linalg.norm(pixel_coords_yx - np.array([center_y, center_x]), axis=1)
-    max_dist = int(np.max(pixel_dists))  # Maximum pixel distance
-
-    # --- Step 3: Compute square window size (odd number with buffer) ---
-    buffer = int(np.ceil(max_dist * 0.5))  # Extra space for rotation
-    half_size = max_dist + buffer
-    window_size = 2 * half_size + 1  # Ensure window is odd
+    # --- Step 3: Compute square window size (odd, centered on drone position) ---
+    # Use the longest side of the corners' bounding box rather than the circumradius
+    # to avoid a sqrt.  buffer_scale is clamped to >= 0.5 so the window is always
+    # at least double the longest side, guaranteeing the rotated frame fits inside.
+    longest_side = max(
+        int(rows_corners.max() - rows_corners.min()),
+        int(cols_corners.max() - cols_corners.min()),
+        1,  # guard: entire frame fits in one DEM pixel (very low altitude / coarse DEM)
+    )
+    # ensure buffer large enough to allow frame to fit in DEM window fits the DEM even after 45 deg rotation
+    effective_scale = max(buffer_scale, 0.5)    
+    half_size = int(np.ceil(longest_side * (0.5 + effective_scale)))
+    # ensure window size is odd to have a center pixel
+    window_size = 2 * half_size + 1 
 
     # --- Step 4: Define the window in pixel coordinates ---
     window_row_start = center_y - half_size
@@ -113,35 +121,72 @@ def extract_dem_window(dem_tif, dem_mask_tif, center_lonlat, rectangle_lonlat):
     # => window_row_start = 6 ... |6|7|8| X |10|11|12
     # => window_col_start = 3 ... |3|4|5| X |7 |8 |9
 
-    # --- Step 5: Make sure the window is inside the tif ---
-    if (
-            window_col_start < 0 or
-            window_row_start < 0 or
-            window_col_end >= dem_tif.width or
-            window_row_end >= dem_tif.height
-    ):
-        print(f"ERROR: Cannot monitor the safety of animals when the drones is leaving the DEM area")
-        print(f"DEM rows: {dem_tif.height}")
-        print(f"DEM window rows: [{window_row_start}, {window_row_start + window_size}]")
-        print(f"DEM columns: {dem_tif.width}")
-        print(f"DEM window columns: [{window_col_start}, {window_col_start + window_size}]")
-        exit()
-
-    # --- Step 6: Extract the window from the raster ---
-    window = rasterio.windows.Window(col_off=window_col_start, row_off=window_row_start, width=window_size, height=window_size)
+    # --- Step 5 & 6: Compute geographic reference, check bounds, extract data ---
+    
+    # rasterio behaviour (confirmed empirically):
+    #   - window_transform() and bounds() are pure affine arithmetic on the Window's
+    #     col_off/row_off/width/height. They never clamp to the raster extent, so they
+    #     always return the correct geographic reference for the full requested area,
+    #     even when part of it lies outside the raster.
+    #   - read() on a partially-OOB window silently clips to the intersection with the
+    #     raster and returns a SMALLER array than the requested window size. This does
+    #     not affect bounds() — the two operations are independent.
+    window = rasterio.windows.Window(
+        col_off=window_col_start,
+        row_off=window_row_start,
+        width=window_size,
+        height=window_size,
+    )
     window_transform = dem_tif.window_transform(window)
+    window_bounds    = bounds(window, dem_tif.transform)
 
-    # Read the dem window from the raster
-    dem_window_array = dem_tif.read(window=window)
+    within_bounds = (
+        window_col_start >= 0 and
+        window_row_start >= 0 and
+        window_col_end < dem_tif.width and
+        window_row_end < dem_tif.height
+    )
 
-    # Read the dem window from the raster (if None, assume mask alla values are valid)
-    if dem_mask_tif is not None:
-        dem_mask_window_array = dem_mask_tif.read(window=window)
+    if within_bounds:
+        dem_window_array = dem_tif.read(window=window)
+        if dem_mask_tif is not None:
+            dem_mask_window_array = dem_mask_tif.read(window=window)
+        else:
+            # if no DEM validity mask provided, assume all DEM data is safe (mask=0)
+            dem_mask_window_array = np.zeros((1, window_size, window_size), dtype=np.uint8)
+
     else:
-        dem_mask_window_array = np.zeros((1, window_size, window_size), dtype=np.uint8)
+        # The drone is near or outside the DEM boundary.
+        # rasterio.read() silently clips to the intersection with the raster, so we
+        # pass the same unclamped window and use the returned shape to embed the valid
+        # strip at the correct position in the full-sized output arrays.
+        #   - DEM elevation: zero-filled outside valid area
+        #   - nodata mask:   1 (= nodata) outside valid area, so downstream danger
+        #                    detection treats those pixels as hazardous
+        _logger.warning(
+            "Requested DEM window extends outside the raster bounds — "
+            "out-of-bounds pixels will be marked as nodata. "
+            f"Window rows [{window_row_start}, {window_row_end}] vs DEM height {dem_tif.height}, "
+            f"cols [{window_col_start}, {window_col_end}] vs DEM width {dem_tif.width}."
+        )
 
-    # get the bounds of the window
-    window_bounds = bounds(window, dem_tif.transform)
+        # Embedding offsets: how far into the full output array the valid data starts.
+        # max(0, -start) handles the case where the window starts before the raster edge.
+        row_off = max(0, -window_row_start)
+        col_off = max(0, -window_col_start)
+
+        valid_dem = dem_tif.read(window=window)   # clipped by rasterio, shape (1, valid_h, valid_w)
+        dem_window_array = np.zeros((1, window_size, window_size), dtype=valid_dem.dtype)
+        dem_window_array[:, row_off:row_off + valid_dem.shape[1], col_off:col_off + valid_dem.shape[2]] = valid_dem
+
+        # All pixels start as nodata=1; valid region is overwritten from the mask tif
+        dem_mask_window_array = np.ones((1, window_size, window_size), dtype=np.uint8)
+        if dem_mask_tif is not None:
+            valid_mask = dem_mask_tif.read(window=window)
+        else:
+            # if no DEM validity mask provided, assume all DEM data is safe (mask=0)
+            valid_mask = np.zeros_like(valid_dem, dtype=np.uint8)
+        dem_mask_window_array[:, row_off:row_off + valid_mask.shape[1], col_off:col_off + valid_mask.shape[2]] = valid_mask
 
     return dem_window_array, dem_mask_window_array, window_transform, window_bounds, window_size
 
