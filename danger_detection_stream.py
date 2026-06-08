@@ -465,6 +465,9 @@ def main():
                     logger.info("All processes finished. Cleaning up.")
                 break
             sleep(0.5)
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt received. Shutting down pipeline.")
+        error_event.set()
     except Exception as e:
         error_event.set()
         logger.critical(f"Unexpected error in main process: {e}", exc_info=True)
