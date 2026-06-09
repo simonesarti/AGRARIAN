@@ -82,6 +82,7 @@ class NotificationsStreamWriterConfig(BaseModel):
     database_service: Optional[Literal["postgresql", "mysql", "sqlite"]] = None
     database_host: Optional[str] = None
     database_port: int = Field(default=DB_PORT, ge=1, le=65535)
+    database_name: str = DB_NAME
     database_worker_name: Optional[str] = None    # DB role (connection credential)
     database_worker_password: Optional[str] = None
     database_username: str = ""                   # app-level auth (users table)
@@ -158,11 +159,11 @@ class NotificationsStreamWriter(mp.Process):
         auth = f"{self.config.database_worker_name}:{self.config.database_worker_password}@"
         addr = f"{self.config.database_host}:{self.config.database_port}"
         if self.config.database_service == "postgresql":
-            return f"postgresql://{auth}{addr}/{DB_NAME}"
+            return f"postgresql://{auth}{addr}/{self.config.database_name}"
         elif self.config.database_service == "mysql":
-            return f"mysql+pymysql://{auth}{addr}/{DB_NAME}"
+            return f"mysql+pymysql://{auth}{addr}/{self.config.database_name}"
         elif self.config.database_service == "sqlite":
-            return f"sqlite:///{DB_NAME}"
+            return f"sqlite:///{self.config.database_name}"
         else:
             logger.warning(f"Unknown database_service '{self.config.database_service}'; database output disabled.")
             return None

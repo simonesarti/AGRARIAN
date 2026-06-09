@@ -279,6 +279,7 @@ def main():
         database_service=s.db_service,
         database_host=s.db_host,
         database_port=s.db_port,
+        database_name=s.db_name,
         database_worker_name=s.db_worker_name,
         database_worker_password=s.db_worker_password.get_secret_value() if s.db_worker_password else None,
         database_username=s.db_username,

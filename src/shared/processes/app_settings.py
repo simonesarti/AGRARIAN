@@ -19,6 +19,7 @@ from src.shared.processes.constants import (
     HM_ANOMALY_USE_AE,
     HM_ANOMALY_USE_SOCIAL,
     DB_HOST,
+    DB_NAME,
     DB_PORT,
     DRONE_SENSOR_HEIGHT_MM,
     DRONE_SENSOR_HEIGHT_PIXELS,
@@ -148,6 +149,7 @@ class AppSettings(BaseSettings):
     db_service:                  Optional[Literal["postgresql", "mysql", "sqlite"]] = None
     db_host:                     str           = DB_HOST
     db_port:                     int           = Field(default=DB_PORT, ge=1, le=65535)
+    db_name:                     str           = DB_NAME
     db_worker_name:     Optional[str]       = None
     db_worker_password: Optional[SecretStr] = None
     db_username:        str                 = ""
