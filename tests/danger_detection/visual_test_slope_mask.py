@@ -209,6 +209,49 @@ def _sinusoidal(amplitude: float = 5.0, periods: float = 3.0) -> np.ndarray:
     return np.tile(wave, (GRID_N, 1))[np.newaxis].astype(np.float32)
 
 
+# --- Y-direction mirrors ---
+
+def _ramp_y(slope_deg: float) -> np.ndarray:
+    """Uniform inclined plane in the y-direction (row-based)."""
+    r = np.arange(GRID_N, dtype=np.float32)
+    elev = np.outer(r, np.ones(GRID_N)) * PIXEL_M * np.tan(np.radians(slope_deg))
+    return elev[np.newaxis].astype(np.float32)
+
+
+def _two_zone_y(flat_side: str = "top", ramp_deg: float = 35.0) -> np.ndarray:
+    """Top half flat, bottom half uniform ramp (or vice-versa)."""
+    elev = np.zeros((1, GRID_N, GRID_N), dtype=np.float32)
+    half = GRID_N // 2
+    ramp = np.arange(half, dtype=np.float32) * PIXEL_M * np.tan(np.radians(ramp_deg))
+    if flat_side == "top":
+        elev[0, half:, :] = ramp.reshape(-1, 1)
+    else:
+        elev[0, :half, :] = ramp[::-1].reshape(-1, 1)
+    return elev
+
+
+def _cliff_y(height: float = 10.0) -> np.ndarray:
+    """Step function: top half at 0 m, bottom half at height m."""
+    elev = np.zeros((1, GRID_N, GRID_N), dtype=np.float32)
+    elev[0, GRID_N // 2:, :] = height
+    return elev
+
+
+def _sinusoidal_y(amplitude: float = 5.0, periods: float = 3.0) -> np.ndarray:
+    """Rolling hills in the y-direction (row-based)."""
+    r = np.arange(GRID_N, dtype=np.float32)
+    wave = amplitude * np.sin(2 * np.pi * periods * r / GRID_N)
+    return np.tile(wave.reshape(-1, 1), (1, GRID_N))[np.newaxis].astype(np.float32)
+
+
+def _diagonal_ramp(slope_deg: float) -> np.ndarray:
+    """Plane inclined at 45° (NE direction): dx = dy = tan(slope)/√2.
+    Combined magnitude → arctan(tan(slope)) = slope_deg, same as x- or y-only ramp."""
+    r, c = np.ogrid[:GRID_N, :GRID_N]
+    elev = (r + c) / np.sqrt(2) * PIXEL_M * np.tan(np.radians(slope_deg))
+    return elev[np.newaxis].astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Test cases
 # ---------------------------------------------------------------------------
@@ -309,6 +352,95 @@ def test_sinusoidal():
     )
 
 
+# ---------------------------------------------------------------------------
+# Y-direction mirrors  (exercise kernel_y independently)
+# ---------------------------------------------------------------------------
+
+def test_ramp_y_below_threshold():
+    """
+    Uniform 20° ramp in the Y direction, threshold = 30° → mask = 0.
+    Mirror of test 2: kernel_y should give the same slope as kernel_x did.
+    """
+    run_test(
+        "9_ramp_y_below_threshold",
+        _ramp_y(slope_deg=20.0), threshold_deg=30.0,
+        safe_pts=[(50, 50)],
+        note="Y-ramp 20°, threshold 30° — slope panel should look like test 2 rotated 90°",
+    )
+
+
+def test_ramp_y_above_threshold():
+    """
+    Same Y ramp, threshold = 10° → mask = 1.  Mirror of test 3.
+    """
+    run_test(
+        "10_ramp_y_above_threshold",
+        _ramp_y(slope_deg=20.0), threshold_deg=10.0,
+        steep_pts=[(50, 50)],
+        note="Y-ramp 20°, threshold 10° — mask all white, same as test 3",
+    )
+
+
+def test_two_zone_y():
+    """
+    Top half flat (0°), bottom half steep Y-ramp (35°), threshold = 20°.
+    Expected: clean top-black / bottom-white split. Mirror of test 5.
+    """
+    run_test(
+        "11_two_zone_y",
+        _two_zone_y(flat_side="top", ramp_deg=35.0), threshold_deg=20.0,
+        steep_pts=[(75, 50)],
+        safe_pts=[(25, 50)],
+        note="top: flat → safe | bottom: 35° Y-ramp → steep | split at row 50",
+    )
+
+
+def test_cliff_edge_y():
+    """
+    Horizontal step (cliff): top=0 m, bottom=10 m.
+    Expected: thin white band at rows 49-50, black everywhere else. Mirror of test 6.
+    """
+    run_test(
+        "12_cliff_edge_y",
+        _cliff_y(height=10.0), threshold_deg=60.0,
+        steep_pts=[(49, 50), (50, 50)],
+        safe_pts=[(25, 50), (75, 50)],
+        note="horizontal cliff: thin white band at row≈49-50 — same geometry as test 6, rotated 90°",
+    )
+
+
+def test_sinusoidal_y():
+    """
+    Rolling hills in the Y direction.
+    Expected: alternating horizontal bands (vs. vertical bands in test 7).
+    """
+    run_test(
+        "13_sinusoidal_y",
+        _sinusoidal_y(amplitude=5.0, periods=3.0), threshold_deg=15.0,
+        note="Y-sinusoidal: horizontal steep/flat bands — rotate test 7 image 90° and they should match",
+    )
+
+
+def test_diagonal_ramp():
+    """
+    Plane inclined at 45° (NE diagonal): dx = dy = tan(20°)/√2.
+    Both kernels contribute equally. Combined magnitude → arctan(tan(20°)) = 20°,
+    identical to the pure x- or y-ramp at the same angle.
+    """
+    run_test(
+        "14_diagonal_ramp_below_threshold",
+        _diagonal_ramp(slope_deg=20.0), threshold_deg=30.0,
+        safe_pts=[(50, 50)],
+        note="diagonal 45° ramp 20°, threshold 30° — slope = 20° despite dx=dy=tan/√2",
+    )
+    run_test(
+        "15_diagonal_ramp_above_threshold",
+        _diagonal_ramp(slope_deg=20.0), threshold_deg=10.0,
+        steep_pts=[(50, 50)],
+        note="same diagonal ramp, threshold 10° — mask all white, same as x- and y-ramp tests",
+    )
+
+
 def test_threshold_90_guard():
     """
     threshold=90° must always return all-zero (guard in the function).
@@ -330,6 +462,7 @@ def test_threshold_90_guard():
 
 if __name__ == "__main__":
     print(f"\nWriting PNGs to: {OUTPUT_DIR}\n")
+    print("--- X-direction ---")
     test_flat()
     test_ramp_below_threshold()
     test_ramp_above_threshold()
@@ -338,4 +471,12 @@ if __name__ == "__main__":
     test_cliff_edge()
     test_sinusoidal()
     test_threshold_90_guard()
+    print("\n--- Y-direction mirrors ---")
+    test_ramp_y_below_threshold()
+    test_ramp_y_above_threshold()
+    test_two_zone_y()
+    test_cliff_edge_y()
+    test_sinusoidal_y()
+    print("\n--- Diagonal (both kernels) ---")
+    test_diagonal_ramp()
     print("\nAll visual tests passed.\n")
