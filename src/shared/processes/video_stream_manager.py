@@ -160,7 +160,11 @@ class VideoStreamManager:
                 self._start_confirmed.set()
                 
                 #stderr consumer
-                self.stderr_consumer = threading.Thread(target=self.log_stderr, args=(self._ffmpeg_process.stderr,), daemon=True)
+                self.stderr_consumer = threading.Thread(
+                    target=self.log_stderr,
+                    args=(self._ffmpeg_process.stderr,),
+                    daemon=True,
+                )
                 self.stderr_consumer.start()
 
                 # Loop continues as long as we are "running"
