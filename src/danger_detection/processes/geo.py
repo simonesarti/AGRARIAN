@@ -342,7 +342,7 @@ class GeoWorker(mp.Process):
                                     center_lonlat=center_coords,
                                     rectangle_lonlat=corners_coordinates,
                                     buffer_scale=self.config.dem_cache_buffer_scale,
-                                ) # masks shape are (1,window_size, window_size)
+                                ) # masks shape are (1, window_size, window_size)
 
                                 # find the distance in meters between two points on opposite sides of
                                 # the window at the drone latitude, then derive the DEM pixel size

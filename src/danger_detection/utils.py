@@ -203,58 +203,6 @@ def get_window_size_m(reference_lat, window_bounds):
     return distance_m
 
 
-def compute_slope_mask_runtime(elev_array, pixel_size, slope_threshold_deg):
-    """
-    Compute a mask indicating where the terrain slope is steeper than a given threshold.
-
-    Parameters
-    ----------
-    elev_array : np.ndarray
-        A square 3D array of elevation values in meters, with first dimension has shape 1.
-    pixel_size : float
-        The size of each pixel in meters.
-    slope_threshold_deg : float
-        The slope threshold in degrees. Cells with a slope greater than this threshold
-        will be marked with a 1 in the output mask.
-
-    Returns
-    -------
-    np.ndarray
-        A 3D array (of the same shape as elev_array) containing 1 where the slope is
-        greater than slope_threshold_deg and 0 elsewhere.
-    """
-
-    # If elev_array has a singleton first dimension, remove it to work with a 2D array.
-    assert elev_array.ndim == 3 and elev_array.shape[0] == 1
-    elev_array = elev_array[0]
-
-    # Pad the DEM with a 1-pixel border using edge replication.
-    elev_padded = np.pad(elev_array, pad_width=1, mode='edge')
-
-    # Compute the gradient on the padded DEM.
-    # np.gradient returns arrays of the same shape as the input.
-    gy_padded, gx_padded = np.gradient(elev_padded, pixel_size)
-
-    # Crop the gradient arrays to remove the padding.
-    gx = gx_padded[1:-1, 1:-1]
-    gy = gy_padded[1:-1, 1:-1]
-
-    # Compute the magnitude of the slope (rise over run)
-    # The slope in radians is given by arctan(sqrt((dz/dx)^2 + (dz/dy)^2)).
-    slope_radians = np.arctan(np.sqrt(gx ** 2 + gy ** 2))
-
-    # Convert the slope to degrees
-    slope_degrees = np.degrees(slope_radians)
-
-    # Create a mask where a cell is 1 if the slope exceeds the threshold, 0 otherwise.
-    mask = (slope_degrees > slope_threshold_deg).astype(np.uint8)
-
-    # Expand the dimensions to ensure the output is (1, W, H).
-    mask = mask[np.newaxis, :, :]
-
-    return mask
-
-
 def compute_slope_mask_horn(elev_array, pixel_size, slope_threshold_deg):
     """
     Compute a mask indicating where the terrain slope is steeper than a given threshold
