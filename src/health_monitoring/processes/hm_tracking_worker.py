@@ -1,8 +1,7 @@
 import multiprocessing as mp
 import multiprocessing.synchronize
 import logging
-from queue import Empty as QueueEmptyException
-from queue import Full as QueueFullException
+from queue import Empty as QueueEmptyException, Full as QueueFullException
 from time import time
 from typing import Optional
 
@@ -113,26 +112,21 @@ class HMTrackingWorker(mp.Process):
 
                 assert isinstance(meta, FrameSlotMetadata)
 
-                # ---- frame skipping ----
-                if _skip_countdown > 0:
-                    _skip_countdown -= 1
-                    self.input_frame_buffer.release(meta.slot_index)
-                    logger.debug(f"Frame {meta.frame_id} skipped.")
-                    continue
-                _skip_countdown = self.config.frame_skip
-
-                get_time = time() - iter_start
-
                 # ---- zero-copy view of input slot ----
-                predict_start = time()
-
                 frame = self.input_frame_buffer.view(meta.slot_index)
 
-                tracks, H = tracker.update(frame)
-
+                # ---- run tracker on keyframes; assign empty outputs for passthrough ----
+                predict_start = time()
+                if _skip_countdown == 0:
+                    _skip_countdown = self.config.frame_skip
+                    tracks, H = tracker.update(frame)
+                    is_keyframe = True
+                    logger.debug(f"Frame {meta.frame_id}: {len(tracks)} active tracks.")
+                else:
+                    _skip_countdown -= 1
+                    tracks, H = [], None
+                    is_keyframe = False
                 predict_time = time() - predict_start
-
-                logger.debug(f"Frame {meta.frame_id}: {len(tracks)} active tracks.")
 
                 # ---- write frame to output buffer ----
                 append_start = time()
@@ -155,10 +149,11 @@ class HMTrackingWorker(mp.Process):
                     slot_index=out_slot,
                     tracks=tracks,
                     H=H,
+                    is_keyframe=is_keyframe,
                 )
                 try:
                     self.output_meta_queue.put(out_meta, timeout=self.config.queue_timeout)
-                    logger.debug(f"Frame {meta.frame_id} → slot {out_slot}.")
+                    logger.debug(f"Frame {meta.frame_id} → slot {out_slot} (keyframe={is_keyframe}).")
                 except QueueFullException:
                     self.output_frame_buffer.release(out_slot)
                     logger.warning(
@@ -170,7 +165,6 @@ class HMTrackingWorker(mp.Process):
                 logger.debug(
                     f"frame {meta.frame_id} processed in {iter_time * 1000:.2f} ms, "
                     f"of which --> "
-                    f"GET: {get_time * 1000:.2f} ms, "
                     f"TRACK: {predict_time * 1000:.2f} ms, "
                     f"PROPAGATE: {(time() - append_start) * 1000:.2f} ms."
                 )

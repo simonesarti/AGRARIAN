@@ -9,7 +9,7 @@ require_both=True:  flag only when both scores exceed their thresholds.
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -52,19 +52,19 @@ class FrameAnomalyResult:
     """
     frame_idx: int
     timestamp_ms: float
-    ae_scores: dict[int, float]
-    social_scores: dict[int, float]
-    ongoing_events: list[AnomalyEvent]
-    unscored_tracks: list[int]
-    scored_ok_tracks: list[int]
-    ok_ae_tracks: list[int]
-    ok_soc_tracks: list[int]
-    elevated_ae_tracks: list[int]
-    elevated_soc_tracks: list[int]
-    elevated_both_tracks: list[int]
-    confirmed_ae_tracks: list[int]
-    confirmed_soc_tracks: list[int]
-    confirmed_both_tracks: list[int]
+    ae_scores: dict[int, float]             = field(default_factory=dict)
+    social_scores: dict[int, float]         = field(default_factory=dict)
+    ongoing_events: list[AnomalyEvent]      = field(default_factory=list)
+    unscored_tracks: list[int]              = field(default_factory=list)
+    scored_ok_tracks: list[int]             = field(default_factory=list)
+    ok_ae_tracks: list[int]                 = field(default_factory=list)
+    ok_soc_tracks: list[int]                = field(default_factory=list)
+    elevated_ae_tracks: list[int]           = field(default_factory=list)
+    elevated_soc_tracks: list[int]          = field(default_factory=list)
+    elevated_both_tracks: list[int]         = field(default_factory=list)
+    confirmed_ae_tracks: list[int]          = field(default_factory=list)
+    confirmed_soc_tracks: list[int]         = field(default_factory=list)
+    confirmed_both_tracks: list[int]        = field(default_factory=list)
 
     @property
     def anomalous_tracks(self) -> list[int]:
@@ -129,14 +129,7 @@ class AnomalyDetector:
                 self._close_event(tid, frame_idx, timestamp_ms)
 
         if not track_features:
-            return FrameAnomalyResult(
-                frame_idx=frame_idx, timestamp_ms=timestamp_ms,
-                ae_scores={}, social_scores={}, ongoing_events=[],
-                unscored_tracks=[], scored_ok_tracks=[],
-                ok_ae_tracks=[], ok_soc_tracks=[],
-                elevated_ae_tracks=[], elevated_soc_tracks=[], elevated_both_tracks=[],
-                confirmed_ae_tracks=[], confirmed_soc_tracks=[], confirmed_both_tracks=[],
-            )
+            return FrameAnomalyResult(frame_idx=frame_idx, timestamp_ms=timestamp_ms)
 
         # Social stats are updated from ALL active tracks regardless of sequence lenght
         if self.cfg.use_social:
@@ -224,10 +217,15 @@ class AnomalyDetector:
         if self._active_events.get(tid) is None:
             triggered_by = "both" if ae_flagged and soc_flagged else ("ae" if ae_flagged else "social")
             self._active_events[tid] = AnomalyEvent(
-                track_id=tid, start_frame=frame_idx, end_frame=frame_idx,
-                start_time_ms=ts, end_time_ms=ts,
-                max_ae_score=ae_score, mean_ae_score=ae_score,
-                max_social_score=social_score, mean_social_score=social_score,
+                track_id=tid,
+                start_frame=frame_idx,
+                end_frame=frame_idx,
+                start_time_ms=ts,
+                end_time_ms=ts,
+                max_ae_score=ae_score,
+                mean_ae_score=ae_score,
+                max_social_score=social_score,
+                mean_social_score=social_score,
                 triggered_by=triggered_by,
             )
         else:

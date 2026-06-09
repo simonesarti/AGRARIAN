@@ -16,6 +16,7 @@ class HMTrackingSlotMetadata:
 
     tracks: active TrackState objects (bounding boxes, ids, classes).
     H: 3×3 prev→curr homography from BotSORT's GMC, or None if unavailable.
+    is_keyframe: False for frames that were skipped by the tracker (passthrough).
     """
     frame_id: int
     timestamp: float
@@ -23,6 +24,7 @@ class HMTrackingSlotMetadata:
     slot_index: int
     tracks: list               # list[TrackState]
     H: Optional[np.ndarray]    # ego-motion homography, or None
+    is_keyframe: bool = True
 
 
 @dataclass
@@ -32,10 +34,10 @@ class HMAnomalySlotMetadata:
 
     Carries a shared-memory slot reference to the (H, W, 3) BGR frame at
     processing resolution alongside the anomaly scoring results.
-    The slot is released by the downstream annotation worker after reading.
 
     tracks: active TrackState objects, forwarded for bounding-box drawing.
     anomaly_result: FrameAnomalyResult with per-track scores and classifications.
+    is_keyframe: False for frames that bypassed inference (no real tracks/scores).
     """
     frame_id: int
     timestamp: float
@@ -43,3 +45,4 @@ class HMAnomalySlotMetadata:
     slot_index: int
     tracks: list               # list[TrackState]
     anomaly_result: FrameAnomalyResult
+    is_keyframe: bool = True

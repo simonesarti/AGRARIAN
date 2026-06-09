@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, PositiveFloat
 
 from src.health_monitoring.inference.config import AnomalyConfig, FeaturesConfig, ModelConfig
 from src.health_monitoring.tracking.feature_extractor import FeatureExtractor
-from src.health_monitoring.anomaly_detection.detector import AnomalyDetector
+from src.health_monitoring.anomaly_detection.detector import AnomalyDetector, FrameAnomalyResult
 from src.health_monitoring.processes.messages import HMTrackingSlotMetadata, HMAnomalySlotMetadata
 from src.shared.processes.frame_buffer import FrameBuffer
 from src.shared.processes.constants import (
@@ -136,42 +136,45 @@ class HMAnomalyDetectionWorker(mp.Process):
 
                 assert isinstance(meta, HMTrackingSlotMetadata)
 
-                get_time = time() - iter_start
-
                 # ---- zero-copy view of input slot ----
-                predict_start = time()
-
                 frame = self.input_frame_buffer.view(meta.slot_index)
 
-                # Feature extraction
-                tf_map = extractor.update(
-                    tracks=meta.tracks,
-                    H_prev_to_curr=meta.H,
-                    frame_idx=meta.frame_id,
-                )
-
-                # Anomaly scoring (timestamp in ms for event logging)
-                anomaly_result = detector.score_tracks(
-                    track_features=tf_map,
-                    frame_idx=meta.frame_id,
-                    timestamp_ms=meta.timestamp * 1000.0,
-                )
-
-                predict_time = time() - predict_start
-
-                n_confirmed = len(anomaly_result.anomalous_tracks)
-                n_elevated = (
-                    len(anomaly_result.elevated_ae_tracks) +
-                    len(anomaly_result.elevated_soc_tracks) +
-                    len(anomaly_result.elevated_both_tracks)
-                )
-                if n_confirmed > 0:
-                    logger.info(
-                        f"Frame {meta.frame_id}: {n_confirmed} confirmed anomalous tracks "
-                        f"{anomaly_result.anomalous_tracks}."
+                # ---- run scoring on keyframes; assign empty results for passthrough ----
+                predict_start = time()
+                if meta.is_keyframe:
+                    tf_map = extractor.update(
+                        tracks=meta.tracks,
+                        H_prev_to_curr=meta.H,
+                        frame_idx=meta.frame_id,
                     )
-                elif n_elevated > 0:
-                    logger.debug(f"Frame {meta.frame_id}: {n_elevated} elevated tracks.")
+                    # Anomaly scoring (timestamp in ms for event logging)
+                    anomaly_result = detector.score_tracks(
+                        track_features=tf_map,
+                        frame_idx=meta.frame_id,
+                        timestamp_ms=meta.timestamp * 1000.0,
+                    )
+                    tracks = meta.tracks
+                    n_confirmed = len(anomaly_result.anomalous_tracks)
+                    n_elevated = (
+                        len(anomaly_result.elevated_ae_tracks) +
+                        len(anomaly_result.elevated_soc_tracks) +
+                        len(anomaly_result.elevated_both_tracks)
+                    )
+                    if n_confirmed > 0:
+                        logger.info(
+                            f"Frame {meta.frame_id}: {n_confirmed} confirmed anomalous tracks "
+                            f"{anomaly_result.anomalous_tracks}."
+                        )
+                    elif n_elevated > 0:
+                        logger.debug(f"Frame {meta.frame_id}: {n_elevated} elevated tracks.")
+                else:
+                    tracks = []
+                    anomaly_result = FrameAnomalyResult(
+                        frame_idx=meta.frame_id,
+                        timestamp_ms=meta.timestamp * 1000.0,
+                    )
+                
+                predict_time = time() - predict_start
 
                 # ---- write frame to output buffer ----
                 append_start = time()
@@ -192,12 +195,13 @@ class HMAnomalyDetectionWorker(mp.Process):
                     timestamp=meta.timestamp,
                     original_wh=meta.original_wh,
                     slot_index=out_slot,
-                    tracks=meta.tracks,
+                    tracks=tracks,
                     anomaly_result=anomaly_result,
+                    is_keyframe=meta.is_keyframe,
                 )
                 try:
                     self.output_meta_queue.put(out_meta, timeout=self.config.queue_timeout)
-                    logger.debug(f"Frame {meta.frame_id} → slot {out_slot}.")
+                    logger.debug(f"Frame {meta.frame_id} → slot {out_slot} (keyframe={meta.is_keyframe}).")
                 except QueueFullException:
                     self.output_frame_buffer.release(out_slot)
                     logger.warning(
@@ -209,7 +213,6 @@ class HMAnomalyDetectionWorker(mp.Process):
                 logger.debug(
                     f"frame {meta.frame_id} processed in {iter_time * 1000:.2f} ms, "
                     f"of which --> "
-                    f"GET: {get_time * 1000:.2f} ms, "
                     f"SCORE: {predict_time * 1000:.2f} ms, "
                     f"PROPAGATE: {(time() - append_start) * 1000:.2f} ms."
                 )

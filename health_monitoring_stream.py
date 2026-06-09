@@ -8,6 +8,7 @@ from src.shared.processes.app_settings import AppSettings
 from src.shared.processes.stream_video_reader import StreamVideoReader, StreamVideoReaderConfig
 from src.health_monitoring.processes.hm_tracking_worker import HMTrackingWorker, HMTrackingWorkerConfig
 from src.health_monitoring.processes.hm_anomaly_worker import HMAnomalyDetectionWorker, HMAnomalyDetectionWorkerConfig
+from src.health_monitoring.processes.hm_interpolator import HMVideoInterpolatorProcess, HMVideoInterpolatorConfig
 from src.health_monitoring.processes.hm_annotation_worker import HMAnnotationWorker, HMAnnotationWorkerConfig
 from src.shared.processes.output_alert_streamer import NotificationsStreamWriter, NotificationsStreamWriterConfig
 from src.shared.processes.output_video_streamer import VideoProducerProcess, VideoProducerProcessConfig
@@ -26,7 +27,6 @@ from src.shared.processes.constants import (
     VIDEO_STREAM_READER_ORIGINAL_SHAPE,
     MAX_SIZE_FRAME_READER_OUT,
     MAX_SIZE_DETECTION_IN,
-    MAX_SIZE_DANGER_DETECTION_RESULT,
     MAX_SIZE_NOTIFICATIONS_STREAM,
     MAX_SIZE_VIDEO_STREAM,
     FPS,
@@ -111,38 +111,46 @@ def main():
     _3ch = (_proc_h, _proc_w, 3)
     _ann = (_orig_h, _orig_w, 3)
 
+    # Resolve tracker checkpoint; frame_skip comes from the anomaly detector config.
+    # frame_skip must be extracted before buffers/queues are sized from it.
+    _yaml_checkpoint = tracking_args.pop("model_checkpoint")
+    _frame_skip = anomaly_detection_args.pop("frame_skip")
+
     # ============== FRAME BUFFERS ==============
     # n_slots matches the corresponding metadata queue maxsize: each queue entry
     # holds exactly one slot index, so queue capacity == max in-flight frames.
 
-    reader_to_tracking_buf    = FrameBuffer(_3ch, n_slots=MAX_SIZE_FRAME_READER_OUT)
-    tracking_to_anomaly_buf   = FrameBuffer(_3ch, n_slots=MAX_SIZE_DETECTION_IN)
-    anomaly_to_annotation_buf = FrameBuffer(_3ch, n_slots=MAX_SIZE_DANGER_DETECTION_RESULT)
-    annotation_to_alert_buf   = FrameBuffer(_ann, n_slots=MAX_SIZE_NOTIFICATIONS_STREAM)
-    annotation_to_video_buf   = FrameBuffer(_ann, n_slots=MAX_SIZE_VIDEO_STREAM)
+    # _frame_skip + 4 = keyframe1 + passthorugh + keyframe2 + headroom of 2 
+    # for backpressure relieve, like for other processes
+
+    reader_to_tracking_buf       = FrameBuffer(_3ch, n_slots=MAX_SIZE_FRAME_READER_OUT)
+    tracking_to_anomaly_buf      = FrameBuffer(_3ch, n_slots=MAX_SIZE_DETECTION_IN)
+    anomaly_to_interpolator_buf    = FrameBuffer(_3ch, n_slots=_frame_skip + 4)
+    interpolator_to_annotation_buf = FrameBuffer(_3ch, n_slots=_frame_skip + 4)
+    annotation_to_alert_buf      = FrameBuffer(_ann, n_slots=MAX_SIZE_NOTIFICATIONS_STREAM)
+    annotation_to_video_buf      = FrameBuffer(_ann, n_slots=MAX_SIZE_VIDEO_STREAM)
 
     frame_buffers = [
         reader_to_tracking_buf,
         tracking_to_anomaly_buf,
-        anomaly_to_annotation_buf,
+        anomaly_to_interpolator_buf,
+        interpolator_to_annotation_buf,
         annotation_to_alert_buf,
         annotation_to_video_buf,
     ]
 
     # ============== METADATA QUEUES ==============
 
-    reader_to_tracking_q    = mp.Queue(maxsize=MAX_SIZE_FRAME_READER_OUT)
-    tracking_to_anomaly_q   = mp.Queue(maxsize=MAX_SIZE_DETECTION_IN)
-    anomaly_to_annotation_q = mp.Queue(maxsize=MAX_SIZE_DANGER_DETECTION_RESULT)
-    annotation_to_alert_q   = mp.Queue(maxsize=MAX_SIZE_NOTIFICATIONS_STREAM)
-    annotation_to_video_q   = mp.Queue(maxsize=MAX_SIZE_VIDEO_STREAM)
-    video_to_persistence_q  = mp.Queue(maxsize=1)
+    reader_to_tracking_q         = mp.Queue(maxsize=MAX_SIZE_FRAME_READER_OUT)
+    tracking_to_anomaly_q        = mp.Queue(maxsize=MAX_SIZE_DETECTION_IN)
+    anomaly_to_interpolator_q    = mp.Queue(maxsize=_frame_skip + 4)
+    interpolator_to_annotation_q = mp.Queue(maxsize=_frame_skip + 4)
+    annotation_to_alert_q        = mp.Queue(maxsize=MAX_SIZE_NOTIFICATIONS_STREAM)
+    annotation_to_video_q        = mp.Queue(maxsize=MAX_SIZE_VIDEO_STREAM)
+    video_to_persistence_q       = mp.Queue(maxsize=1)
 
     # ============== BUILD PROCESS CONFIGS ==============
 
-    # Resolve tracker checkpoint; frame_skip comes from the anomaly detector config.
-    _yaml_checkpoint = tracking_args.pop("model_checkpoint")
-    _frame_skip = anomaly_detection_args.pop("frame_skip")
     if _use_engine:
         _tracking_checkpoint = str(_engine_path)
         logger.info(f"TensorRT engine found at {_engine_path}. Using engine (frame_skip={_frame_skip}).")
@@ -194,6 +202,11 @@ def main():
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
+    interpolator_config = HMVideoInterpolatorConfig(
+        queue_timeout=PIPELINE_QUEUE_TIMEOUT,
+        poison_pill_timeout=POISON_PILL_TIMEOUT,
+    )
+
     annotation_config = HMAnnotationWorkerConfig(
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
@@ -227,7 +240,7 @@ def main():
     )
 
     video_producer_config = VideoProducerProcessConfig(
-        fps=round(FPS / (_frame_skip + 1)),
+        fps=FPS,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         video_file_path=str(output_dir / f"{session_ts}.mp4"),
         media_server_url=s.video_out_stream_url,
@@ -293,15 +306,24 @@ def main():
         anomaly_process = HMAnomalyDetectionWorker(
             input_meta_queue=tracking_to_anomaly_q,
             input_frame_buffer=tracking_to_anomaly_buf,
-            output_meta_queue=anomaly_to_annotation_q,
-            output_frame_buffer=anomaly_to_annotation_buf,
+            output_meta_queue=anomaly_to_interpolator_q,
+            output_frame_buffer=anomaly_to_interpolator_buf,
             error_event=error_event,
             config=anomaly_config,
         )
 
+        interpolator_process = HMVideoInterpolatorProcess(
+            input_meta_queue=anomaly_to_interpolator_q,
+            input_frame_buffer=anomaly_to_interpolator_buf,
+            output_meta_queue=interpolator_to_annotation_q,
+            output_frame_buffer=interpolator_to_annotation_buf,
+            error_event=error_event,
+            config=interpolator_config,
+        )
+
         annotation_process = HMAnnotationWorker(
-            input_meta_queue=anomaly_to_annotation_q,
-            input_frame_buffer=anomaly_to_annotation_buf,
+            input_meta_queue=interpolator_to_annotation_q,
+            input_frame_buffer=interpolator_to_annotation_buf,
             alert_output_meta_queue=annotation_to_alert_q,
             alert_output_frame_buffer=annotation_to_alert_buf,
             video_output_meta_queue=annotation_to_video_q,
@@ -344,6 +366,7 @@ def main():
         video_reader_process,
         tracking_process,
         anomaly_process,
+        interpolator_process,
         annotation_process,
         alert_writer_process,
         video_producer_process,

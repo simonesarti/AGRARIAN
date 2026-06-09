@@ -104,6 +104,7 @@ MAX_SIZE_DANGER_DETECTION_RESULT=3
 MAX_SIZE_VIDEO_STREAM=3
 MAX_SIZE_NOTIFICATIONS_STREAM=3
 
+
 # ------------------------ VIDEO READING ----------
 
 # VIDEO_STREAM_URL = "rtmp://<server>[:port]/<app>/<stream_key>"
