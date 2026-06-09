@@ -80,10 +80,7 @@ def main():
 
     _engine_path = Path("engine/detection_1280_720_yolo11m.engine")
     _use_engine  = _engine_path.is_file()
-    _anomaly_cfg_file = (
-        "configs/health_monitoring/anomaly_detector_30fps.yaml" if _use_engine
-        else "configs/health_monitoring/anomaly_detector_8fps.yaml"
-    )
+    _anomaly_cfg_file = "configs/health_monitoring/anomaly_detector_8fps.yaml"
 
     try:
         tracking_args          = read_yaml_config("configs/health_monitoring/tracker.yaml")
