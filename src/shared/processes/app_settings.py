@@ -18,10 +18,7 @@ from src.shared.processes.constants import (
     HM_ANOMALY_SOCIAL_THRESHOLD,
     HM_ANOMALY_USE_AE,
     HM_ANOMALY_USE_SOCIAL,
-    DB_HOST,
-    DB_NAME,
-    DB_PORT,
-    DRONE_SENSOR_HEIGHT_MM,
+DRONE_SENSOR_HEIGHT_MM,
     DRONE_SENSOR_HEIGHT_PIXELS,
     DRONE_SENSOR_WIDTH_MM,
     DRONE_SENSOR_WIDTH_PIXELS,
@@ -50,7 +47,7 @@ class AppSettings(BaseSettings):
 
     Values are read from environment variables (case-insensitive) and from a
     .env file if present.  The field name maps 1-to-1 to the env var name:
-    e.g. field `db_service` reads DB_SERVICE.
+    e.g. field `db_writer_url` reads DB_WRITER_URL.
 
     env_ignore_empty=True means an empty string in the environment is treated
     the same as "not set" and causes the field default to be used instead.
@@ -145,15 +142,12 @@ class AppSettings(BaseSettings):
     # DATABASE
     # ------------------------------------------------------------------ #
 
-    # Supported: postgresql, mysql, sqlite — leave empty/unset to disable
-    db_service:                  Optional[Literal["postgresql", "mysql", "sqlite"]] = None
-    db_host:                     str           = DB_HOST
-    db_port:                     int           = Field(default=DB_PORT, ge=1, le=65535)
-    db_name:                     str           = DB_NAME
-    db_worker_name:     Optional[str]       = None
-    db_worker_password: Optional[SecretStr] = None
-    db_username:        str                 = ""
-    db_password:        SecretStr           = ""
+    # URL of the db-writer sidecar (e.g. http://db-writer:8000).
+    # Leave empty/unset to disable database output.
+    # The sidecar holds the privileged DB credentials; only end-user identity goes here.
+    db_writer_url:  Optional[str]       = None
+    db_username:    str                 = ""
+    db_password:    SecretStr           = ""
 
     # ------------------------------------------------------------------ #
     # VIDEO STREAM OUTPUT (RTMP → media server)
@@ -207,13 +201,6 @@ class AppSettings(BaseSettings):
     @classmethod
     def _coerce_qos(cls, v: Any) -> Any:
         return int(v) if isinstance(v, str) else v
-
-    @field_validator("db_service", mode="before")
-    @classmethod
-    def _normalize_db_service(cls, v: Any) -> Optional[str]:
-        if v is None or (isinstance(v, str) and v.strip().lower() in ("", "none")):
-            return None
-        return v.strip().lower()
 
     @field_validator("geofencing_vertexes", mode="before")
     @classmethod
@@ -288,13 +275,6 @@ class AppSettings(BaseSettings):
         else:
             self.video_out_stream_username = None
             self.video_out_stream_password = None
-
-        # --- database ---
-        if self.db_service in ("postgresql", "mysql"):
-            if not (self.db_worker_name and self.db_worker_password):
-                raise ValueError(
-                    f"{self.db_service.upper()} requires DB_WORKER_NAME and DB_WORKER_PASSWORD."
-                )
 
         # --- video storage ---
         if self.video_out_store_service == "azure":

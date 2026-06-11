@@ -4,14 +4,14 @@ from queue import Empty as QueueEmptyException
 import json
 import cv2
 import numpy as np
-from typing import Literal, Optional
+from typing import Optional
 import base64
 from datetime import datetime as dtt
 import logging
 from time import time
 from pydantic import BaseModel, PositiveFloat, PositiveInt, Field
 
-from src.shared.processes.db_manager import DatabaseManager
+from src.shared.processes.db_writer_client import DbWriterClient
 from src.shared.processes.websocket_manager import WebSocketManager
 from src.shared.processes.messages import AnnotationSlotMetadata
 from src.shared.processes.frame_buffer import FrameBuffer
@@ -24,13 +24,6 @@ from src.shared.processes.constants import (
     WS_MANAGER_PING_TIMEOUT,
     WS_MANAGER_BROADCAST_TIMEOUT,
     WS_MANAGER_THREAD_CLOSE_TIMEOUT,
-    DB_PORT,
-    DB_MANAGER_POOL_SIZE,
-    DB_MANAGER_MAX_OVERFLOW,
-    DB_MANAGER_QUEUE_WAIT_TIMEOUT,
-    DB_MANAGER_THREAD_CLOSE_TIMEOUT,
-    DB_MANAGER_QUEUE_SIZE,
-    DB_NAME,
     POISON_PILL,
 )
 
@@ -72,26 +65,13 @@ class NotificationsStreamWriterConfig(BaseModel):
     ws_broadcast_timeout: PositiveFloat = WS_MANAGER_BROADCAST_TIMEOUT
     ws_thread_close_timeout: PositiveFloat = WS_MANAGER_THREAD_CLOSE_TIMEOUT
 
-    # ------- Database connection (database_service=None to disable) --------
-    # Supported services: "postgresql", "mysql", "sqlite".
-    # For postgresql / mysql: database_host, database_port, database_worker_name,
-    #   and database_worker_password are used to build the SQLAlchemy connection URL.
-    # For sqlite: connection params are ignored; the DB file is named DB_NAME.
-    # database_username / database_password are app-level credentials checked against
-    #   the users table (distinct from the DB role credentials above).
-    database_service: Optional[Literal["postgresql", "mysql", "sqlite"]] = None
-    database_host: Optional[str] = None
-    database_port: int = Field(default=DB_PORT, ge=1, le=65535)
-    database_name: str = DB_NAME
-    database_worker_name: Optional[str] = None    # DB role (connection credential)
-    database_worker_password: Optional[str] = None
-    database_username: str = ""                   # app-level auth (users table)
+    # ------- Database connection (db_writer_url=None to disable) --------
+    # URL of the db-writer sidecar (e.g. http://db-writer:8000).
+    # The sidecar holds the privileged DB credentials; the app supplies only
+    # the end-user identity (database_username / database_password).
+    db_writer_url: Optional[str] = None
+    database_username: str = ""
     database_password: str = ""
-    db_pool_size: PositiveInt = DB_MANAGER_POOL_SIZE
-    db_max_overflow: int = Field(default=DB_MANAGER_MAX_OVERFLOW, ge=-1)
-    db_queue_get_timeout: PositiveFloat = DB_MANAGER_QUEUE_WAIT_TIMEOUT
-    db_thread_close_timeout: PositiveFloat = DB_MANAGER_THREAD_CLOSE_TIMEOUT
-    db_alerts_queue_size: PositiveInt = DB_MANAGER_QUEUE_SIZE
     # Video stream URL written to the flights table so the UI can fetch it from the DB.
     # Should match the media_server_url passed to VideoProducerProcess.
     video_stream_url: Optional[str] = None
@@ -139,34 +119,12 @@ class NotificationsStreamWriter(mp.Process):
         self.error_event = error_event
         self.config = config
 
-        # Build DB URL from config fields; None means database output is disabled.
-        self.database_url = self._build_database_url()
-
         # Output managers — set to None here, instantiated inside run() in the child process
         self.log_file = None
-        self.db_manager = None
+        self.db_client = None
         self.ws_manager = None
 
         self.work_finished = mp.Event()
-
-    def _build_database_url(self) -> Optional[str]:
-        """Construct SQLAlchemy database URL from config fields. Returns None if disabled."""
-        if not self.config.database_service:
-            return None
-        if not (self.config.database_worker_name and self.config.database_worker_password):
-            logger.warning("DB worker credentials not provided; database output disabled.")
-            return None
-        auth = f"{self.config.database_worker_name}:{self.config.database_worker_password}@"
-        addr = f"{self.config.database_host}:{self.config.database_port}"
-        if self.config.database_service == "postgresql":
-            return f"postgresql://{auth}{addr}/{self.config.database_name}"
-        elif self.config.database_service == "mysql":
-            return f"mysql+pymysql://{auth}{addr}/{self.config.database_name}"
-        elif self.config.database_service == "sqlite":
-            return f"sqlite:///{self.config.database_name}"
-        else:
-            logger.warning(f"Unknown database_service '{self.config.database_service}'; database output disabled.")
-            return None
 
     def _setup_managers(self):
         """Initialise file, WebSocket, and database output channels inside the child process."""
@@ -179,23 +137,16 @@ class NotificationsStreamWriter(mp.Process):
             self.log_file = None    # ensure log_file stays None
             logger.error(f"Failed to open log file '{self.config.log_file_path}': {e}. Continuing without ...")
 
-        # Initialize DB manager
+        # Initialize DB writer client
         try:
-            if self.database_url:
-                self.db_manager = DatabaseManager(
-                    database_url=self.database_url,
-                    alerts_queue_size=self.config.db_alerts_queue_size,
-                    pool_size=self.config.db_pool_size,
-                    max_overflow=self.config.db_max_overflow,
-                    queue_get_timeout=self.config.db_queue_get_timeout,
-                    thread_close_timeout=self.config.db_thread_close_timeout,
-                )
-                self.db_manager.initialize(self.config.database_username, self.config.database_password)
+            if self.config.db_writer_url:
+                self.db_client = DbWriterClient(self.config.db_writer_url)
+                self.db_client.initialize(self.config.database_username, self.config.database_password)
                 if self.config.video_stream_url:
-                    self.db_manager.set_stream_url(self.config.video_stream_url)
+                    self.db_client.set_stream_url(self.config.video_stream_url)
         except Exception as e:
-            self.db_manager = None  # ensure db_manager stays None
-            logger.error(f"Failed to initialise database manager: {e}. Continuing without ...")
+            self.db_client = None  # ensure db_client stays None
+            logger.error(f"Failed to initialise DB writer client: {e}. Continuing without ...")
 
         # Initialize WebSocket manager
         try:
@@ -214,7 +165,7 @@ class NotificationsStreamWriter(mp.Process):
             logger.error(f"Failed to initialise WebSocket server: {e}. Continuing without ...")
 
         # At least one output channel must be available
-        if not (self.db_manager or self.ws_manager or self.log_file):
+        if not (self.db_client or self.ws_manager or self.log_file):
             self.error_event.set()
             logger.error(
                 "Error event set: "
@@ -233,7 +184,7 @@ class NotificationsStreamWriter(mp.Process):
             output channel is not active.
             Returns (None, None) if neither WebSocket nor database is active.
         """
-        if not (self.ws_manager or self.db_manager):
+        if not (self.ws_manager or self.db_client):
             logger.debug("No WS nor DB active; skipping frame compression.")
             return None, None
 
@@ -250,7 +201,7 @@ class NotificationsStreamWriter(mp.Process):
         jpg_as_text = base64.b64encode(raw_bytes).decode('utf-8') if self.ws_manager else None
 
         # Get raw bytes for database storage
-        compressed_bytes = raw_bytes if self.db_manager else None
+        compressed_bytes = raw_bytes if self.db_client else None
 
         logger.debug(f"Frame compressed in {(time() - compression_start) * 1000:.1f} ms")
         return jpg_as_text, compressed_bytes
@@ -322,9 +273,9 @@ class NotificationsStreamWriter(mp.Process):
         if self.ws_manager:
             self.ws_manager.queue_alert(alert_data)
 
-        # Save to database
-        if self.db_manager:
-            self.db_manager.save_alert(
+        # Save to database via sidecar
+        if self.db_client:
+            self.db_client.save_alert(
                 frame_id=meta.frame_id,
                 alert_msg=meta.alert_msg,
                 timestamp=meta.timestamp,
@@ -346,9 +297,9 @@ class NotificationsStreamWriter(mp.Process):
             except Exception as e:
                 logger.error(f"Failed to close alert log file: {e}")
 
-        # Close database (handles errors internally)
-        if self.db_manager:
-            self.db_manager.close()
+        # Close DB writer client (signals sidecar to flush and close session)
+        if self.db_client:
+            self.db_client.close()
 
         # Stop WebSocket server (handles errors internally)
         if self.ws_manager:
@@ -366,7 +317,7 @@ class NotificationsStreamWriter(mp.Process):
         last_alert_timestamp = -float('inf')
 
         ws_status = f"ws://{self.config.websocket_host}:{self.config.websocket_port}" if self.config.websocket_host else "disabled"
-        db_status = self.database_url if self.database_url else "disabled"
+        db_status = self.config.db_writer_url if self.config.db_writer_url else "disabled"
         logfile_status = self.config.log_file_path if self.config.log_file_path else "disabled"
 
         logger.info("NotificationsStreamWriter process starting.")
