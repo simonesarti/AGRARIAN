@@ -8,8 +8,8 @@ from time import time
 logger = logging.getLogger("main.danger_segmentation")
 
 
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
+IMAGENET_MEAN = [0.5, 0.5, 0.5]
+IMAGENET_STD = [0.5, 0.5, 0.5]
 
 imagenet_mean_255 = np.array(IMAGENET_MEAN, dtype=np.float32) * 255.0
 imagenet_inv_std_255 = 1 / (np.array(IMAGENET_STD, dtype=np.float32) * 255.0)
