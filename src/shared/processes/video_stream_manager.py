@@ -16,20 +16,49 @@ from src.shared.processes.constants import (
 )
 
 # ================================================================
-logger = logging.getLogger("main.video_out.stream")
+# Two dedicated loggers, one per sink, each writing to its own file so the
+# RTMP stream and the local recording can be analysed independently.
+stream_logger = logging.getLogger("main.video_out.stream")
+if not stream_logger.handlers:
+    _h = logging.FileHandler('./logs/video_out_stream.log', mode='w')
+    _h.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    stream_logger.addHandler(_h)
+    stream_logger.setLevel(logging.WARNING)
 
-if not logger.handlers:  # Avoid duplicate handlers
-    video_handler = logging.FileHandler('./logs/video_out_stream.log', mode='w')
-    video_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-    logger.addHandler(video_handler)
-    logger.setLevel(logging.WARNING)
+file_logger = logging.getLogger("main.video_out.file")
+if not file_logger.handlers:
+    _h = logging.FileHandler('./logs/video_out_file.log', mode='w')
+    _h.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    file_logger.addHandler(_h)
+    file_logger.setLevel(logging.WARNING)
 # ================================================================
 
 
-class VideoStreamManager:
+class FFmpegSink:
+    """
+    Base class for an output sink backed by a single FFmpeg subprocess fed raw
+    BGR frames over stdin.
+
+    Frames are pushed onto a bounded in-process queue (non-blocking; dropped when
+    full to preserve real-time cadence). A background thread drains the queue into
+    FFmpeg's stdin, performing the slow encode/write off the producer's path.
+
+    Subclasses supply:
+      - get_ffmpeg_command(): the FFmpeg argv (input is always rawvideo/bgr24 on stdin).
+      - reconnect (class attr): if True, the background thread re-spawns FFmpeg after a
+        failure (used for network sinks); if False, it stops after the first run
+        (used for local-file sinks, which never need to reconnect).
+
+    Lifecycle: set_frame_dims() -> start() (blocking health check) -> push_to_queue()
+    -> stop() (drains the queue, then closes FFmpeg so the container trailer is written).
+    """
+
+    reconnect: bool = False
+    name: str = "ffmpeg"
+
     def __init__(
             self,
-            mediaserver_url: str,
+            logger: logging.Logger,
             fps: int = FPS,
             queue_max_size: int = MAX_SIZE_VIDEO_STREAM,
             queue_get_timeout: float = PIPELINE_QUEUE_TIMEOUT,
@@ -38,8 +67,7 @@ class VideoStreamManager:
             startup_timeout: float = VIDEO_OUT_STREAM_STARTUP_TIMEOUT,
             shutdown_timeout: float = VIDEO_OUT_STREAM_SHUTDOWN_TIMEOUT,
     ):
-
-        self.mediaserver_url = mediaserver_url
+        self.logger = logger
         self.fps = fps
 
         # lazy-init frame dimensions based on first frame received
@@ -70,74 +98,40 @@ class VideoStreamManager:
 
     def push_to_queue(self, frame: np.ndarray) -> bool:
         """
-        Receives frames from the Worker process.
-        Returns whether the frame was enqueued or not.
+        Enqueue a frame for the background writer.
+        Returns whether the frame was enqueued or not (dropped when full).
         """
         if not self.running:
-            logger.warning("Stream Manager not running. Dropping frame.")
+            self.logger.warning(f"{self.name} not running. Dropping frame.")
             return False
 
         try:
             self.frame_queue.put_nowait(frame)
             return True
         except Full:
-            logger.warning("Stream queue full, dropping frame to maintain real-time sync.")
+            self.logger.warning(f"{self.name} queue full, dropping frame to maintain real-time sync.")
             return False
-    
-    @staticmethod
-    def log_stderr(pipe):
+
+    def log_stderr(self, pipe):
         for line in iter(pipe.readline, b''):
-            logger.debug(f"FFmpeg: {line.decode().strip()}")
+            self.logger.debug(f"FFmpeg: {line.decode().strip()}")
 
-    def get_ffmpeg_command(self):
-
-        # Optimized command for Full HD 30fps ingest
-        command = [
-            'ffmpeg',
-            '-y', 
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            '-s', f"{self.width}x{self.height}",
-            '-r', str(self.fps),
-            '-i', '-', # Input from stdin pipe
-            '-c:v', 'libx264',
-            '-preset', 'veryfast',
-            '-tune', 'zerolatency',
-            '-profile:v', 'baseline',
-            '-pix_fmt', 'yuv420p',
-            # Rate Control
-            '-b:v', '4000k',
-            '-maxrate', '4000k',
-            '-bufsize', '8000k',
-            # GOP / Keyframe Settings
-            '-g', str(2*self.fps),                    # Force keyframe every 2 seconds (at 30fps)
-            '-x264-params', f'keyint={str(2*self.fps)}:min-keyint={str(2*self.fps)}:scenecut=0',
-            # Output format
-            '-an',                         # Remove audio if not needed
-            '-f', 'flv',
-            self.mediaserver_url
-        ]
-
-        return command
+    def get_ffmpeg_command(self) -> list:
+        raise NotImplementedError
 
     def _stream_loop(self):
         """
-        Background thread that manages the FFmpeg pipe and ensures
-        graceful termination.
+        Background thread that owns the FFmpeg subprocess. Drains the frame queue
+        into FFmpeg's stdin and ensures graceful termination. If self.reconnect is
+        True, it re-spawns FFmpeg after a failure; otherwise it runs exactly once.
         """
 
         command = self.get_ffmpeg_command()
 
-        # should only stop on parent process .close() command
-        # if connection is lost, should try to reestablish it
         while self.running:
 
             try:
-                # Launch FFmpeg process
-                logger.info(
-                    f"Attempting to connect to {self.mediaserver_url}"
-                )
+                self.logger.info(f"Starting FFmpeg for {self.name}: target={self._target_repr()}")
                 self._ffmpeg_process = subprocess.Popen(
                     command,
                     stdin=subprocess.PIPE,
@@ -145,7 +139,7 @@ class VideoStreamManager:
                     bufsize=10 ** 7
                 )
 
-                # Brief sleep to allow FFmpeg to initialize/fail connection
+                # Brief sleep to allow FFmpeg to initialize/fail
                 sleep(self.ffmpeg_startup_timeout)
 
                 # startup verification
@@ -154,12 +148,12 @@ class VideoStreamManager:
                     _, stderr_data = self._ffmpeg_process.communicate()
                     self._startup_error = stderr_data.decode().split('\n')[-2] if stderr_data else "Unknown error"
                     self._start_confirmed.set()
-                    return # exit the thread on failed startup
-                
+                    return  # exit the thread on failed startup
+
                 # If we reach here, process is alive
                 self._start_confirmed.set()
-                
-                #stderr consumer
+
+                # stderr consumer
                 self.stderr_consumer = threading.Thread(
                     target=self.log_stderr,
                     args=(self._ffmpeg_process.stderr,),
@@ -171,63 +165,71 @@ class VideoStreamManager:
                 # OR there are frames left to drain.
                 while self.running or not self.frame_queue.empty():
                     try:
-                        # Use a timeout to block for a short time only
                         frame = self.frame_queue.get(timeout=self.queue_get_timeout)
-                        self._ffmpeg_process.stdin.write(frame.tobytes())
-                        self._ffmpeg_process.stdin.flush() # Ensure data transfer
+                        t0 = time()
+                        raw = frame.tobytes()
+                        self._ffmpeg_process.stdin.write(raw)
+                        self._ffmpeg_process.stdin.flush()
+                        self.logger.debug(
+                            f"[TIMING {self.name}] write={(time() - t0) * 1000:.1f}ms | "
+                            f"qdepth={self.frame_queue.qsize()}"
+                        )
                     except Empty:
-                        logger.debug("Queue empty. Continuing ...")
                         continue
                     except BrokenPipeError as e:
-                        logger.error(f"FFmpeg pipe broken: {e}")
+                        self.logger.error(f"FFmpeg pipe broken: {e}")
                         break
                     except ConnectionResetError as e:
-                        logger.error(f"Connection Reset: {e}")
+                        self.logger.error(f"Connection reset: {e}")
                         break
 
-
             except Exception as e:
-                logger.error(f"Streaming error: {e}")
+                self.logger.error(f"FFmpeg sink error: {e}")
                 self._startup_error = str(e)
                 self._start_confirmed.set()
             finally:
                 self._finalize_ffmpeg()
-                # on exit, checkj again whether the exit was due to thrad being stopped or due to error
-                # if the process should still be running (not stopped from outside), try to reconnect
-        
+
+            # Local-file sinks never reconnect; network sinks retry while running.
+            if not self.reconnect:
+                break
+
         # thread complete, set running status to False
         self.running = False
+
+    def _target_repr(self) -> str:
+        return self.name
 
     def _finalize_ffmpeg(self):
         """Internal routine to close the pipe and wait for process exit."""
         if self._ffmpeg_process:
-            logger.info("Closing FFmpeg pipe ...")
+            self.logger.info("Closing FFmpeg pipe ...")
             try:
                 if self._ffmpeg_process.stdin:
                     self._ffmpeg_process.stdin.close()
             except Exception as e:
-                logger.error(f"Error closing FFmpeg stdin: {e}")
+                self.logger.error(f"Error closing FFmpeg stdin: {e}")
             # Always wait, even if stdin.close() raised, to avoid zombie processes
             try:
                 self._ffmpeg_process.wait(timeout=self.ffmpeg_shutdown_timeout)
-                logger.info("FFmpeg process exited cleanly.")
+                self.logger.info("FFmpeg process exited cleanly.")
             except subprocess.TimeoutExpired:
-                logger.warning("FFmpeg did not exit in time. Forcing termination.")
+                self.logger.warning("FFmpeg did not exit in time. Forcing termination.")
                 self._ffmpeg_process.kill()
             except Exception as e:
-                logger.error(f"Error waiting for FFmpeg to exit: {e}")
+                self.logger.error(f"Error waiting for FFmpeg to exit: {e}")
 
     def start(self) -> bool:
         """
-        Launches the streaming thread and prepares the FFmpeg pipe.
-        Returns True if the stream started correctly, False otherwise.
+        Launches the background thread and the FFmpeg pipe.
+        Returns True if FFmpeg started correctly, False otherwise.
         """
         if self.running:
-            logger.warning("Stream Manager is already running.")
+            self.logger.warning(f"{self.name} is already running.")
             return True
 
         if self.width is None or self.height is None:
-            logger.error("Cannot start StreamManager: Frame dimensions not set.")
+            self.logger.error(f"Cannot start {self.name}: frame dimensions not set.")
             return False
 
         self._start_confirmed.clear()
@@ -236,67 +238,148 @@ class VideoStreamManager:
 
         self.stream_thread = threading.Thread(
             target=self._stream_loop,
-            name="StreamThread",
+            name=f"{self.name}Thread",
             daemon=True
         )
         self.stream_thread.start()
 
         # Wait for the thread to confirm success (blocking start)
-        # Timeout slightly longer than the sleep in the thread
         started = self._start_confirmed.wait(timeout=self.startup_timeout)
 
         if not started or self._startup_error:
             error_msg = self._startup_error if self._startup_error else "Timeout during startup"
-            logger.error(f"Streaming failed to start: {error_msg}")
+            self.logger.error(f"{self.name} failed to start: {error_msg}")
             self.stop()
             return False
 
-        logger.info(f"Streaming thread successfully initialized for target: {self.mediaserver_url}")
+        self.logger.info(f"{self.name} successfully initialized for target: {self._target_repr()}")
         return True
 
     def stop(self):
-        """Triggers graceful shutdown of the streaming thread."""
-
-        # set stopping flag
+        """Triggers graceful shutdown: drains the queue, then closes FFmpeg."""
         self.running = False
 
-        # Give it a moment (timeout) to flush the queue before the parent process exits
         if self.stream_thread:
             self.stream_thread.join(timeout=self.shutdown_timeout)
             if self.stream_thread.is_alive():
-                logger.warning("Video Streaming thread did not terminate cleanly within timeout")
+                self.logger.warning(f"{self.name} thread did not terminate cleanly within timeout")
             else:
-                logger.info("Video Streaming thread terminated successfully")
+                self.logger.info(f"{self.name} thread terminated successfully")
 
+
+class VideoStreamManager(FFmpegSink):
+    """
+    RTMP output sink: encodes with libx264 and streams to a media server via FFmpeg.
+    Reconnects automatically if the connection drops while the app keeps running.
+    """
+
+    reconnect = True
+    name = "VideoStreamManager"
+
+    def __init__(self, mediaserver_url: str, **kwargs):
+        super().__init__(logger=stream_logger, **kwargs)
+        self.mediaserver_url = mediaserver_url
+
+    def _target_repr(self) -> str:
+        return self.mediaserver_url
+
+    def get_ffmpeg_command(self):
+        # libx264 ingest for Full HD 30fps RTMP. Kept on CPU (subprocess keeps up
+        # under load) so it does not compete for NVENC sessions with the recorder.
+        return [
+            'ffmpeg',
+            '-y',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f"{self.width}x{self.height}",
+            '-r', str(self.fps),
+            '-i', '-',                      # Input from stdin pipe
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-tune', 'zerolatency',
+            '-profile:v', 'baseline',
+            '-pix_fmt', 'yuv420p',
+            # Rate Control
+            '-b:v', '4000k',
+            '-maxrate', '4000k',
+            '-bufsize', '8000k',
+            # GOP / Keyframe Settings
+            '-g', str(2 * self.fps),
+            '-x264-params', f'keyint={2 * self.fps}:min-keyint={2 * self.fps}:scenecut=0',
+            '-an',                          # no audio
+            '-f', 'flv',
+            self.mediaserver_url
+        ]
+
+
+class VideoFileWriter(FFmpegSink):
+    """
+    Local-file output sink: encodes with the GPU (h264_nvenc) and writes to a local
+    mp4. Connection-independent (no network), so it never reconnects.
+
+    NVENC moves the encode off the (saturated) CPU onto the GPU's dedicated encoder
+    ASIC, replacing the in-process cv2.VideoWriter software encode that bottlenecked
+    the recording under full-pipeline load.
+
+    Uses fragmented mp4 so the file stays playable even if the process is killed
+    before a clean shutdown.
+    """
+
+    reconnect = False
+    name = "VideoFileWriter"
+
+    def __init__(self, file_path: str, **kwargs):
+        super().__init__(logger=file_logger, **kwargs)
+        self.file_path = file_path
+
+    def _target_repr(self) -> str:
+        return self.file_path
+
+    def get_ffmpeg_command(self):
+        return [
+            'ffmpeg',
+            '-y',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f"{self.width}x{self.height}",
+            '-r', str(self.fps),
+            '-i', '-',                      # Input from stdin pipe
+            '-an',                          # no audio
+            '-c:v', 'h264_nvenc',
+            '-preset', 'p4',                # balanced speed/quality
+            '-pix_fmt', 'yuv420p',
+            '-b:v', '8M',
+            '-maxrate', '8M',
+            '-bufsize', '16M',
+            '-g', str(2 * self.fps),
+            # Fragmented mp4: file remains playable even on an abrupt kill.
+            '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
+            '-f', 'mp4',
+            self.file_path,
+        ]
 
 
 if __name__ == "__main__":
-        
+
     import cv2
     import datetime
-    from time import time, perf_counter, sleep
+    from time import perf_counter, sleep
 
     mediaserver_url = "rtmp://0.0.0.0:1935/annot"
-    fps=30
+    fps = 30
     duration_seconds = 60
 
     def make_frame():
-        # black frame
         frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
-
-        # 3. Define text properties
         font = cv2.FONT_HERSHEY_SIMPLEX
-        org = (50, 100)  # Coordinates (X, Y) where text starts
+        org = (50, 100)
         fontScale = 2
-        color = (255, 255, 255)  # White in BGR
+        color = (255, 255, 255)
         thickness = 3
-
-        # put current datetime string oin frame
         current_time = datetime.datetime.now().isoformat()
         cv2.putText(frame, current_time, org, font, fontScale, color, thickness, cv2.LINE_AA)
-
         return frame
-    
+
     stream_manager = VideoStreamManager(
         mediaserver_url=mediaserver_url,
         fps=fps,
@@ -304,7 +387,7 @@ if __name__ == "__main__":
     stream_manager.set_frame_dims(width=1920, height=1080)
     stream_manager.start()
 
-    next = perf_counter() + 1/fps
+    next = perf_counter() + 1 / fps
     stop_time = next + duration_seconds
 
     while True:
@@ -316,7 +399,7 @@ if __name__ == "__main__":
 
         perf = perf_counter()
         if perf < next:
-            sleep(next-perf)
-        next += 1/fps
+            sleep(next - perf)
+        next += 1 / fps
 
     stream_manager.stop()
