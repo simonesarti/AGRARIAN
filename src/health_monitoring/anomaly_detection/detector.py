@@ -140,11 +140,29 @@ class AnomalyDetector:
         social_scores: dict[int, float] = {}
 
         # Only complete sequences are scored (both AE and social).
-        # Scores are smoothed
-        for tid, tf in track_features.items():
-            if len(tf.feature_sequence) < self._ae_seq_len:
-                continue
-            ae_z = self._ae_z_score(tf) if self.cfg.use_ae else 0.0
+        eligible_ids = [
+            tid for tid, tf in track_features.items()
+            if len(tf.feature_sequence) >= self._ae_seq_len
+        ]
+
+        # Batch AE scoring: single H2D copy + one forward pass for all eligible tracks,
+        # instead of N separate GPU round-trips (each with kernel-launch and D2H sync overhead).
+        ae_z_map: dict[int, float] = {}
+        if eligible_ids and self.cfg.use_ae:
+            seqs = np.stack([
+                self._normalize(track_features[tid].feature_sequence)
+                for tid in eligible_ids
+            ])
+            batch = torch.from_numpy(seqs).float().to(self.device)
+            errors = self.ae.reconstruction_error(batch).cpu().numpy()  # (N,)
+            ae_z_map = {
+                tid: (float(errors[i]) - self._ae_mean) / self._ae_std
+                for i, tid in enumerate(eligible_ids)
+            }
+
+        for tid in eligible_ids:
+            tf = track_features[tid]
+            ae_z = ae_z_map.get(tid, 0.0)
             soc = self.social.score(self._normalize(tf.feature_sequence[-1])) if self.cfg.use_social else 0.0
             self._ae_history[tid].append(ae_z)
             self._social_history[tid].append(soc)
@@ -207,11 +225,6 @@ class AnomalyDetector:
         if self._feat_mean is None:
             return features
         return (features - self._feat_mean) / self._feat_std
-
-    def _ae_z_score(self, tf: TrackFeatures) -> float:
-        seq = torch.from_numpy(self._normalize(tf.feature_sequence)).unsqueeze(0).float().to(self.device)
-        error = float(self.ae.reconstruction_error(seq).item())
-        return (error - self._ae_mean) / self._ae_std
 
     def _open_or_extend_event(self, tid, frame_idx, ts, ae_score, social_score, ae_flagged, soc_flagged):
         if self._active_events.get(tid) is None:
