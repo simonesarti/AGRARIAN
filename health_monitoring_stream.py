@@ -25,8 +25,6 @@ from src.shared.processes.constants import (
     LOCAL_OUTPUT_DIR,
     VIDEO_STREAM_READER_PROCESSING_SHAPE,
     VIDEO_STREAM_READER_ORIGINAL_SHAPE,
-    MAX_SIZE_FRAME_READER_OUT,
-    MAX_SIZE_TRACKING_IN,
     MAX_SIZE_NOTIFICATIONS_STREAM,
     MAX_SIZE_VIDEO_STREAM,
     FPS,
@@ -120,12 +118,12 @@ def main():
     # _frame_skip + 4 = keyframe1 + passthorugh + keyframe2 + headroom of 2 
     # for backpressure relieve, like for other processes
 
-    reader_to_tracking_buf       = FrameBuffer(_3ch, n_slots=MAX_SIZE_FRAME_READER_OUT)
-    tracking_to_anomaly_buf      = FrameBuffer(_3ch, n_slots=MAX_SIZE_TRACKING_IN)
+    reader_to_tracking_buf       = FrameBuffer(_3ch, n_slots=2*_frame_skip + 3)
+    tracking_to_anomaly_buf      = FrameBuffer(_3ch, n_slots=_frame_skip + 4)
     anomaly_to_interpolator_buf    = FrameBuffer(_3ch, n_slots=_frame_skip + 4)
     interpolator_to_annotation_buf = FrameBuffer(_3ch, n_slots=_frame_skip + 4)
     annotation_to_alert_buf      = FrameBuffer(_ann, n_slots=MAX_SIZE_NOTIFICATIONS_STREAM)
-    annotation_to_video_buf      = FrameBuffer(_ann, n_slots=MAX_SIZE_VIDEO_STREAM)
+    annotation_to_video_buf      = FrameBuffer(_ann, n_slots=_frame_skip + 4)
 
     frame_buffers = [
         reader_to_tracking_buf,
@@ -138,12 +136,12 @@ def main():
 
     # ============== METADATA QUEUES ==============
 
-    reader_to_tracking_q         = mp.Queue(maxsize=MAX_SIZE_FRAME_READER_OUT)
-    tracking_to_anomaly_q        = mp.Queue(maxsize=MAX_SIZE_TRACKING_IN)
+    reader_to_tracking_q         = mp.Queue(maxsize=2*_frame_skip + 3)
+    tracking_to_anomaly_q        = mp.Queue(maxsize=_frame_skip + 4)
     anomaly_to_interpolator_q    = mp.Queue(maxsize=_frame_skip + 4)
     interpolator_to_annotation_q = mp.Queue(maxsize=_frame_skip + 4)
     annotation_to_alert_q        = mp.Queue(maxsize=MAX_SIZE_NOTIFICATIONS_STREAM)
-    annotation_to_video_q        = mp.Queue(maxsize=MAX_SIZE_VIDEO_STREAM)
+    annotation_to_video_q        = mp.Queue(maxsize=_frame_skip + 4)
     video_to_persistence_q       = mp.Queue(maxsize=1)
 
     # ============== BUILD PROCESS CONFIGS ==============
@@ -410,6 +408,15 @@ def main():
             p.terminate()
         p.join()
         logger.info(f"{p.name} joined.")
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            logger.info("CUDA context flushed.")
+    except Exception as e:
+        logger.warning(f"CUDA cleanup failed (non-fatal): {e}")
 
     for buf in frame_buffers:
         buf.unlink()
