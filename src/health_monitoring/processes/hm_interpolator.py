@@ -104,13 +104,13 @@ class HMVideoInterpolatorProcess(mp.Process):
         logger.info("HMVideoInterpolatorProcess started.")
         poison_pill_received = False
 
-        _k0: Optional[_GroupFrame] = None
+        _k0_meta: Optional[HMAnomalySlotMetadata] = None  # metadata only; frame emitted immediately
         _pending: list[_GroupFrame] = []
 
         try:
 
             while not self.error_event.is_set():
-                
+
                 # ----------------------- FETCH ------------------------------------
                 try:
                     meta = self.input_meta_queue.get(timeout=self.config.queue_timeout)
@@ -130,19 +130,23 @@ class HMVideoInterpolatorProcess(mp.Process):
                 # Zero-copy view; slot is held until _emit releases it after writing
                 # to the output buffer — same pattern as all other pipeline workers.
                 frame = self.input_frame_buffer.view(meta.slot_index)
-                gf = _GroupFrame(meta=meta, frame=frame)
 
                 if meta.is_keyframe:
-                    if _k0 is not None:
-                        # K1 has arrived — interpolate and flush the accumulated group.
-                        self._flush_group(_k0, _pending, gf)
-                    _k0 = gf
+                    if _k0_meta is not None:
+                        # K1 has arrived — interpolate and flush the pending passthroughs.
+                        self._flush_pending(_pending, _k0_meta, meta)
+                    # Emit this keyframe immediately: it carries its own annotations and
+                    # has no dependency on K1. Freeing its slot now rather than holding it
+                    # until K1 arrives keeps one extra slot available for incoming frames.
+                    self._emit(frame, meta.slot_index, meta)
+                    _k0_meta = meta
                     _pending = []
                 else:
-                    if _k0 is None:
+                    if _k0_meta is None:
                         logger.warning(f"Passthrough frame {meta.frame_id} received before any keyframe. Dropping.")
+                        self.input_frame_buffer.release(meta.slot_index)
                         continue
-                    _pending.append(gf)
+                    _pending.append(_GroupFrame(meta=meta, frame=frame))
 
             if not self.error_event.is_set():
                 try:
@@ -178,26 +182,25 @@ class HMVideoInterpolatorProcess(mp.Process):
     # Flush helpers
     # ------------------------------------------------------------------
 
-    def _flush_group(
+    def _flush_pending(
             self,
-            k0: _GroupFrame,
             pending: list[_GroupFrame],
-            k1: _GroupFrame,
+            k0_meta: HMAnomalySlotMetadata,
+            k1_meta: HMAnomalySlotMetadata,
     ) -> None:
-        """Emit K0 with full annotations, then interpolated Pi frames and emit them."""
-        self._emit(k0.frame, k0.meta.slot_index, k0.meta)
-
+        """Emit interpolated passthrough frames for a completed group.
+        K0 has already been emitted immediately on receipt; only P1..Pn are emitted here."""
         if not pending:
             return
 
         n = len(pending)
-        k0_by_id = {t.track_id: t for t in k0.meta.tracks}
-        k1_by_id = {t.track_id: t for t in k1.meta.tracks}
+        k0_by_id = {t.track_id: t for t in k0_meta.tracks}
+        k1_by_id = {t.track_id: t for t in k1_meta.tracks}
         common_ids = set(k0_by_id) & set(k1_by_id)
 
         # Score fields are identical for every pending frame (K0 values filtered to common tracks)
         # compute once and reuse.
-        r = k0.meta.anomaly_result
+        r = k0_meta.anomaly_result
         filtered_ae_scores      = {tid: v for tid, v in r.ae_scores.items()     if tid in common_ids}
         filtered_social_scores  = {tid: v for tid, v in r.social_scores.items() if tid in common_ids}
         filtered_ongoing_events = [e   for e   in r.ongoing_events              if e.track_id in common_ids]
