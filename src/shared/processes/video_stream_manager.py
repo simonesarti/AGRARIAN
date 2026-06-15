@@ -294,15 +294,16 @@ class VideoStreamManager(FFmpegSink):
             '-s', f"{self.width}x{self.height}",
             '-r', str(self.fps),
             '-i', '-',                      # Input from stdin pipe
+            '-vf', f'realtime,fps=fps={self.fps}',
             '-c:v', 'libx264',
             '-preset', 'veryfast',
             '-tune', 'zerolatency',
             '-profile:v', 'baseline',
             '-pix_fmt', 'yuv420p',
             # Rate Control
-            '-b:v', '4000k',
-            '-maxrate', '4000k',
-            '-bufsize', '8000k',
+            '-b:v', '6M',
+            '-maxrate', '6M',
+            '-bufsize', '12M',
             # GOP / Keyframe Settings
             '-g', str(2 * self.fps),
             '-x264-params', f'keyint={2 * self.fps}:min-keyint={2 * self.fps}:scenecut=0',
