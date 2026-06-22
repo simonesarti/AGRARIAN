@@ -60,5 +60,8 @@ engine/
 !main.py
 !danger_detection_stream.py
 !health_monitoring_stream.py
+!annotate_videos.py
+!onnx_seg_session.py
+!export_segmentation_trt.py
 # Shell scripts
 *.sh
