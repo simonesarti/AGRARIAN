@@ -48,10 +48,10 @@ HM_ANOMALY_USE_AE = True
 HM_ANOMALY_USE_SOCIAL = True
 HM_ANOMALY_AE_THRESHOLD = 2.75
 HM_ANOMALY_SOCIAL_THRESHOLD = 5.0
-HM_ANOMALY_SMOOTHING_WINDOW = 56
-HM_ANOMALY_MIN_ANOMALY_DURATION = 90
-HM_ANOMALY_SOCIAL_EMA_ALPHA = 0.007
-HM_ANOMALY_SOCIAL_MIN_UPDATES = 375
+HM_ANOMALY_SMOOTHING_WINDOW = 9
+HM_ANOMALY_MIN_ANOMALY_DURATION = 15
+HM_ANOMALY_SOCIAL_EMA_ALPHA = 0.042
+HM_ANOMALY_SOCIAL_MIN_UPDATES = 63
 HM_ANOMALY_SOCIAL_MIN_HERD = 5
 HM_ANOMALY_REQUIRE_BOTH = False
 
@@ -59,7 +59,7 @@ HM_ANOMALY_REQUIRE_BOTH = False
 
 # https://sdk-forum.dji.net/hc/en-us/articles/12325496609689-What-is-the-custom-camera-parameters-for-Mavic-3-Enterprise-series-and-Mavic-3M
 
-# positive float: true focal lenght of the camera in mm
+# positive float: true focal length of the camera in mm
 DRONE_TRUE_FOCAL_LEN_MM = 12.29
 
 # positive float: width of the camera sensor in millimeters
