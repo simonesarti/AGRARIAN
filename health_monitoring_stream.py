@@ -114,16 +114,16 @@ def main():
     # ============== FRAME BUFFERS ==============
     # n_slots matches the corresponding metadata queue maxsize: each queue entry
     # holds exactly one slot index, so queue capacity == max in-flight frames.
+    # 2*_frame_skip + 3: holds two full groups (K + frame_skip passthrough frames each)
+    # plus one slot of headroom to avoid stalling while the interpolator flushes a burst.
+    _slot_count = 2 * _frame_skip + 3
 
-    # _frame_skip + 4 = keyframe1 + passthorugh + keyframe2 + headroom of 2 
-    # for backpressure relieve, like for other processes
-
-    reader_to_tracking_buf       = FrameBuffer(_3ch, n_slots=2*_frame_skip + 3)
-    tracking_to_anomaly_buf      = FrameBuffer(_3ch, n_slots=_frame_skip + 4)
-    anomaly_to_interpolator_buf    = FrameBuffer(_3ch, n_slots=_frame_skip + 4)
-    interpolator_to_annotation_buf = FrameBuffer(_3ch, n_slots=_frame_skip + 4)
-    annotation_to_alert_buf      = FrameBuffer(_ann, n_slots=MAX_SIZE_NOTIFICATIONS_STREAM)
-    annotation_to_video_buf      = FrameBuffer(_ann, n_slots=_frame_skip + 4)
+    reader_to_tracking_buf         = FrameBuffer(_3ch, n_slots=_slot_count)
+    tracking_to_anomaly_buf        = FrameBuffer(_3ch, n_slots=_slot_count)
+    anomaly_to_interpolator_buf    = FrameBuffer(_3ch, n_slots=_slot_count)
+    interpolator_to_annotation_buf = FrameBuffer(_3ch, n_slots=_slot_count)
+    annotation_to_alert_buf        = FrameBuffer(_ann, n_slots=MAX_SIZE_NOTIFICATIONS_STREAM)
+    annotation_to_video_buf        = FrameBuffer(_ann, n_slots=_slot_count)
 
     frame_buffers = [
         reader_to_tracking_buf,
@@ -136,12 +136,12 @@ def main():
 
     # ============== METADATA QUEUES ==============
 
-    reader_to_tracking_q         = mp.Queue(maxsize=2*_frame_skip + 3)
-    tracking_to_anomaly_q        = mp.Queue(maxsize=_frame_skip + 4)
-    anomaly_to_interpolator_q    = mp.Queue(maxsize=_frame_skip + 4)
-    interpolator_to_annotation_q = mp.Queue(maxsize=_frame_skip + 4)
+    reader_to_tracking_q         = mp.Queue(maxsize=_slot_count)
+    tracking_to_anomaly_q        = mp.Queue(maxsize=_slot_count)
+    anomaly_to_interpolator_q    = mp.Queue(maxsize=_slot_count)
+    interpolator_to_annotation_q = mp.Queue(maxsize=_slot_count)
     annotation_to_alert_q        = mp.Queue(maxsize=MAX_SIZE_NOTIFICATIONS_STREAM)
-    annotation_to_video_q        = mp.Queue(maxsize=_frame_skip + 4)
+    annotation_to_video_q        = mp.Queue(maxsize=_slot_count)
     video_to_persistence_q       = mp.Queue(maxsize=1)
 
     # ============== BUILD PROCESS CONFIGS ==============
