@@ -113,9 +113,12 @@ class FrameBuffer:
 
     def unlink(self) -> None:
         """Destroy the shared memory blocks. Call once in the parent after all processes finish."""
+        self.close()
         for name in self._names:
             try:
-                shared_memory.SharedMemory(name=name, create=False).unlink()
+                shm = shared_memory.SharedMemory(name=name, create=False)
+                shm.unlink()
+                shm.close()
             except FileNotFoundError:
                 pass
 
@@ -270,10 +273,13 @@ class MultiFrameBuffer:
 
     def unlink(self) -> None:
         """Destroy the shared memory blocks. Call once in the parent after all processes finish."""
+        self.close()
         for names in (self._primary_names, self._secondary_names):
             for name in names:
                 try:
-                    shared_memory.SharedMemory(name=name, create=False).unlink()
+                    shm = shared_memory.SharedMemory(name=name, create=False)
+                    shm.unlink()
+                    shm.close()
                 except FileNotFoundError:
                     pass
 

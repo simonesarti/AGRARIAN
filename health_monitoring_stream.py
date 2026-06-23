@@ -352,6 +352,7 @@ def main():
     except Exception as e:
         logger.critical(f"Failed to instantiate one of the processes: {e}", exc_info=True)
         for buf in frame_buffers:
+            buf.close()
             buf.unlink()
         return
 
@@ -419,6 +420,7 @@ def main():
         logger.warning(f"CUDA cleanup failed (non-fatal): {e}")
 
     for buf in frame_buffers:
+        buf.close()
         buf.unlink()
     logger.info("Shared memory freed. Pipeline shut down.")
 
