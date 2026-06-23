@@ -34,6 +34,7 @@ class AnomalyEvent:
     max_social_score: float
     mean_social_score: float
     triggered_by: str   # "ae" | "social" | "both"
+    keyframe_count: int = 1  # number of scored keyframes this event has been active for
 
     @property
     def duration_ms(self) -> float:
@@ -184,7 +185,7 @@ class AnomalyDetector:
         confirmed: list[int] = []
         for tid in anomalous:
             ev = self._active_events.get(tid)
-            if ev is not None and ev.end_frame - ev.start_frame + 1 >= self.cfg.min_anomaly_duration:
+            if ev is not None and ev.keyframe_count >= self.cfg.min_anomaly_duration:
                 confirmed.append(tid)
 
         ae_elevated_set  = {tid for tid in ae_scores if self.cfg.use_ae and ae_scores[tid] > self.cfg.ae_threshold}
@@ -240,12 +241,14 @@ class AnomalyDetector:
                 max_social_score=social_score,
                 mean_social_score=social_score,
                 triggered_by=triggered_by,
+                keyframe_count=1,
             )
         else:
             ev = self._active_events[tid]
             assert ev is not None
             ev.end_frame = frame_idx
             ev.end_time_ms = ts
+            ev.keyframe_count += 1
             ev.max_ae_score = max(ev.max_ae_score, ae_score)
             ev.max_social_score = max(ev.max_social_score, social_score)
             n = ev.end_frame - ev.start_frame + 1
@@ -261,5 +264,5 @@ class AnomalyDetector:
         ev = self._active_events.pop(tid, None)
         if ev is None:
             return
-        if ev.end_frame - ev.start_frame + 1 >= self.cfg.min_anomaly_duration:
+        if ev.keyframe_count >= self.cfg.min_anomaly_duration:
             self._completed_events.append(ev)

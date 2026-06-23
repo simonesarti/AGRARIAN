@@ -45,15 +45,14 @@ class FeatureExtractor:
         self.cfg = cfg
         self._fw = frame_w
         self._fh = frame_h
-        # track_id → deque of (frame_idx, center_px, feature_vec)
-        self._history: dict[int, deque[tuple[int, np.ndarray, np.ndarray]]] = {}
+        # track_id → deque of (center_px, feature_vec)
+        self._history: dict[int, deque[tuple[np.ndarray, np.ndarray]]] = {}
         self._missed: dict[int, int] = {}
 
     def update(
         self,
         tracks: list[TrackState],
         H_prev_to_curr: Optional[np.ndarray],
-        frame_idx: int,
     ) -> dict[int, TrackFeatures]:
         """
         Compute features for all active tracks.
@@ -74,8 +73,8 @@ class FeatureExtractor:
                 self._missed.pop(tid, None)
             else:
                 self._missed[tid] = missed
-                _, last_center, last_feat = self._history[tid][-1]
-                self._history[tid].append((frame_idx, last_center, last_feat))
+                last_center, last_feat = self._history[tid][-1]
+                self._history[tid].append((last_center, last_feat))
 
         # Reset the missed counter for tracks that are visible again
         for tid in active_ids:
@@ -84,7 +83,7 @@ class FeatureExtractor:
         # if there are no active tracks, return only interpolated ones (if any)
         if not tracks:
             return {
-                tid: TrackFeatures(track_id=tid, feature_sequence=np.stack([s[2] for s in hist], axis=0))
+                tid: TrackFeatures(track_id=tid, feature_sequence=np.stack([s[1] for s in hist], axis=0))
                 for tid, hist in self._history.items()
             }
 
@@ -136,19 +135,19 @@ class FeatureExtractor:
         for i, t in enumerate(tracks):
             if t.track_id not in self._history:
                 self._history[t.track_id] = deque(maxlen=self.cfg.sequence_length)
-            self._history[t.track_id].append((frame_idx, centers[i], feats[i]))
+            self._history[t.track_id].append((centers[i], feats[i]))
             seq = self._history[t.track_id]
             result[t.track_id] = TrackFeatures(
                 track_id=t.track_id,
-                feature_sequence=np.stack([s[2] for s in seq], axis=0),
+                feature_sequence=np.stack([s[1] for s in seq], axis=0),
             )
 
         # Include in history interpolated tracks (currently absent but within interp_max_age)
         for tid, hist in self._history.items():
             if tid not in active_ids:
                 result[tid] = TrackFeatures(
-                    track_id=tid, 
-                    feature_sequence=np.stack([s[2] for s in hist], axis=0),
+                    track_id=tid,
+                    feature_sequence=np.stack([s[1] for s in hist], axis=0),
                 )
 
         return result
@@ -156,7 +155,7 @@ class FeatureExtractor:
     def _world_velocity(self, track_id: int, center: np.ndarray, H: Optional[np.ndarray]) -> Optional[np.ndarray]:
         if track_id not in self._history or len(self._history[track_id]) == 0:
             return None
-        _, prev_center, _ = self._history[track_id][-1]
+        prev_center, _ = self._history[track_id][-1]
         
         # displacement = current_pos_in_current_ref_system - old_pos_in_current_ref_system
         if H is not None:

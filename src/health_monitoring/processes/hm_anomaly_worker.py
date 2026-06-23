@@ -145,7 +145,6 @@ class HMAnomalyDetectionWorker(mp.Process):
                     tf_map = extractor.update(
                         tracks=meta.tracks,
                         H_prev_to_curr=meta.H,
-                        frame_idx=meta.frame_id,
                     )
                     # Anomaly scoring (timestamp in ms for event logging)
                     anomaly_result = detector.score_tracks(
