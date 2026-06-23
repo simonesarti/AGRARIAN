@@ -296,7 +296,7 @@ class VideoStreamManager(FFmpegSink):
             '-i', '-',                      # Input from stdin pipe
             '-vf', f'realtime,fps=fps={self.fps}',
             '-c:v', 'libx264',
-            '-preset', 'veryfast',
+            '-preset', 'ultrafast',
             '-tune', 'zerolatency',
             '-profile:v', 'baseline',
             '-pix_fmt', 'yuv420p',
