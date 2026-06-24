@@ -166,6 +166,9 @@ services:
       context: .
       dockerfile: app/Dockerfile
     env_file: app/.env
+    environment:
+      WS_SERVER_URL: http://ws-server:8000
+      DB_WRITER_URL: http://db-writer:8000
     networks: [session-net]
     shm_size: "256m"
     depends_on:

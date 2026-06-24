@@ -49,18 +49,18 @@ class NotificationsStreamWriterConfig(BaseModel):
     # Queue timeouts
     queue_get_timeout: PositiveFloat = ALERTS_QUEUE_GET_TIMEOUT
 
-    # ------- File logger (log_file_path=None to disable) --------
-    log_file_path: Optional[str] = "alerts.log"
+    # ------- File logger --------
+    log_file_path: str = "alerts.log"
 
-    # ------- WebSocket server sidecar (ws_server_url=None to disable) --------
-    # URL of the ws-server sidecar (e.g. http://ws-server:8000).
-    ws_server_url: Optional[str] = None
+    # ------- WebSocket server sidecar --------
+    # URL of the ws-server sidecar HTTP API (e.g. http://ws-server:8000).
+    ws_server_url: str
 
-    # ------- Database connection (db_writer_url=None to disable) --------
-    # URL of the db-writer sidecar (e.g. http://db-writer:8000).
+    # ------- Database writer sidecar --------
+    # URL of the db-writer sidecar HTTP API (e.g. http://db-writer:8000).
     # The sidecar holds the privileged DB credentials; the app supplies only
     # the end-user identity (database_username / database_password).
-    db_writer_url: Optional[str] = None
+    db_writer_url: str
     database_username: str = ""
     database_password: str = ""
     # Video stream URL written to the flights table so the UI can fetch it from the DB.
@@ -120,74 +120,31 @@ class NotificationsStreamWriter(mp.Process):
     def _setup_managers(self):
         """Initialise file, WebSocket, and database output channels inside the child process."""
 
-        # Initialize log file manager
-        try:
-            if self.config.log_file_path:
-                self.log_file = open(self.config.log_file_path, 'a', buffering=1, encoding='utf-8')
-        except Exception as e:
-            self.log_file = None    # ensure log_file stays None
-            logger.error(f"Failed to open log file '{self.config.log_file_path}': {e}. Continuing without ...")
+        # Initialize log file manager (required — exception propagates to run())
+        self.log_file = open(self.config.log_file_path, 'a', buffering=1, encoding='utf-8')
 
-        # Initialize DB writer client
-        try:
-            if self.config.db_writer_url:
-                self.db_client = DbWriterClient(self.config.db_writer_url)
-                self.db_client.initialize(self.config.database_username, self.config.database_password)
-                if self.config.video_stream_url:
-                    self.db_client.set_stream_url(self.config.video_stream_url)
-        except Exception as e:
-            self.db_client = None  # ensure db_client stays None
-            logger.error(f"Failed to initialise DB writer client: {e}. Continuing without ...")
+        # Initialize DB writer client (required — exception propagates to run())
+        self.db_client = DbWriterClient(self.config.db_writer_url)
+        self.db_client.initialize(self.config.database_username, self.config.database_password)
+        if self.config.video_stream_url:
+            self.db_client.set_stream_url(self.config.video_stream_url)
 
-        # Initialize WebSocket server client
-        try:
-            if self.config.ws_server_url:
-                self.ws_client = WsServerClient(self.config.ws_server_url)
-        except Exception as e:
-            self.ws_client = None  # ensure ws_client stays None
-            logger.error(f"Failed to initialise WS server client: {e}. Continuing without ...")
+        # Initialize WebSocket server client (required — exception propagates to run())
+        self.ws_client = WsServerClient(self.config.ws_server_url)
 
-        # At least one output channel must be available
-        if not (self.db_client or self.ws_client or self.log_file):
-            self.error_event.set()
-            logger.error(
-                "Error event set: "
-                "no output channel (file, WebSocket, database) could be initialised. "
-                "Shutting down the application ..."
-            )
-            raise RuntimeError("No output managers available")
-
-    def _compress_frame(self, frame: np.ndarray) -> tuple[Optional[str], Optional[bytes]]:
-        """
-        Compress frame to JPEG.
-
-        Returns:
-            (base64_encoded_string, raw_bytes): base64 string for WebSocket transmission,
-            raw bytes for database storage. Either value is None if the corresponding
-            output channel is not active.
-            Returns (None, None) if neither WebSocket nor database is active.
-        """
-        if not (self.ws_client or self.db_client):
-            logger.debug("No WS nor DB active; skipping frame compression.")
-            return None, None
-
+    def _compress_frame(self, frame: np.ndarray) -> tuple[str, bytes]:
+        """Compress frame to JPEG, returning (base64 string for WS, raw bytes for DB)."""
         compression_start = time()
 
-        # Encode as JPEG
         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), self.config.alerts_jpeg_quality]
         _, buffer = cv2.imencode('.jpg', frame, encode_param)
 
         # tobytes() once; reused for both WebSocket (base64) and database (raw bytes)
         raw_bytes = buffer.tobytes()
-
-        # Convert to base64 for WebSocket transmission
-        jpg_as_text = base64.b64encode(raw_bytes).decode('utf-8') if self.ws_client else None
-
-        # Get raw bytes for database storage
-        compressed_bytes = raw_bytes if self.db_client else None
+        jpg_as_text = base64.b64encode(raw_bytes).decode('utf-8')
 
         logger.debug(f"Frame compressed in {(time() - compression_start) * 1000:.1f} ms")
-        return jpg_as_text, compressed_bytes
+        return jpg_as_text, raw_bytes
 
     def _log_alert(self, frame_id: int, alert_msg: str, timestamp: float, datetime_str: str):
         """
@@ -199,8 +156,6 @@ class NotificationsStreamWriter(mp.Process):
             timestamp: Alert timestamp
             datetime_str: ISO-formatted alert datetime
         """
-        if not self.log_file:
-            return
         try:
             log_entry = {
                 'frame_id': frame_id,
@@ -244,8 +199,7 @@ class NotificationsStreamWriter(mp.Process):
         }
 
         # Log alert to file using the persistent handle
-        if self.log_file:
-            self._log_alert(
+        self._log_alert(
                 frame_id=meta.frame_id,
                 alert_msg=meta.alert_msg,
                 timestamp=meta.timestamp,
@@ -253,19 +207,22 @@ class NotificationsStreamWriter(mp.Process):
             )
 
         # Send to WebSocket server sidecar for broadcast
-        if self.ws_client:
-            self.ws_client.send_alert(alert_data)
+        self.ws_client.send_alert(alert_data)
 
         # Save to database via sidecar
-        if self.db_client:
-            self.db_client.save_alert(
-                frame_id=meta.frame_id,
-                alert_msg=meta.alert_msg,
-                timestamp=meta.timestamp,
-                datetime=alert_datetime,
-                image_data=compressed_bytes,
-                image_width=width,
-                image_height=height,
+        saved = self.db_client.save_alert(
+            frame_id=meta.frame_id,
+            alert_msg=meta.alert_msg,
+            timestamp=meta.timestamp,
+            datetime=alert_datetime,
+            image_data=compressed_bytes,
+            image_width=width,
+            image_height=height,
+        )
+        if not saved:
+            logger.warning(
+                f"Alert for frame {meta.frame_id} was not persisted to DB "
+                f"(worker unavailable or queue full)"
             )
 
     def _cleanup(self):
@@ -299,14 +256,10 @@ class NotificationsStreamWriter(mp.Process):
         # Initialised to -inf so the very first alert is always dispatched regardless of cooldown.
         last_alert_timestamp = -float('inf')
 
-        ws_status = self.config.ws_server_url if self.config.ws_server_url else "disabled"
-        db_status = self.config.db_writer_url if self.config.db_writer_url else "disabled"
-        logfile_status = self.config.log_file_path if self.config.log_file_path else "disabled"
-
         logger.info("NotificationsStreamWriter process starting.")
-        logger.info(f"  WebSocket     : {ws_status}")
-        logger.info(f"  Database      : {db_status}")
-        logger.info(f"  Log file      : {logfile_status}")
+        logger.info(f"  WebSocket     : {self.config.ws_server_url}")
+        logger.info(f"  Database      : {self.config.db_writer_url}")
+        logger.info(f"  Log file      : {self.config.log_file_path}")
         logger.info(f"  JPEG quality  : {self.config.alerts_jpeg_quality}")
         logger.info(f"  Alert cooldown: {self.config.alerts_cooldown_s} s")
 

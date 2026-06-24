@@ -130,21 +130,19 @@ class AppSettings(BaseSettings):
     alerts_jpeg_compression_quality: int = Field(default=ALERTS_JPEG_COMPRESSION_QUALITY, ge=0, le=100)
 
     # ------------------------------------------------------------------ #
-    # WEBSOCKET WRITER SIDECAR
+    # WEBSOCKET SERVER SIDECAR
     # ------------------------------------------------------------------ #
 
-    # URL of the ws-server sidecar (e.g. http://ws-server:8000).
-    # Leave empty/unset to disable WebSocket output.
-    ws_server_url: Optional[str] = None
+    # URL of the ws-server sidecar HTTP API (e.g. http://ws-server:8000).
+    ws_server_url: str
 
     # ------------------------------------------------------------------ #
     # DATABASE
     # ------------------------------------------------------------------ #
 
-    # URL of the db-writer sidecar (e.g. http://db-writer:8000).
-    # Leave empty/unset to disable database output.
+    # URL of the db-writer sidecar HTTP API (e.g. http://db-writer:8000).
     # The sidecar holds the privileged DB credentials; only end-user identity goes here.
-    db_writer_url:  Optional[str]       = None
+    db_writer_url: str
     db_username:    str                 = ""
     db_password:    SecretStr           = ""
 

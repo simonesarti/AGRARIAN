@@ -117,7 +117,7 @@ def save_alert(flight_id: int, req: AlertRequest):
 
     image_bytes = base64.b64decode(req.image_data) if req.image_data else None
 
-    manager.save_alert(
+    queued = manager.save_alert(
         frame_id=req.frame_id,
         alert_msg=req.alert_msg,
         timestamp=req.timestamp,
@@ -126,6 +126,8 @@ def save_alert(flight_id: int, req: AlertRequest):
         image_width=req.image_width,
         image_height=req.image_height,
     )
+    if not queued:
+        raise HTTPException(status_code=503, detail="Alert queue full — DB may be unavailable")
     return {"queued": True}
 
 
