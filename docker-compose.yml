@@ -6,7 +6,8 @@
 # Traefik dashboard (development only):  http://localhost:8080
 # HLS playback (via Traefik):            http://localhost/hls/annot/index.m3u8
 # WebRTC play (via Traefik):             http://localhost/webrtc/annot/whep
-# WebSocket alerts (via Traefik):        ws://localhost/ws
+# WebSocket alerts (via Traefik, WS):    ws://localhost/ws
+# WebSocket alerts (via Traefik, WSS):   wss://<domain>/ws
 # WebSocket alerts (direct):            ws://localhost:8765
 
 name: agrarian
@@ -19,6 +20,7 @@ volumes:
   mosquitto-data:
   mosquitto-log:
   postgres-data:
+  letsencrypt:
 
 services:
 
@@ -29,17 +31,24 @@ services:
     networks: [session-net]
     ports:
       - "80:80"
+      - "443:443"
       - "8080:8080"     # dashboard — disable in production
     command:
       - "--providers.docker=true"
       - "--providers.docker.network=session-net"
       - "--providers.docker.exposedbydefault=false"
       - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
       - "--api.dashboard=true"
       - "--api.insecure=true"   # no auth — development only
       - "--log.level=WARN"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt:/letsencrypt
 
   # ── Video server ──────────────────────────────────────────────────────────────
   mediamtx:
@@ -134,10 +143,17 @@ services:
       WS_PORT: ${WS_PORT:-8765}
     labels:
       - "traefik.enable=true"
+      - "traefik.http.services.ws-svc.loadbalancer.server.port=${WS_PORT:-8765}"
+      # WS  — plain WebSocket over HTTP
       - "traefik.http.routers.ws.rule=PathPrefix(`/ws`)"
       - "traefik.http.routers.ws.entrypoints=web"
       - "traefik.http.routers.ws.service=ws-svc"
-      - "traefik.http.services.ws-svc.loadbalancer.server.port=${WS_PORT:-8765}"
+      # WSS — WebSocket over TLS (requires ACME_EMAIL and a public domain in .env)
+      - "traefik.http.routers.wss.rule=PathPrefix(`/ws`)"
+      - "traefik.http.routers.wss.entrypoints=websecure"
+      - "traefik.http.routers.wss.service=ws-svc"
+      - "traefik.http.routers.wss.tls=true"
+      - "traefik.http.routers.wss.tls.certresolver=letsencrypt"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 5s
