@@ -38,7 +38,7 @@ import numpy as np
 from affine import Affine
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-from src.danger_detection.utils import map_window_onto_drone_frame, get_frame_transform
+from app.danger_detection.utils import map_window_onto_drone_frame, get_frame_transform
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output", "visual_map_window")
 os.makedirs(OUTPUT_DIR, exist_ok=True)

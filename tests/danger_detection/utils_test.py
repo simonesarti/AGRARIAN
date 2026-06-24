@@ -6,8 +6,8 @@ from pathlib import Path
 from geopy.distance import geodesic
 import cv2
 
-from src.danger_detection.utils import *
-from src.danger_detection.utils import merge_3d_mask
+from app.danger_detection.utils import *
+from app.danger_detection.utils import merge_3d_mask
 
 
 def create_temp_tif(tmp_path, filename="temp.tif", width=10, height=10, count=1, dtype='uint8'):

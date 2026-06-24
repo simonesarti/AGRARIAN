@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-from src.danger_detection.utils import compute_slope_mask_horn
+from app.danger_detection.utils import compute_slope_mask_horn
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output", "visual_slope_mask")
 os.makedirs(OUTPUT_DIR, exist_ok=True)

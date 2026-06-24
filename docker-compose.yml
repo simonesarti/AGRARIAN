@@ -1,28 +1,164 @@
+# AGRARIAN — per-session pipeline stack
+#
+# Core stack (always on):
+#   docker compose up --build
+#
+# Traefik dashboard (development only):  http://localhost:8080
+# HLS playback (via Traefik):            http://localhost/hls/annot/index.m3u8
+# WebRTC play (via Traefik):             http://localhost/webrtc/annot/whep
+# WebSocket alerts (via Traefik):        ws://localhost/ws
+# WebSocket alerts (direct):            ws://localhost:8765
+
+name: agrarian
+
+networks:
+  session-net:
+    driver: bridge
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:
+  postgres-data:
+
 services:
 
+  # ── Reverse proxy ─────────────────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.1
+    restart: unless-stopped
+    networks: [session-net]
+    ports:
+      - "80:80"
+      - "8080:8080"     # dashboard — disable in production
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.network=session-net"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--api.dashboard=true"
+      - "--api.insecure=true"   # no auth — development only
+      - "--log.level=WARN"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  # ── Video server ──────────────────────────────────────────────────────────────
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    restart: unless-stopped
+    networks: [session-net]
+    ports:
+      - "8554:8554"     # RTSP  — drone publishes here
+      - "1935:1935"     # RTMP  — app pushes annotated video here
+      - "8889:8889"     # WebRTC — viewer connects here
+    volumes:
+      - ./configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro
+    labels:
+      - "traefik.enable=true"
+      # HLS playback — strip /hls prefix before forwarding to MediaMTX port 8888
+      - "traefik.http.middlewares.hls-strip.stripprefix.prefixes=/hls"
+      - "traefik.http.routers.hls.rule=PathPrefix(`/hls`)"
+      - "traefik.http.routers.hls.entrypoints=web"
+      - "traefik.http.routers.hls.middlewares=hls-strip"
+      - "traefik.http.routers.hls.service=hls-svc"
+      - "traefik.http.services.hls-svc.loadbalancer.server.port=8888"
+      # WebRTC signalling — strip /webrtc prefix before forwarding to MediaMTX port 8889
+      - "traefik.http.middlewares.webrtc-strip.stripprefix.prefixes=/webrtc"
+      - "traefik.http.routers.webrtc.rule=PathPrefix(`/webrtc`)"
+      - "traefik.http.routers.webrtc.entrypoints=web"
+      - "traefik.http.routers.webrtc.middlewares=webrtc-strip"
+      - "traefik.http.routers.webrtc.service=webrtc-svc"
+      - "traefik.http.services.webrtc-svc.loadbalancer.server.port=8889"
+
+  # ── MQTT broker ───────────────────────────────────────────────────────────────
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    networks: [session-net]
+    ports:
+      - "1883:1883"     # MQTT  — drone publishes, app subscribes
+      #- "8883:8883"    # MQTTS — uncomment together with the listener block in mosquitto.conf
+    volumes:
+      - ./configs/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+      #- ./certificates/mosquitto:/mosquitto/certs:ro   # required for MQTTS
+
+  # ── Database ──────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    networks: [session-net]
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-agrarian_db}
+      POSTGRES_USER:     ${POSTGRES_USER:-db_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-db_pass}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-db_user} -d ${POSTGRES_DB:-agrarian_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # ── DB writer sidecar ─────────────────────────────────────────────────────────
   db-writer:
     build:
-      context: .
-      dockerfile: db_writer/Dockerfile
-    env_file: db_writer/.env
-    networks:
-      - internal
+      context: db_writer
     restart: unless-stopped
+    networks: [session-net]
+    environment:
+      DB_SERVICE:         postgresql
+      DB_HOST:            postgres
+      DB_PORT:            5432
+      DB_NAME:            ${POSTGRES_DB:-agrarian_db}
+      DB_WORKER_NAME:     ${POSTGRES_USER:-db_user}
+      DB_WORKER_PASSWORD: ${POSTGRES_PASSWORD:-db_pass}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
+  # ── WS server ────────────────────────────────────────────────────────────────
+  ws-server:
+    build:
+      context: ws_server
+    restart: unless-stopped
+    networks: [session-net]
+    ports:
+      - "${WS_PORT:-8765}:${WS_PORT:-8765}"
+    environment:
+      WS_PORT: ${WS_PORT:-8765}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ws.rule=PathPrefix(`/ws`)"
+      - "traefik.http.routers.ws.entrypoints=web"
+      - "traefik.http.routers.ws.service=ws-svc"
+      - "traefik.http.services.ws-svc.loadbalancer.server.port=${WS_PORT:-8765}"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # ── Main pipeline app ─────────────────────────────────────────────────────────
   app:
     build:
       context: .
-      dockerfile: Dockerfile
-    env_file: .env
-    networks:
-      - internal
-    ports:
-      - "8443:8443"
+      dockerfile: app/Dockerfile
+    env_file: app/.env
+    networks: [session-net]
     shm_size: "256m"
     depends_on:
-      - db-writer
+      db-writer:
+        condition: service_healthy
+      ws-server:
+        condition: service_healthy
+      mediamtx:
+        condition: service_started
+      mosquitto:
+        condition: service_started
     restart: unless-stopped
-
-networks:
-  internal:
-    driver: bridge

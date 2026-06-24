@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-from src.danger_detection.utils import create_geofencing_mask_runtime, get_frame_transform
+from app.danger_detection.utils import create_geofencing_mask_runtime, get_frame_transform
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output", "visual_geofencing_mask")
 os.makedirs(OUTPUT_DIR, exist_ok=True)

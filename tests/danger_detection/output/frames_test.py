@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import pytest
 
-from src.danger_detection.output.frames import (
+from app.danger_detection.output.frames import (
     RED,
     GREEN,
     BLUE,

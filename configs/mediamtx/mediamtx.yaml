@@ -1,0 +1,23 @@
+rtsp: yes
+rtspAddress: :8554
+protocols: [tcp, udp]
+
+rtmp: yes
+rtmpAddress: :1935
+
+webrtc: yes
+webrtcAddress: :8889
+webrtcICEServers:
+  - stun:stun.l.google.com:19302
+
+hls: yes
+hlsAddress: :8888
+
+readTimeout: 10s
+writeTimeout: 10s
+
+paths:
+  drone:
+    source: publisher
+  annot:
+    source: publisher

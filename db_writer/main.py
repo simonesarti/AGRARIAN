@@ -5,10 +5,11 @@ from datetime import datetime
 from threading import Lock
 from typing import Optional
 
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from src.shared.processes.db_manager import DatabaseManager
+from db_manager import DatabaseManager
 
 
 logging.basicConfig(
@@ -67,6 +68,11 @@ class AlertRequest(BaseModel):
 # ------------------------------------------------------------------ #
 
 app = FastAPI()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/session/start")
@@ -133,3 +139,7 @@ def close_session(flight_id: int):
     manager.close()
     logger.info(f"Session closed: flight_id={flight_id}")
     return {"ok": True}
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, log_level="info")
