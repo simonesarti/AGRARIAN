@@ -11,7 +11,7 @@ Drone-based livestock monitoring pipeline with two operating modes, selected at 
 
 ## Pipeline Architecture
 
-Both pipelines are chains of `multiprocessing.Process` workers connected by shared-memory frame buffers. All IPC passes through two buffer classes defined in [src/shared/processes/frame_buffer.py](src/shared/processes/frame_buffer.py):
+Both pipelines are chains of `multiprocessing.Process` workers connected by shared-memory frame buffers. All IPC passes through two buffer classes defined in [app/shared/processes/frame_buffer.py](app/shared/processes/frame_buffer.py):
 
 - **`FrameBuffer`** — a pool of N POSIX shared memory slots, each holding one `(H, W, 3)` BGR frame. Workers call `acquire()` → `write()` → enqueue metadata; the downstream worker calls `view()` (zero-copy read into SHM) → process → `release()`.
 - **`MultiFrameBuffer`** — two independent POSIX SHM regions per slot (primary for the frame, secondary for a mask stack), governed by a single slot pool. The primary region is `(H, W, 3)` HWC (cv2-native, always contiguous); the secondary is `(N, H, W)` CHW so that each mask `mask_view[i]` is a contiguous `(H, W)` slice. This layout eliminates intermediate `np.concatenate` allocations and `np.ascontiguousarray` copies.
@@ -25,7 +25,7 @@ Each hop has its own N-slot pool. When a downstream consumer is too slow to free
            │
           FB
            │
-        Combiner
+        Combiner  ◄── MQTT telemetry
            │
           FB
            │
@@ -51,7 +51,7 @@ Each hop has its own N-slot pool. When a downstream consumer is too slow to free
         FB   FB
          │   │
       Alert  Video
-      Writer Producer
+      Writer Producer ──► RTMP → MediaMTX
 ```
 
 `FB` = `FrameBuffer((H,W,3))`, `MFB` = `MultiFrameBuffer`
@@ -65,15 +65,15 @@ Segmentation and geo inference use TensorRT. Both the YOLO detection process and
           │
          FB
           │
-       Detection
-          │
-         FB
-          │
        Tracking
           │
          FB
           │
   Anomaly Detector
+          │
+         FB
+          │
+     Interpolator
           │
          FB
           │
@@ -83,223 +83,168 @@ Segmentation and geo inference use TensorRT. Both the YOLO detection process and
        FB   FB
         │   │
      Alert  Video
-     Writer Producer
+     Writer Producer ──► RTMP → MediaMTX
 ```
 
 In engine mode (TensorRT `.engine` file present) every frame is tracked; in fallback mode (`.pt` checkpoint) 1 in 4 frames is tracked to compensate for higher inference latency. Health monitoring does not require NVIDIA MPS.
 
 ---
 
+## Service Stack
+
+The full stack is defined in [docker-compose.yml](docker-compose.yml). All services run on an isolated internal bridge network (`session-net`).
+
+| Service | Role |
+| ------- | ---- |
+| **traefik** | Reverse proxy; TLS termination via Let's Encrypt; routes HLS, WebRTC, and WebSocket traffic |
+| **mediamtx** | Video ingestion from drone (RTSP); re-publishes annotated stream (RTMP); records the annotated stream to the `recordings` volume |
+| **mosquitto** | MQTT broker; receives drone telemetry consumed by the app |
+| **postgres** | Alert persistence database |
+| **db-writer** | Receives alert POST requests from the app and writes them to PostgreSQL; decouples the app from DB write latency |
+| **ws-server** | Maintains a WebSocket connection to the viewer UI; receives alert events from the app and pushes them in real time |
+| **recorder** | Receives a webhook from MediaMTX on each completed recording segment and uploads it to the configured storage backend (local volume, Azure Blob Storage, or AWS S3) |
+| **app** | Core GPU processing pipeline; consumes video and telemetry, produces annotated stream and structured alerts |
+
+### Recording
+
+MediaMTX records the annotated `annot` stream directly as it is received, removing the need for the app to write video files. When a segment is complete, MediaMTX calls a webhook on the `recorder` sidecar, which uploads the file according to `RECORDING_STORE_SERVICE` in the root `.env`.
+
+---
+
 ## Prerequisites
 
-- Docker with NVIDIA Container Toolkit (`nvidia-docker2` or `--gpus` support)
+- Docker with the Compose plugin
+- NVIDIA Container Toolkit (`nvidia-docker2` or `--gpus` support) on the host
 - NVIDIA MPS (required for danger detection, to share the GPU between YOLO and TensorRT processes):
 
   ```bash
   sudo nvidia-cuda-mps-control -d          # start MPS daemon on the host
-  # ... run the container ...
-  echo quit | sudo nvidia-cuda-mps-control  # stop MPS daemon when done
-  ```
-
-- A `.env` file — copy `.env.example` and fill in your deployment values:
-
-  ```bash
-  cp .env.example .env
+  # ... run the stack ...
+  echo quit | sudo nvidia-cuda-mps-control  # stop when done
   ```
 
 ---
 
-## Building the image
+## Configuration
+
+Two configuration files are required.
+
+### Root `.env`
+
+Compose-level settings — variables that must drive both port bindings in `docker-compose.yml` and container environment variables. Edit before running:
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `WS_PORT` | `8765` | External port for the WebSocket alert stream |
+| `ACME_EMAIL` | — | Email for Let's Encrypt certificate registration (required for WSS in production) |
+| `RECORDING_STORE_SERVICE` | `local` | Recording upload backend: `local`, `azure`, or `aws` |
+| `RECORDING_DELETE_LOCAL_ON_SUCCESS` | `false` | Delete the local segment file after a successful remote upload |
+| `RECORDING_AZURE_*` | — | Azure Blob Storage credentials (required when service=azure) |
+| `RECORDING_AWS_*` | — | AWS S3 credentials (required when service=aws) |
+
+### `app/.env`
+
+Pipeline configuration — read by the `app` container at startup. Key groups:
+
+- **General**: `ALERTS_COOLDOWN_SECONDS`, `ALERTS_JPEG_COMPRESSION_QUALITY`
+- **Drone hardware**: sensor dimensions (default: DJI Mavic 3 Enterprise)
+- **Video stream reader**: `VIDEO_STREAM_READER_HOST/PORT/STREAM_KEY` and protocol
+- **Telemetry/MQTT**: `TELEMETRY_LISTENER_HOST/PORT` and protocol
+- **Danger detection**: `SAFETY_RADIUS_M`, `SLOPE_ANGLE_THRESHOLD`, `GEOFENCING_VERTEXES`
+- **Health monitoring anomaly detector**: thresholds and model parameters
+- **Video stream output**: `VIDEO_OUT_STREAM_HOST/PORT/STREAM_KEY` (default: `mediamtx:1935/annot`)
+- **Database credentials**: `DB_USERNAME`, `DB_PASSWORD` (end-user identity forwarded to db-writer)
+
+`WS_SERVER_URL` and `DB_WRITER_URL` are hardcoded in `docker-compose.yml` as internal service URLs and do not appear in `app/.env`.
+
+---
+
+## Quick Start
 
 ```bash
-docker build -t agrarian .
+# 1. Fill in configuration
+#    Edit the root .env and app/.env with your deployment values.
+
+# 2. Place DEM files (danger detection only)
+#    Put dem.tif and dem_mask.tif in the dem/ directory.
+
+# 3. Start the stack
+docker compose up --build
 ```
+
+Set `APP_MODE` in `app/.env` to `danger_detection` or `health_monitoring`.
 
 ---
 
-## Running — Danger Detection
+## Running with a TensorRT Engine
 
-### Danger detection: volumes
-
-All data is exchanged with the container via bind mounts. The host-side paths are conventions; any path works as long as it maps to the correct container-side path.
-
-| Container path              | R/W | Required   | Contents                                              |
-|-----------------------------|-----|------------|-------------------------------------------------------|
-| `/app/dem`                  | R   | Yes        | `dem.tif` and `dem_mask.tif`                          |
-| `/app/logs`                 | W   | No         | Per-process log files, one per pipeline stage         |
-| `/app/processing_results`   | W   | No         | Session video (`.mp4`) and alert log (`.log`)         |
-| `/app/certificates/mqtt`    | R   | MQTTS only | CA certificate for the MQTT broker                    |
-
-Populate the `dem` directory on the host before starting the container:
+Place the compiled `.engine` file in the `engine/` directory before starting:
 
 ```text
-<host-dem-path>/
-  dem.tif
-  dem_mask.tif
+engine/
+  detection_1280_720_yolo11m.engine   # health monitoring
+  <detector>.engine                   # danger detection (optional)
+  <segmenter>.engine                  # danger detection (optional)
 ```
 
-### Danger detection: run command
-
-```bash
-docker run --rm \
-  --name agrarian \
-  --gpus all \
-  --shm-size=128m \
-  --env-file .env \
-  -e APP_MODE=danger_detection \
-  -p 8443:8443 \
-  -v /path/to/dem:/app/dem \
-  -v /path/to/logs:/app/logs \
-  -v /path/to/processing_results:/app/processing_results \
-  -v /path/to/certificates/mqtt:/app/certificates/mqtt \
-  agrarian
-```
-
-The last `-v` line (certificates) is only needed when `TELEMETRY_LISTENER_PROTOCOL=mqtts`.
-
-### Danger detection: network
-
-| Port        | Protocol | Role                 | Purpose                                                    |
-|-------------|----------|----------------------|------------------------------------------------------------|
-| 8554        | RTSP     | outbound (client)    | Container reads video from media server                    |
-| 1883        | MQTT     | outbound (client)    | Container reads telemetry from MQTT broker                 |
-| 1935        | RTMP     | outbound (client)    | Container pushes annotated stream to media server          |
-| 8443        | WSS      | **inbound (server)** | UI connects to container's WebSocket alert server          |
-| 5432 / 3306 | TCP      | outbound (client)    | Alert storage — PostgreSQL / MySQL (disabled if unset)     |
-
-Only port 8443 is published with `-p` — it is the only port the container listens on. All others are outbound connections to external services. Adjust port numbers to match your `.env` if you changed the defaults.
+The app detects engine files at startup and switches to engine mode automatically. Without an engine file, the `.pt`/`.onnx` checkpoint bundled in the image is used.
 
 ---
 
-## Running — Health Monitoring
+## Network
 
-### Health monitoring: volumes
+Ports exposed externally by the stack:
 
-Health monitoring does not use telemetry — no MQTT broker or certificates are needed.
+| Port | Protocol | Direction | Purpose |
+| ---- | -------- | --------- | ------- |
+| 80 | HTTP | inbound | Traefik (Let's Encrypt HTTP challenge; redirects to 443 in production) |
+| 443 | HTTPS/WSS | inbound | Traefik: HLS/WebRTC video playback + WSS alerts (production) |
+| 8080 | HTTP | inbound | Traefik dashboard (development only) |
+| 8554 | RTSP | inbound | MediaMTX: drone video publish |
+| 1935 | RTMP | inbound | MediaMTX: app annotated stream publish |
+| 8889 | WebRTC | inbound | MediaMTX: viewer WebRTC playback |
+| 1883 | MQTT | inbound | Mosquitto: drone telemetry |
+| `WS_PORT` | WS | inbound | WebSocket alert stream (direct, without Traefik) |
 
-| Container path              | R/W | Required          | Contents                                                                    |
-|-----------------------------|-----|-------------------|-----------------------------------------------------------------------------|
-| `/app/logs`                 | W   | No                | Per-process log files, one per pipeline stage                               |
-| `/app/processing_results`   | W   | No                | Session video (`.mp4`) and alert log (`.log`)                               |
-| `/app/engine`               | R   | Engine mode only  | TensorRT `.engine` file compiled for the host GPU (see tracker mode below)  |
+Access URLs (development, via Traefik on localhost):
 
-**Tracker mode** is selected automatically at startup based on the presence of a compiled engine file:
-
-- **Engine mode** — place `detection_1280_720_yolo11m.engine` (compiled for the host GPU) in a directory on the host and mount it to `/app/engine`. The pipeline runs at full frame rate with no frame skipping.
-- **Fallback mode** — when the `.engine` file is absent, the `.pt` checkpoint bundled in the image is used and 1 in 4 frames is tracked to compensate for higher inference latency.
-
-### Health monitoring: run command
-
-```bash
-docker run --rm \
-  --name agrarian \
-  --gpus all \
-  --shm-size=128m \
-  --env-file .env \
-  -e APP_MODE=health_monitoring \
-  -p 8443:8443 \
-  -v /path/to/logs:/app/logs \
-  -v /path/to/processing_results:/app/processing_results \
-  agrarian
-```
-
-Add `-v /path/to/engine:/app/engine` when using a TensorRT engine (engine mode above).
-
-### Health monitoring: network
-
-| Port        | Protocol | Role                 | Purpose                                                    |
-|-------------|----------|----------------------|------------------------------------------------------------|
-| 8554        | RTSP     | outbound (client)    | Container reads video from media server                    |
-| 1935        | RTMP     | outbound (client)    | Container pushes annotated stream to media server          |
-| 8443        | WSS      | **inbound (server)** | UI connects to container's WebSocket alert server          |
-| 5432 / 3306 | TCP      | outbound (client)    | Alert storage — PostgreSQL / MySQL (disabled if unset)     |
-
----
-
-## Container Networking
-
-When multiple containers are running on the default bridge network, use their IP addresses to communicate between them (the default bridge does not support DNS name resolution).
-
-Find the IP of every running container:
-
-```bash
-docker inspect -f '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $(docker ps -q)
-```
-
-Or for a single container by name:
-
-```bash
-docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' <container-name>
-```
-
-Use the resolved IP in `.env` for `VIDEO_STREAM_READER_HOST`, `TELEMETRY_LISTENER_HOST`, `VIDEO_OUT_STREAM_HOST`, and `DB_HOST` as appropriate.
-
----
-
-## Local Testing
-
-Commands for running both apps from the project directory, mounting subdirectories of the repo as volumes and using the local `.env` file. Logs and outputs land directly in the project tree for easy inspection.
-
-### Test: danger detection
-
-Place `dem.tif` and `dem_mask.tif` in the project's `dem/` directory before running.
-
-```bash
-docker run --rm \
-  --name agrarian \
-  --gpus all \
-  --shm-size=128m \
-  --env-file .env \
-  -e APP_MODE=danger_detection \
-  -p 8443:8443 \
-  -v ./dem:/app/dem \
-  -v ./logs:/app/logs \
-  -v ./processing_results:/app/processing_results \
-  agrarian
-```
-
-Add `-v ./certificates/mqtt:/app/certificates/mqtt` if testing with `TELEMETRY_LISTENER_PROTOCOL=mqtts`.
-
-### Test: health monitoring
-
-```bash
-docker run --rm \
-  --name agrarian \
-  --gpus all \
-  --shm-size=128m \
-  --env-file .env \
-  -e APP_MODE=health_monitoring \
-  -p 8443:8443 \
-  -v ./logs:/app/logs \
-  -v ./processing_results:/app/processing_results \
-  agrarian
-```
-
-Add `-v ./engine:/app/engine` when testing with a TensorRT engine.
+| Resource | URL |
+| -------- | --- |
+| HLS playback | `http://localhost/hls/annot/index.m3u8` |
+| WebRTC playback | `http://localhost/webrtc/annot/whep` |
+| WebSocket alerts (WS) | `ws://localhost/ws` |
+| WebSocket alerts (WSS, production) | `wss://<domain>/ws` |
+| WebSocket alerts (direct) | `ws://localhost:${WS_PORT}` |
+| Traefik dashboard | `http://localhost:8080` |
 
 ---
 
 ## Outputs
 
-After a session, the following files are written to the mounted volumes.
-
-**`/app/logs`** — one file per pipeline process:
+**Alert log** — written per session to `app/processing_results/` inside the `app` container (bind-mount if you need it on the host). One `.log` file per session, named by start timestamp:
 
 ```text
-main.log
-stream_video_in.log
-frame_telemetry_combiner.log
-animals_detection.log
-danger_segmentation.log
-danger_geo.log
-danger_annotation.log
-alert_out.log
-video_out.log
+20260525_143012.log
 ```
 
-**`/app/processing_results`** — one set of files per session, named by start timestamp:
+**Process logs** — one file per pipeline stage, written to `./logs/` in the container (bind-mount as needed).
 
-```text
-20260525_143012.mp4     # annotated video recording
-20260525_143012.log     # alert event log for the session
+**Video recordings** — written by MediaMTX to the `recordings` Docker volume. The `recorder` sidecar uploads each completed segment to the configured backend. When `RECORDING_STORE_SERVICE=local`, segments remain on the volume indefinitely; for `azure` or `aws`, the file is optionally deleted after upload (`RECORDING_DELETE_LOCAL_ON_SUCCESS=true`).
+
+---
+
+## Shared Memory
+
+The app container requires at least 256 MB of shared memory for the POSIX SHM frame buffers. This is configured in `docker-compose.yml` (`shm_size: "256m"`) and applies automatically when using Compose. If running the container standalone, pass `--shm-size=256m`.
+
+---
+
+## MQTT Certificates (MQTTS)
+
+When `TELEMETRY_LISTENER_PROTOCOL=mqtts`, the app expects a CA certificate at `certificates/mqtt/` inside the container. Bind-mount the directory:
+
+```yaml
+# add to the app service in docker-compose.yml
+volumes:
+  - ./certificates/mqtt:/app/certificates/mqtt:ro
 ```

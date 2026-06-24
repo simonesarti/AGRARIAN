@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-The system provides real-time drone video analysis as a cloud service. A drone operator streams video and telemetry to a cloud endpoint; the service processes the stream and delivers a processed video feed plus structured alerts back to the operator's UI.
+The system provides real-time drone video analysis as a cloud service. A drone operator streams video and telemetry to a cloud endpoint; the service processes the stream and delivers a processed video feed plus structured alerts back to the operator's UI. Completed recording segments are automatically uploaded to configurable cloud storage.
 
 **The fundamental design constraint** is that video processing is real-time, latency-sensitive, and one-app-per-stream. This eliminates shared-processing architectures and drives the entire design toward **per-session isolated stacks deployed regionally close to the drone**.
 
@@ -11,7 +11,7 @@ The system provides real-time drone video analysis as a cloud service. A drone o
 ## 2. Core Design Principles
 
 | Principle | Consequence |
-|---|---|
+| --------- | ----------- |
 | One app handles one stream at a time | No shared app containers; each session gets a dedicated stack |
 | Minimize video round-trip distance | Deploy the session stack in the cloud region nearest the drone operator |
 | Stateless external persistence | Alerts go to a central DB outside the session stack; sessions can be torn down cleanly |
@@ -30,7 +30,7 @@ A single shared deployment would mean all users' video streams converge at one e
 
 When a drone session is initiated, a **control plane** provisions a complete isolated stack in the cloud region nearest the operator. The stack runs for the duration of the session and is torn down when the session ends, freeing all resources.
 
-```
+```text
 Region EU-West                        Region AP-South
 ┌─────────────────────────┐           ┌─────────────────────────┐
 │  Session Stack A        │           │  Session Stack B        │
@@ -46,12 +46,13 @@ Region EU-West                        Region AP-South
 ### Shared vs per-session component analysis
 
 | Component | Decision | Rationale |
-|---|---|---|
+| --------- | -------- | --------- |
 | App | **Per-session** | Hard constraint: one video at a time |
 | MediaMTX | **Per-session** | Avoids cross-region video routing; simplifies auth |
 | MQTT broker | **Per-session** | Avoids topic namespace collisions; simpler auth isolation |
 | WebSocket server | **Per-session** | Tightly coupled to one session's alert stream |
 | DB Worker | **Per-session** | Lightweight; no benefit from sharing |
+| Recorder | **Per-session** | Uploads segments produced by this session's MediaMTX only |
 | Reverse proxy | **Per-session** | Handles TLS for the session's public endpoint |
 | Central DB | **Shared / external** | Persistent store across all sessions and regions |
 | Control Plane | **Shared / global** | One API manages all regions |
@@ -66,7 +67,8 @@ Region EU-West                        Region AP-South
 **Why Traefik over Nginx**: Traefik's dynamic configuration via Docker labels is ideal for programmatically-provisioned stacks. It integrates with Let's Encrypt for automatic TLS certificate provisioning per session domain.
 
 Handles:
-- HTTPS routing to MediaMTX (HLS/WebRTC/RTSP-over-HTTPS playback by viewers)
+
+- HTTPS routing to MediaMTX (HLS/WebRTC playback by viewers)
 - WSS routing to the WebSocket server
 - Optional: Bearer token validation middleware before forwarding to downstream services
 
@@ -74,11 +76,15 @@ RTSP publish from the drone (port 8554) and MQTT (port 1883/8883) are exposed di
 
 ### 4.2 MediaMTX
 
-**Role**: Video ingestion from drone; re-publication of processed stream; playback to viewer UI.  
+**Role**: Video ingestion from drone; re-publication of processed stream; playback to viewer UI; **recording of the annotated stream**.  
 **Protocol surface**:
+
 - Drone → MediaMTX: RTSP publish on a secret path (e.g. `rtsp://host:8554/session/{id}/raw?token=...`)
-- App → MediaMTX: RTSP publish on processed path (e.g. `rtsp://mediamtx:8554/session/{id}/processed`)
+- App → MediaMTX: RTMP publish on annotated path (`rtmp://mediamtx:1935/annot`)
 - Viewer → MediaMTX: HLS or WebRTC (lower latency) via HTTPS, proxied through Traefik
+- MediaMTX → Recorder: `runOnRecordSegmentComplete` webhook (`wget` POST to `http://recorder:8000/on-segment-complete`) on each completed segment
+
+**Recording**: MediaMTX records the `annot` path to the shared `recordings` volume in fmp4 format. This removes the need for the app to write video files locally and eliminates double-encoding.
 
 **Configuration**: MediaMTX path-level authentication using per-session tokens provisioned by the control plane. External auth hook (HTTP callback) can validate tokens against the control plane.
 
@@ -86,6 +92,7 @@ RTSP publish from the drone (port 8554) and MQTT (port 1883/8883) are exposed di
 
 **Role**: Receives telemetry (GPS, altitude, attitude, sensor data) from the drone; consumed by the app.  
 **Protocol surface**:
+
 - Drone → Mosquitto: MQTT over TLS (port 8883), authenticated with per-session credentials
 - App ← Mosquitto: Internal subscription (no TLS needed on internal Docker network)
 
@@ -93,42 +100,57 @@ RTSP publish from the drone (port 8554) and MQTT (port 1883/8883) are exposed di
 
 ### 4.4 App
 
-**Role**: Core processing pipeline. Consumes raw video from MediaMTX and telemetry from MQTT. Produces processed video (re-published to MediaMTX) and structured alerts (pushed to WebSocket server and DB worker).
+**Role**: Core processing pipeline. Consumes raw video from MediaMTX and telemetry from MQTT. Produces annotated video (pushed to MediaMTX via RTMP) and structured alerts (pushed to WebSocket server and DB worker).
 
 **Interfaces** (all internal):
+
 - MediaMTX raw stream → RTSP pull
 - MQTT broker → subscribe to telemetry topics
-- MediaMTX processed stream → RTSP publish
-- WebSocket server → HTTP POST or internal message queue (e.g. Unix socket or Redis-free in-process channel)
-- DB worker → HTTP POST or shared message queue
+- MediaMTX annotated stream → RTMP push
+- WebSocket server → HTTP POST to `http://ws-server:8000/alert`
+- DB worker → HTTP POST to `http://db-writer:8000/save_alert`
 
-**Resource requirements**: GPU access required. The container must be scheduled on a GPU-equipped host. In Kubernetes this is a node selector; in a VM-based model the VM must have a GPU.
+**Resource requirements**: GPU access required. The container must be scheduled on a GPU-equipped host. Requires `shm_size: 256m` for POSIX shared memory frame buffers. In Kubernetes this is a node selector; in a VM-based model the VM must have a GPU.
 
 ### 4.5 WebSocket Server
 
 **Role**: Maintains a persistent WebSocket connection to the viewer's UI. Receives alert events from the app and pushes them to the connected client in real time.
 
 **Protocol surface**:
-- App → WebSocket server: Internal HTTP POST `/alert`
-- Viewer ↔ WebSocket server: WSS, proxied through Traefik
 
-**Implementation**: A minimal server (e.g. FastAPI + WebSockets, or a Node.js server). Stateless beyond the active connection — no DB, no queue. If the client disconnects and reconnects, alerts produced during the gap are retrieved from the DB (queried by the client on reconnect).
+- App → WebSocket server: Internal HTTP POST to `/alert` on port 8000 (FastAPI HTTP API)
+- Viewer ↔ WebSocket server: WSS on the configurable `WS_PORT` (default 8765), proxied through Traefik
+- External: `wss://<domain>/ws` via Traefik, or `ws://host:8765` direct
+
+**Implementation**: FastAPI + WebSockets. The WebSocket listener runs in a background thread; the HTTP API runs in the uvicorn event loop. Stateless beyond the active connection — no DB, no queue. If the client disconnects and reconnects, alerts produced during the gap are retrieved from the DB (queried by the client on reconnect). Shutdown is triggered by uvicorn receiving SIGTERM (as PID 1 in the container), which resumes the FastAPI lifespan context and calls `WebSocketManager.stop()`.
 
 ### 4.6 DB Worker
 
 **Role**: Consumes alert events from the app and persists them to the external central database. Decouples the app from DB write latency.
 
 **Protocol surface**:
-- App → DB Worker: Internal HTTP POST `/ingest`
-- DB Worker → External DB: Outbound TCP (PostgreSQL/other), authenticated
 
-**Implementation**: A lightweight service that batches writes and retries on transient failures. Owns the schema migration logic. Does not expose any port to the external network.
+- App → DB Worker: Internal HTTP POST to `/save_alert` on port 8000
+- DB Worker → External DB: Outbound TCP (PostgreSQL), authenticated
+
+**Implementation**: A lightweight FastAPI service with an internal async queue and background worker thread. Owns the schema migration logic. Returns HTTP 503 if the alert queue is full (DB unreachable for extended period). Does not expose any port to the external network.
+
+### 4.7 Recorder
+
+**Role**: Receives a webhook from MediaMTX on each completed recording segment and uploads the file to the configured storage backend (local volume, Azure Blob Storage, or AWS S3).
+
+**Protocol surface**:
+
+- MediaMTX → Recorder: Internal HTTP POST to `/on-segment-complete` (form data: `path=<segment-file-path>`)
+- Recorder → Azure / S3: Outbound HTTPS upload
+
+**Implementation**: A minimal FastAPI service. The endpoint returns immediately (`202 Accepted`) and performs the upload in a FastAPI `BackgroundTask`, so the MediaMTX webhook does not block. Upload failures are logged and skipped — the segment file is retained on the `recordings` volume in all cases. The storage SDK (azure-storage-blob / boto3) is imported lazily at first use. Configured entirely via environment variables (`RECORDING_STORE_SERVICE`, `RECORDING_AZURE_*`, `RECORDING_AWS_*`).
 
 ---
 
 ## 5. Network Topology
 
-```
+```text
                         INTERNET
                             │
            ┌────────────────┼────────────────┐
@@ -145,30 +167,38 @@ RTSP publish from the drone (port 8554) and MQTT (port 1883/8883) are exposed di
     ┌──────▼──────┐  ┌──────▼──────┐  ┌──────▼──────┐
     │  MediaMTX   │  │  Mosquitto  │  │  WebSocket  │
     │  :8554(ext) │  │  :8883(ext) │  │  Server     │
-    │  :8888(int) │  │  :1883(int) │  │  :8765(int) │
-    └──────┬──────┘  └──────┬──────┘  └──────▲──────┘
-           │  raw stream    │ telemetry        │ alerts
-           └────────┬───────┘                 │
-                    ▼                          │
+    │  :8888(int) │  │  :1883(int) │  │  :8000(api) │
+    └──────┬──────┘  └──────┬──────┘  │  :8765(ws)  │
+           │  raw stream    │ telemetry└──────▲──────┘
+           └────────┬───────┘                 │ alerts
+                    ▼                         │
              ┌─────────────┐                  │
              │     App     ├──────────────────┘
              │  (GPU host) │
              └──────┬──────┘
-                    │ processed stream        alerts
-                    ▼                          │
-             ┌─────────────┐          ┌────────▼────────┐
-             │  MediaMTX   │          │    DB Worker    │
-             │  (same svc) │          │                 │
-             └─────────────┘          └────────┬────────┘
-                                               │
-                                               ▼
-                                      External Central DB
-                                      (PostgreSQL / managed)
+           annotated│stream          alerts
+                    ▼                 │
+             ┌─────────────┐  ┌───────▼─────────┐
+             │  MediaMTX   │  │    DB Worker    │
+             │  (same svc) │  │    :8000(api)   │
+             │  records to │  └────────┬────────┘
+             │  /recordings│           │
+             └──────┬──────┘           ▼
+                    │         External Central DB
+                    │         (PostgreSQL / managed)
+                    ▼
+             ┌─────────────┐
+             │  Recorder   │  ← webhook from MediaMTX
+             │  :8000      │
+             └──────┬──────┘
+                    │ upload
+                    ▼
+          Azure Blob / S3 / local
 ```
 
 ### Docker internal network
 
-All containers are on a single internal bridge network (`session-net`). Only Traefik, MediaMTX (RTSP port), and Mosquitto (MQTT/TLS port) have external port bindings.
+All containers are on a single internal bridge network (`session-net`). Only Traefik (80, 443), MediaMTX (8554, 1935, 8889), Mosquitto (1883), and the WebSocket server (`WS_PORT`) have external port bindings. The recorder, db-worker, ws-server API, and postgres are internal-only.
 
 ---
 
@@ -178,8 +208,8 @@ The following is the canonical per-session `docker-compose.yml`. The control pla
 
 ```yaml
 # docker-compose.yml — per-session stack
-# Rendered by control plane; SESSION_ID, SESSION_TOKEN_DRONE, SESSION_TOKEN_VIEWER,
-# MQTT_USER, MQTT_PASS, ACME_EMAIL, SESSION_DOMAIN are injected at provision time.
+# Rendered by control plane; SESSION_ID, ACME_EMAIL, SESSION_DOMAIN,
+# MQTT credentials, and storage secrets are injected at provision time.
 
 name: session-${SESSION_ID}
 
@@ -188,10 +218,10 @@ networks:
     driver: bridge
 
 volumes:
-  mediamtx-config:
-  mosquitto-config:
   mosquitto-data:
+  postgres-data:
   letsencrypt:
+  recordings:
 
 services:
 
@@ -205,12 +235,13 @@ services:
     command:
       - "--providers.docker=true"
       - "--providers.docker.network=session-net"
+      - "--providers.docker.exposedbydefault=false"
       - "--entrypoints.web.address=:80"
-      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
       - "--entrypoints.websecure.address=:443"
-      - "--certificatesresolvers.le.acme.tlschallenge=true"
-      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL}"
-      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - letsencrypt:/letsencrypt
@@ -219,99 +250,147 @@ services:
     image: bluenviron/mediamtx:latest
     restart: unless-stopped
     networks: [session-net]
+    depends_on:
+      recorder:
+        condition: service_healthy
     ports:
-      - "8554:8554"     # RTSP (drone publish, external)
-      - "8322:8322"     # RTSPS — RTSP over TLS (optional)
-    environment:
-      MTX_LOGLEVEL: warn
-      MTX_WEBRTCADDITIONALHOSTS: "${SESSION_DOMAIN}"
+      - "8554:8554"     # RTSP  — drone publishes here
+      - "1935:1935"     # RTMP  — app pushes annotated video here
+      - "8889:8889"     # WebRTC — viewer connects here
     volumes:
-      - ./configs/mediamtx.yml:/mediamtx.yml:ro
-    # MediaMTX config (mediamtx.yml) sets per-path publish tokens:
-    #   paths:
-    #     session/${SESSION_ID}/raw:
-    #       source: publisher
-    #       publishUser: drone
-    #       publishPass: ${SESSION_TOKEN_DRONE}
-    #     session/${SESSION_ID}/processed:
-    #       source: publisher
-    #       readUser: viewer
-    #       readPass: ${SESSION_TOKEN_VIEWER}
+      - ./configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro
+      - recordings:/recordings
+    # mediamtx.yaml configures the annot path with:
+    #   record: yes
+    #   recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+    #   recordFormat: fmp4
+    #   runOnRecordSegmentComplete: wget -q -O /dev/null \
+    #     --post-data="path=$MTX_SEGMENT_PATH" http://recorder:8000/on-segment-complete
     labels:
       - "traefik.enable=true"
-      # HLS playback
-      - "traefik.http.routers.mediamtx-hls.rule=Host(`${SESSION_DOMAIN}`) && PathPrefix(`/hls`)"
-      - "traefik.http.routers.mediamtx-hls.entrypoints=websecure"
-      - "traefik.http.routers.mediamtx-hls.tls.certresolver=le"
-      - "traefik.http.routers.mediamtx-hls.service=mediamtx-svc"
-      - "traefik.http.services.mediamtx-svc.loadbalancer.server.port=8888"
-      # WebRTC signaling
-      - "traefik.http.routers.mediamtx-webrtc.rule=Host(`${SESSION_DOMAIN}`) && PathPrefix(`/webrtc`)"
-      - "traefik.http.routers.mediamtx-webrtc.entrypoints=websecure"
-      - "traefik.http.routers.mediamtx-webrtc.tls.certresolver=le"
-      - "traefik.http.routers.mediamtx-webrtc.service=mediamtx-svc"
+      - "traefik.http.middlewares.hls-strip.stripprefix.prefixes=/hls"
+      - "traefik.http.routers.hls.rule=PathPrefix(`/hls`)"
+      - "traefik.http.routers.hls.entrypoints=websecure"
+      - "traefik.http.routers.hls.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.hls.middlewares=hls-strip"
+      - "traefik.http.routers.hls.service=hls-svc"
+      - "traefik.http.services.hls-svc.loadbalancer.server.port=8888"
+      - "traefik.http.middlewares.webrtc-strip.stripprefix.prefixes=/webrtc"
+      - "traefik.http.routers.webrtc.rule=PathPrefix(`/webrtc`)"
+      - "traefik.http.routers.webrtc.entrypoints=websecure"
+      - "traefik.http.routers.webrtc.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.webrtc.middlewares=webrtc-strip"
+      - "traefik.http.routers.webrtc.service=webrtc-svc"
+      - "traefik.http.services.webrtc-svc.loadbalancer.server.port=8889"
 
   mosquitto:
     image: eclipse-mosquitto:2
     restart: unless-stopped
     networks: [session-net]
     ports:
-      - "8883:8883"     # MQTT over TLS (drone publish, external)
+      - "1883:1883"
     volumes:
-      - ./configs/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-      - ./configs/mosquitto-passwd:/mosquitto/config/passwd:ro
-      - ./certs/server.crt:/mosquitto/certs/server.crt:ro
-      - ./certs/server.key:/mosquitto/certs/server.key:ro
+      - ./configs/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - mosquitto-data:/mosquitto/data
-    # mosquitto.conf sets TLS listener on 8883 and plaintext on 1883 (internal only)
-    # passwd file generated by control plane: mosquitto_passwd -c passwd ${MQTT_USER} ${MQTT_PASS}
 
-  app:
-    image: ${APP_IMAGE}
+  postgres:
+    image: postgres:16
     restart: unless-stopped
     networks: [session-net]
-    runtime: nvidia     # GPU access; requires nvidia-container-toolkit on host
     environment:
-      SESSION_ID: "${SESSION_ID}"
-      MEDIAMTX_URL: "rtsp://mediamtx:8554"
-      RAW_STREAM_PATH: "session/${SESSION_ID}/raw"
-      PROCESSED_STREAM_PATH: "session/${SESSION_ID}/processed"
-      MEDIAMTX_PUBLISH_USER: "app"
-      MEDIAMTX_PUBLISH_PASS: "${SESSION_TOKEN_APP}"
-      MQTT_HOST: "mosquitto"
-      MQTT_PORT: "1883"
-      MQTT_USER: "${MQTT_USER}"
-      MQTT_PASS: "${MQTT_PASS}"
-      WS_SERVER_URL: "http://ws-server:8765"
-      DB_WORKER_URL: "http://db-worker:9000"
+      POSTGRES_DB:       ${POSTGRES_DB:-agrarian_db}
+      POSTGRES_USER:     ${POSTGRES_USER:-db_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-db_pass}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-db_user}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  db-writer:
+    image: ${DB_WRITER_IMAGE}
+    restart: unless-stopped
+    networks: [session-net]
+    environment:
+      DB_SERVICE:         postgresql
+      DB_HOST:            postgres
+      DB_NAME:            ${POSTGRES_DB:-agrarian_db}
+      DB_WORKER_NAME:     ${POSTGRES_USER:-db_user}
+      DB_WORKER_PASSWORD: ${POSTGRES_PASSWORD:-db_pass}
     depends_on:
-      - mediamtx
-      - mosquitto
-      - ws-server
-      - db-worker
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
   ws-server:
     image: ${WS_SERVER_IMAGE}
     restart: unless-stopped
     networks: [session-net]
+    ports:
+      - "${WS_PORT:-8765}:${WS_PORT:-8765}"
     environment:
-      SESSION_ID: "${SESSION_ID}"
-      VIEWER_TOKEN: "${SESSION_TOKEN_VIEWER}"
+      WS_PORT: ${WS_PORT:-8765}
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.ws.rule=Host(`${SESSION_DOMAIN}`) && PathPrefix(`/ws`)"
-      - "traefik.http.routers.ws.entrypoints=websecure"
-      - "traefik.http.routers.ws.tls.certresolver=le"
-      - "traefik.http.services.ws-svc.loadbalancer.server.port=8765"
+      - "traefik.http.services.ws-svc.loadbalancer.server.port=${WS_PORT:-8765}"
+      - "traefik.http.routers.wss.rule=PathPrefix(`/ws`)"
+      - "traefik.http.routers.wss.entrypoints=websecure"
+      - "traefik.http.routers.wss.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.wss.service=ws-svc"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
-  db-worker:
-    image: ${DB_WORKER_IMAGE}
+  recorder:
+    image: ${RECORDER_IMAGE}
     restart: unless-stopped
     networks: [session-net]
     environment:
-      DATABASE_URL: "${DATABASE_URL}"    # injected from control plane secrets
-      SESSION_ID: "${SESSION_ID}"
-    # No external ports — outbound only to external DB
+      RECORDING_STORE_SERVICE:           ${RECORDING_STORE_SERVICE:-local}
+      RECORDING_DELETE_LOCAL_ON_SUCCESS: ${RECORDING_DELETE_LOCAL_ON_SUCCESS:-false}
+      RECORDING_AZURE_CONNECTION_STRING: ${RECORDING_AZURE_CONNECTION_STRING:-}
+      RECORDING_AZURE_CONTAINER_NAME:    ${RECORDING_AZURE_CONTAINER_NAME:-}
+      RECORDING_AZURE_BLOB_PREFIX:       ${RECORDING_AZURE_BLOB_PREFIX:-}
+      RECORDING_AWS_BUCKET_NAME:         ${RECORDING_AWS_BUCKET_NAME:-}
+      RECORDING_AWS_KEY_PREFIX:          ${RECORDING_AWS_KEY_PREFIX:-}
+      RECORDING_AWS_ACCESS_KEY_ID:       ${RECORDING_AWS_ACCESS_KEY_ID:-}
+      RECORDING_AWS_SECRET_ACCESS_KEY:   ${RECORDING_AWS_SECRET_ACCESS_KEY:-}
+      RECORDING_AWS_REGION_NAME:         ${RECORDING_AWS_REGION_NAME:-}
+    volumes:
+      - recordings:/recordings
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  app:
+    image: ${APP_IMAGE}
+    restart: unless-stopped
+    networks: [session-net]
+    runtime: nvidia
+    shm_size: "256m"
+    env_file: app/.env
+    environment:
+      WS_SERVER_URL: http://ws-server:8000   # internal wiring — not user-configurable
+      DB_WRITER_URL: http://db-writer:8000   # internal wiring — not user-configurable
+    depends_on:
+      db-writer:
+        condition: service_healthy
+      ws-server:
+        condition: service_healthy
+      mediamtx:
+        condition: service_started
+      mosquitto:
+        condition: service_started
 ```
 
 ---
@@ -331,7 +410,7 @@ The control plane is a separate long-running service (single global deployment, 
 
 ### Provisioning flow
 
-```
+```text
 Client (mobile app / web UI)
    │
    POST /sessions  { region: "eu-west", drone_id: "..." }
@@ -344,11 +423,12 @@ Control Plane API
    ├── Register DNS: {SESSION_ID}.eu-west.yourdomain.com → VM IP
    └── Return to client:
          {
-           rtsp_url:  "rtsp://{SESSION_ID}.eu-west.yourdomain.com:8554/session/{id}/raw",
-           mqtt_url:  "mqtts://{SESSION_ID}.eu-west.yourdomain.com:8883",
-           hls_url:   "https://{SESSION_ID}.eu-west.yourdomain.com/hls/session/{id}/processed",
-           ws_url:    "wss://{SESSION_ID}.eu-west.yourdomain.com/ws",
-           drone_token: "...",
+           rtsp_url:     "rtsp://{SESSION_ID}.eu-west.yourdomain.com:8554/...",
+           mqtt_url:     "mqtts://{SESSION_ID}.eu-west.yourdomain.com:8883",
+           hls_url:      "https://{SESSION_ID}.eu-west.yourdomain.com/hls/annot/index.m3u8",
+           webrtc_url:   "https://{SESSION_ID}.eu-west.yourdomain.com/webrtc/annot/whep",
+           ws_url:       "wss://{SESSION_ID}.eu-west.yourdomain.com/ws",
+           drone_token:  "...",
            viewer_token: "..."
          }
 ```
@@ -370,7 +450,7 @@ On teardown: `docker compose down -v` → deregister DNS → release VM (or retu
 Maintain a warm pool of GPU-equipped VMs in each supported region. A warm VM has Docker and the nvidia-container-toolkit pre-installed and is ready to receive a session stack immediately.
 
 | Approach | Latency to start | Cost |
-|---|---|---|
+| -------- | ---------------- | ---- |
 | Warm pool (1-2 VMs per region) | < 10 s | Pay for idle VMs |
 | On-demand VM provisioning | 60–120 s | No idle cost |
 | Kubernetes node auto-scaling | 30–90 s | Complex but elastic |
@@ -380,7 +460,7 @@ Maintain a warm pool of GPU-equipped VMs in each supported region. A warm VM has
 ### Supported regions (example)
 
 | Region label | Cloud provider location | Covers |
-|---|---|---|
+| ------------ | ----------------------- | ------ |
 | `eu-west` | AWS eu-west-1 / GCP europe-west1 | Europe |
 | `us-east` | AWS us-east-1 / GCP us-east4 | Americas |
 | `ap-south` | AWS ap-southeast-1 / GCP asia-southeast1 | Asia-Pacific |
@@ -393,17 +473,18 @@ The control plane selects region based on the operator's declared location or IP
 
 ### External trust boundaries
 
-```
+```text
 Drone        → MediaMTX (RTSP/TLS): per-session publish token, rotated each session
 Drone        → Mosquitto (MQTT/TLS): per-session username+password, CA-signed cert on server
 Viewer       → Traefik (HTTPS/WSS): Bearer token (JWT) validated by Traefik middleware or by ws-server
 Control Plane→ VM: SSH with provisioning key, or cloud provider instance API
 DB Worker    → External DB: connection string with session-scoped DB user (read/write to session's partition only)
+Recorder     → Azure / S3: storage credentials injected at provision time; scoped to the session's blob prefix / key prefix
 ```
 
 ### Internal network
 
-All inter-container communication is on the isolated `session-net` bridge. No container has host networking. Internal ports (1883, 8765, 8888, 9000) are not bound to the host.
+All inter-container communication is on the isolated `session-net` bridge. No container has host networking. The recorder, db-writer, ws-server HTTP API, and postgres ports are not bound to the host.
 
 ### Secrets
 
@@ -414,9 +495,9 @@ All inter-container communication is on the isolated `session-net` bridge. No co
 
 ### Certificate strategy
 
-- **MediaMTX RTSP (port 8554)**: Use Mosquitto-style pre-provisioned TLS cert (wildcard cert for `*.region.yourdomain.com`, renewed by control plane, copied to VM before session start)
-- **HTTP/WSS services**: Traefik handles Let's Encrypt ACME automatically per session domain
-- **MQTT (port 8883)**: Mosquitto TLS using the same wildcard cert
+- **HTTP/WSS services**: Traefik handles Let's Encrypt ACME automatically per session domain (HTTP challenge on port 80)
+- **MQTT (port 8883)**: Mosquitto TLS using a wildcard cert for `*.region.yourdomain.com`, provisioned by the control plane
+- **RTSP (port 8554)**: Optionally wrapped in TLS using the same wildcard cert
 
 ---
 
@@ -453,7 +534,7 @@ The DB worker for each session writes to `alerts` with its `SESSION_ID`. On reco
 
 ## 11. Data Flow Summary
 
-```
+```text
 DRONE
   │─── RTSP publish ──────────────────► MediaMTX [:8554]
   │─── MQTT publish ──────────────────► Mosquitto [:8883]
@@ -463,20 +544,26 @@ DRONE
                                             │
                      ┌──────────────────────┼──────────────────────┐
                      ▼                      ▼                      ▼
-               RTSP publish           HTTP POST /alert       HTTP POST /ingest
-               (processed)            to ws-server           to db-worker
+               RTMP publish           HTTP POST /alert       HTTP POST /save_alert
+               (annotated)            to ws-server           to db-worker
                      │                      │                      │
                      ▼                      ▼                      ▼
                MediaMTX            WebSocket push          Write to external DB
-               [:8554/processed]   to viewer UI
+               [:1935/annot]       to viewer UI
                      │                      │
-                     └──────────┬───────────┘
-                                ▼
-                             Traefik
-                             HTTPS/WSS
-                                │
-                             VIEWER UI
-                       (HLS/WebRTC video + WSS alerts)
+                     │    ┌─────────────────┘
+                     │    ▼
+                     │  Traefik
+                     │  HTTPS/WSS
+                     │    │
+                     │  VIEWER UI
+                     │  (HLS/WebRTC video + WSS alerts)
+                     │
+                     ▼  (record to /recordings volume)
+               Recorder ◄── webhook on segment complete
+                     │
+                     ▼
+          Azure Blob / S3 / local volume
 ```
 
 ---
@@ -484,17 +571,21 @@ DRONE
 ## 12. Production Readiness Checklist
 
 - [ ] GPU driver + nvidia-container-toolkit pre-installed on all session VMs
-- [ ] Wildcard TLS certificate provisioned and auto-renewed (wildcard covers RTSP/MQTT ports; Traefik covers HTTP)
+- [ ] `shm_size: 256m` set on the app container (POSIX SHM frame buffers require it)
+- [ ] Wildcard TLS certificate provisioned and auto-renewed (wildcard covers RTSP/MQTT ports; Traefik covers HTTP/WSS)
 - [ ] MediaMTX auth hook configured (validates drone token against control plane)
 - [ ] Mosquitto password files generated per-session (not shared config)
-- [ ] DB Worker retry logic with exponential backoff; dead-letter queue for failed writes
+- [ ] DB Worker queue depth monitored; `503` responses from `/save_alert` surface in app logs as warnings
+- [ ] Recorder upload failures logged and monitored; recordings volume sized for worst-case retention before upload
+- [ ] `RECORDING_DELETE_LOCAL_ON_SUCCESS=true` set when using cloud storage, to prevent the `recordings` volume from filling
+- [ ] Storage credentials for recorder scoped to session's prefix (least-privilege)
 - [ ] Control plane health probe: poll MediaMTX `/v3/paths/list`; auto-teardown on stream absence > threshold
 - [ ] Session maximum duration enforced (prevents zombie sessions)
 - [ ] Resource limits set on all containers (`deploy.resources.limits` in compose) — prevent a runaway app from starving the broker
 - [ ] Log aggregation: forward container logs to a central collector (e.g. Loki, CloudWatch) with `session_id` label
-- [ ] Metrics: expose `/metrics` from app, ws-server, db-worker; scrape with Prometheus on the VM; push to central Grafana
+- [ ] Metrics: expose `/metrics` from app, ws-server, db-writer, recorder; scrape with Prometheus; push to central Grafana
 - [ ] VM image baked with Docker, nvidia-toolkit, compose plugin — cold-start time < 30 s
-- [ ] Firewall rules: only ports 80, 443, 8554, 8883 open externally; block all others at cloud security-group level
+- [ ] Firewall rules: only ports 80, 443, 8554, 1935, 8889, 1883 open externally; block all others at cloud security-group level
 - [ ] External DB has automated backups, connection pooling (PgBouncer), and a read replica if alert queries are heavy
 
 ---
@@ -511,4 +602,4 @@ In K8s, each session becomes a **Namespace** with its own deployments for each c
 
 ---
 
-*Document version: 1.0 — designed for single-stream, latency-sensitive drone monitoring. Revise section 8 (regional capacity) based on observed concurrent user growth.*
+*Document version: 1.1 — added recorder sidecar (MediaMTX-based recording replacing in-app video persistence); updated port references; revised data flow and security model accordingly.*
