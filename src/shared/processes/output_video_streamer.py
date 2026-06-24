@@ -2,19 +2,18 @@ import multiprocessing as mp
 import multiprocessing.synchronize
 import threading
 import logging
-from queue import Empty as QueueEmptyException, Queue, Full as QueueFullException
+from queue import Empty as QueueEmptyException, Full as QueueFullException
 from time import time
 from typing import Optional
 import cv2
 import numpy as np
 from pydantic import BaseModel, PositiveFloat, PositiveInt
 
-from src.shared.processes.video_stream_manager import VideoStreamManager
+from src.shared.processes.video_stream_manager import VideoStreamManager, VideoFileWriter
 from src.shared.processes.frame_buffer import FrameBuffer
 from src.shared.processes.messages import AnnotationSlotMetadata
 from src.shared.processes.constants import (
     FPS,
-    CODEC,
     PIPELINE_QUEUE_TIMEOUT,
     VIDEO_WRITER_HANDOFF_TIMEOUT,
     MAX_SIZE_VIDEO_STREAM,
@@ -68,23 +67,23 @@ class VideoProducerProcess(mp.Process):
     AnnotationSlotMetadata from the input queue and the full-resolution annotated
     frame from the dedicated input FrameBuffer.
 
-    The main loop takes a zero-copy view of each SHM slot and hands (view, slot_index)
-    to a background writer thread via an in-process queue — no numpy copy needed.
-    The writer thread performs the slow I/O (cv2.VideoWriter.write + stream manager
-    push) and releases the slot only after all reads are complete, following the same
-    late-release zero-copy pattern used across the pipeline.
+    The main loop copies each frame out of its SHM slot, releases the slot, and fans
+    the frame out to two independent FFmpeg sinks. Each sink owns a background thread
+    and bounded queue, so the slow encode/write happens off the main loop and a stall
+    in one sink never blocks the other:
 
-    Each frame is:
-    - written to a local video file via cv2.VideoWriter
-    - pushed to VideoStreamManager (background thread via FFmpeg) for RTMP streaming,
-      if media_server_url is configured
+    - VideoFileWriter: GPU-encoded (h264_nvenc) local mp4 recording. Connection-
+      independent and never reconnects. Encoding on the GPU's dedicated encoder ASIC
+      keeps the recording at full frame rate even when the CPU is saturated by the
+      rest of the pipeline (the previous in-process cv2.VideoWriter software encode
+      was CPU-starved and dropped ~half the frames under load).
+    - VideoStreamManager: libx264 RTMP stream to the media server (only if
+      media_server_url is configured). Reconnects automatically if the link drops.
 
-    Both outputs are lazily initialised inside the writer thread on the first frame,
-    since cv2.VideoWriter and FFmpeg both require frame dimensions at construction time.
-
-    On clean shutdown (POISON_PILL received), the writer thread drains its queue before
-    stopping so all buffered frames are encoded. The local video path is then passed to
-    the downstream PersistenceProcess via output_queue for cloud upload.
+    Both sinks are lazily started on the first frame, since FFmpeg needs the frame
+    dimensions at launch. On clean shutdown (POISON_PILL) each sink drains its queue
+    and closes FFmpeg so the encoded outputs are finalized; the local video path is
+    then passed to the downstream PersistenceProcess via output_queue for upload.
 
     Termination:
     - Clean shutdown: POISON_PILL received on the input queue.
@@ -109,106 +108,45 @@ class VideoProducerProcess(mp.Process):
 
         self.work_finished = mp.Event()
 
-        # Lazily initialised inside the writer thread on the first frame
-        self.writer: Optional[cv2.VideoWriter] = None
+        # Lazily started on the first frame (FFmpeg needs frame dims at launch).
+        self.file_writer: Optional[VideoFileWriter] = None
         self.stream_manager: Optional[VideoStreamManager] = None
-        self._video_filename: str = ""  # set at run() start from config
+        self._video_filename: str = ""      # set at run() start from config
+        self._recording_active = False      # True once the file sink starts cleanly
 
-        # Background writer thread: receives (view, slot_index) tuples, performs
-        # slow I/O, then releases the slot. Bounded by the SHM pool size so it
-        # never accumulates more than MAX_SIZE_VIDEO_STREAM in-flight entries.
-        self._writer_queue: Queue = Queue(maxsize=MAX_SIZE_VIDEO_STREAM)
-        self._writer_thread: Optional[threading.Thread] = None
-        self._writer_stop = threading.Event()
+    def _start_sinks(self, width: int, height: int):
+        """Start both FFmpeg sinks on the first frame, once dimensions are known."""
+        if self.file_writer is not None:
+            self.file_writer.set_frame_dims(width, height)
+            if self.file_writer.start():
+                self._recording_active = True
+                logger.info(f"Recording started: '{self._video_filename}' ({width}×{height})")
+            else:
+                logger.error("VideoFileWriter failed to start; local recording disabled.")
+                self.file_writer = None
 
-    def _init_writer(self, width: int, height: int):
-        fourcc = cv2.VideoWriter_fourcc(*CODEC)
-        self.writer = cv2.VideoWriter(
-            filename=self._video_filename,
-            fourcc=fourcc,
-            fps=self.config.fps,
-            frameSize=(width, height),
-        )
-        logger.info(f"VideoWriter initialised. File: '{self._video_filename}'. Frame size: {width}×{height}")
-
-    def _writer_loop(self):
-        """
-        Background thread: dequeues (view, slot_index) pairs, writes to disk,
-        pushes to stream manager, then releases the SHM slot.
-
-        Exits only after draining the queue once _writer_stop is set, so all
-        buffered frames are flushed before shutdown.
-        """
-        while True:
-            try:
-                item = self._writer_queue.get(timeout=0.01)
-            except QueueEmptyException:
-                if self._writer_stop.is_set():
-                    break
-                continue
-
-            frame, put_time = item
-            t_dequeue = time()
-            h, w = frame.shape[:2]
-
-            # Lazy-init on first frame (dimensions known only at runtime)
-            if self.writer is None:
-                self._init_writer(w, h)
-            assert self.writer is not None
-            if self.stream_manager is not None and self.stream_manager.stream_thread is None:
-                self.stream_manager.set_frame_dims(w, h)
-                if not self.stream_manager.start():
-                    logger.warning("VideoStreamManager failed to start; RTMP streaming disabled.")
-                    self.stream_manager = None
-
-            self.writer.write(frame)
-            t_write = time()
-
-            if self.stream_manager:
-                self.stream_manager.push_to_queue(frame)
-            t_push = time()
-
-            def ms(a, b): return f"{(b - a) * 1000:.1f}"
-            logger.debug(
-                f"[TIMING] "
-                f"queue_lag={ms(put_time, t_dequeue)}ms | "
-                f"write={ms(t_dequeue, t_write)}ms | "
-                f"push={ms(t_write, t_push)}ms | "
-                f"total={ms(put_time, t_push)}ms"
-            )
+        if self.stream_manager is not None:
+            self.stream_manager.set_frame_dims(width, height)
+            if not self.stream_manager.start():
+                logger.warning("VideoStreamManager failed to start; RTMP streaming disabled.")
+                self.stream_manager = None
 
     def _shutdown(self):
-        """Drain writer thread, flush and close the video file, stop streaming, handoff to persistence."""
+        """Stop both sinks (drain + finalize), then hand the recording off to persistence."""
 
-        # 1. Signal writer thread to drain remaining frames then stop; wait for it.
-        self._writer_stop.set()
-        if self._writer_thread is not None:
-            self._writer_thread.join(timeout=10.0)
-            if self._writer_thread.is_alive():
-                logger.warning("VideoWriterThread did not stop cleanly within timeout.")
-                # Drain remaining items so the writer thread can exit cleanly.
-                while not self._writer_queue.empty():
-                    try:
-                        self._writer_queue.get_nowait()
-                    except QueueEmptyException:
-                        break
-
-        # 2. Finalize the local file immediately — before stopping the stream manager,
-        #    so the moov atom is written even if the process is killed during stream cleanup.
+        # Finalize the recording first so the mp4 is safe even if stream cleanup is slow.
         save_succeeded = False
-        if self.writer:
-            try:
-                self.writer.release()
+        if self.file_writer is not None:
+            self.file_writer.stop()
+            save_succeeded = self._recording_active
+            if save_succeeded:
                 logger.info(f"Recording saved at '{self._video_filename}'")
-                save_succeeded = True
-            except Exception as e:
-                logger.error(f"Error saving recording: {e}")
 
-        # 3. Stop the RTMP stream manager (can be slow; local file is already safe).
-        if self.stream_manager:
+        # Stop the RTMP stream manager (can be slow; local file is already safe).
+        if self.stream_manager is not None:
             self.stream_manager.stop()
 
-        # Notify PersistenceProcess: send path on success, None on failure.
+        # Notify PersistenceProcess: send path on success, None on failure/absence.
         # The persistence process exits as soon as it receives this value — no pill needed.
         payload = self._video_filename if save_succeeded else None
         try:
@@ -216,7 +154,7 @@ class VideoProducerProcess(mp.Process):
             if save_succeeded:
                 logger.info("Video path passed to persistence process.")
             else:
-                logger.info("Video save failed: persistence process notified to skip upload.")
+                logger.info("Video save failed/absent: persistence process notified to skip upload.")
         except Exception as e:
             logger.error(f"Failed to communicate with persistence process: {e}. Setting error event.")
             self.error_event.set()
@@ -228,12 +166,24 @@ class VideoProducerProcess(mp.Process):
         poison_pill_received = False
 
         # Reset in case run() is ever called again (defensive)
-        self.writer = None
+        self.file_writer = None
         self.stream_manager = None
-        self._writer_thread = None
-
+        self._recording_active = False
         self._video_filename = self.config.video_file_path
 
+        # Local GPU-encoded recording sink (always present).
+        self.file_writer = VideoFileWriter(
+            file_path=self._video_filename,
+            fps=self.config.fps,
+            queue_max_size=self.config.stream_manager_queue_max_size,
+            queue_get_timeout=self.config.queue_timeout,
+            ffmpeg_startup_timeout=self.config.stream_manager_ffmpeg_startup_timeout,
+            ffmpeg_shutdown_timeout=self.config.stream_manager_ffmpeg_shutdown_timeout,
+            startup_timeout=self.config.stream_manager_startup_timeout,
+            shutdown_timeout=self.config.stream_manager_shutdown_timeout,
+        )
+
+        # Optional RTMP streaming sink.
         if self.config.media_server_url:
             self.stream_manager = VideoStreamManager(
                 mediaserver_url=self.config.media_server_url,
@@ -246,13 +196,15 @@ class VideoProducerProcess(mp.Process):
                 shutdown_timeout=self.config.stream_manager_shutdown_timeout,
             )
 
-        self._writer_stop.clear()
-        self._writer_thread = threading.Thread(
-            target=self._writer_loop,
-            name="VideoWriterThread",
-            daemon=True,
-        )
-        self._writer_thread.start()
+        sinks_started = False
+
+        # ---- diagnostics: is the loop input-starved (supply-bound) or backlogged
+        #      (VideoProducer-bound). Summarised once per second at INFO. ----
+        _diag_frames = 0      # frames processed this window
+        _diag_empty = 0       # empty gets this window (loop idle waiting for input)
+        _diag_qmax = 0        # max input backlog seen after a get
+        _diag_proc_sum = 0.0  # sum of per-frame processing time (read+release+push)
+        _diag_proc_max = 0.0
 
         try:
             while not self.error_event.is_set():
@@ -261,7 +213,7 @@ class VideoProducerProcess(mp.Process):
                 try:
                     meta = self.input_meta_queue.get(timeout=self.config.queue_timeout)
                 except QueueEmptyException:
-                    logger.debug("Input queue empty. Waiting for frames ...")
+                    _diag_empty += 1
                     continue
 
                 # ---- poison pill: stop ----
@@ -272,20 +224,43 @@ class VideoProducerProcess(mp.Process):
 
                 assert isinstance(meta, AnnotationSlotMetadata)
 
+                _t_proc = time()
+                _qd = self.input_meta_queue.qsize()  # frames still queued behind this one
+
                 # Copy frame out of SHM and release the slot immediately so the
-                # upstream annotator can reuse it regardless of writer queue depth.
+                # upstream annotator can reuse it regardless of sink queue depth.
                 frame = self.input_frame_buffer.read(meta.slot_index)
                 self.input_frame_buffer.release(meta.slot_index)
 
-                put_time = time()
-                try:
-                    self._writer_queue.put((frame, put_time), timeout=self.config.queue_timeout)
-                    logger.debug(
-                        f"[TIMING] frame={meta.frame_id} slot={meta.slot_index} | "
-                        f"queue_put={(time() - put_time) * 1000:.1f}ms"
+                # Lazy-start both sinks on the first frame (dims known only at runtime).
+                if not sinks_started:
+                    h, w = frame.shape[:2]
+                    self._start_sinks(w, h)
+                    sinks_started = True
+
+                # Fan out: each sink encodes/writes on its own thread (non-blocking).
+                if self.file_writer is not None:
+                    self.file_writer.push_to_queue(frame)
+                if self.stream_manager is not None:
+                    self.stream_manager.push_to_queue(frame)
+
+                # ---- diagnostics summary (once per ~second) ----
+                _proc = time() - _t_proc
+                _diag_frames += 1
+                _diag_proc_sum += _proc
+                if _proc > _diag_proc_max:
+                    _diag_proc_max = _proc
+                if _qd > _diag_qmax:
+                    _diag_qmax = _qd
+                if _diag_frames >= self.config.fps:
+                    logger.info(
+                        f"[DIAG main] frames/s={_diag_frames} | empty_gets={_diag_empty} | "
+                        f"in_backlog_max={_diag_qmax} | "
+                        f"proc_avg={_diag_proc_sum / _diag_frames * 1000:.1f}ms | "
+                        f"proc_max={_diag_proc_max * 1000:.1f}ms"
                     )
-                except QueueFullException:
-                    logger.warning(f"Writer queue full; frame {meta.frame_id} dropped for video output.")
+                    _diag_frames = _diag_empty = _diag_qmax = 0
+                    _diag_proc_sum = _diag_proc_max = 0.0
 
         except Exception as e:
             logger.critical(f"Critical error in VideoProducerProcess: {e}", exc_info=True)
@@ -320,7 +295,7 @@ if __name__ == "__main__":
     DURATION_S    = 30                # how long to run
 
     # Set to an RTMP URL to benchmark with streaming, or None to test disk-write only.
-    RTMP_URL = None  # e.g. "rtmp://localhost:1935/live/bench"
+    RTMP_URL = "rtmp://172.17.0.2:1935/annot"  # e.g. "rtmp://localhost:1935/live/bench"
 
     # Set one to True to test the corresponding shutdown path.
     TRIGGER_POISON_PILL = True   # clean shutdown after DURATION_S
@@ -333,6 +308,10 @@ if __name__ == "__main__":
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[logging.StreamHandler()],
     )
+    # Surface the per-sink [TIMING ...] debug lines (the module loggers are pinned to
+    # WARNING by default so they stay quiet under the full pipeline).
+    for _ln in ("main.video_out", "main.video_out.stream", "main.video_out.file"):
+        logging.getLogger(_ln).setLevel(logging.DEBUG)
 
     # ---- shared objects ----
     error_event   = mp.Event()
@@ -395,7 +374,7 @@ if __name__ == "__main__":
             try:
                 input_meta_q.put(meta, timeout=0.1)
                 stats["produced"] += 1
-            except Full:
+            except QueueFullException:
                 input_buf.release(slot)
                 stats["dropped_queue_full"] += 1
                 print(f"[Producer] Meta queue full — frame {frame_id} dropped.")
@@ -460,6 +439,7 @@ if __name__ == "__main__":
         f"  Dropped  : {total_dropped}  "
         f"(no_slot={stats['dropped_no_slot']}  queue_full={stats['dropped_queue_full']})\n"
         f"  Drop rate: {total_dropped / max(1, total + total_dropped) * 100:.1f}%\n"
-        f"  Per-frame timing: logs/video_out.log\n"
-        f"  FFmpeg timing   : logs/video_out_stream.log\n"
+        f"  Producer log : logs/video_out.log\n"
+        f"  File sink    : logs/video_out_file.log   (h264_nvenc recording)\n"
+        f"  Stream sink  : logs/video_out_stream.log (libx264 RTMP)\n"
     )

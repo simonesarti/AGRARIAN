@@ -412,6 +412,7 @@ def main():
     except Exception as e:
         logger.critical(f"Failed to instantiate one of the processes: {e}", exc_info=True)
         for buf in frame_buffers:
+            buf.close()
             buf.unlink()
         return
 
@@ -471,7 +472,17 @@ def main():
         p.join()
         logger.info(f"{p.name} joined.")
 
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            logger.info("CUDA context flushed.")
+    except Exception as e:
+        logger.warning(f"CUDA cleanup failed (non-fatal): {e}")
+
     for buf in frame_buffers:
+        buf.close()
         buf.unlink()
     logger.info("Shared memory freed. Pipeline shut down.")
 

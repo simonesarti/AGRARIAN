@@ -34,6 +34,7 @@ class AnomalyEvent:
     max_social_score: float
     mean_social_score: float
     triggered_by: str   # "ae" | "social" | "both"
+    keyframe_count: int = 1  # number of scored keyframes this event has been active for
 
     @property
     def duration_ms(self) -> float:
@@ -140,11 +141,29 @@ class AnomalyDetector:
         social_scores: dict[int, float] = {}
 
         # Only complete sequences are scored (both AE and social).
-        # Scores are smoothed
-        for tid, tf in track_features.items():
-            if len(tf.feature_sequence) < self._ae_seq_len:
-                continue
-            ae_z = self._ae_z_score(tf) if self.cfg.use_ae else 0.0
+        eligible_ids = [
+            tid for tid, tf in track_features.items()
+            if len(tf.feature_sequence) >= self._ae_seq_len
+        ]
+
+        # Batch AE scoring: single H2D copy + one forward pass for all eligible tracks,
+        # instead of N separate GPU round-trips (each with kernel-launch and D2H sync overhead).
+        ae_z_map: dict[int, float] = {}
+        if eligible_ids and self.cfg.use_ae:
+            seqs = np.stack([
+                self._normalize(track_features[tid].feature_sequence)
+                for tid in eligible_ids
+            ])
+            batch = torch.from_numpy(seqs).float().to(self.device)
+            errors = self.ae.reconstruction_error(batch).cpu().numpy()  # (N,)
+            ae_z_map = {
+                tid: (float(errors[i]) - self._ae_mean) / self._ae_std
+                for i, tid in enumerate(eligible_ids)
+            }
+
+        for tid in eligible_ids:
+            tf = track_features[tid]
+            ae_z = ae_z_map.get(tid, 0.0)
             soc = self.social.score(self._normalize(tf.feature_sequence[-1])) if self.cfg.use_social else 0.0
             self._ae_history[tid].append(ae_z)
             self._social_history[tid].append(soc)
@@ -166,7 +185,7 @@ class AnomalyDetector:
         confirmed: list[int] = []
         for tid in anomalous:
             ev = self._active_events.get(tid)
-            if ev is not None and ev.end_frame - ev.start_frame + 1 >= self.cfg.min_anomaly_duration:
+            if ev is not None and ev.keyframe_count >= self.cfg.min_anomaly_duration:
                 confirmed.append(tid)
 
         ae_elevated_set  = {tid for tid in ae_scores if self.cfg.use_ae and ae_scores[tid] > self.cfg.ae_threshold}
@@ -208,11 +227,6 @@ class AnomalyDetector:
             return features
         return (features - self._feat_mean) / self._feat_std
 
-    def _ae_z_score(self, tf: TrackFeatures) -> float:
-        seq = torch.from_numpy(self._normalize(tf.feature_sequence)).unsqueeze(0).float().to(self.device)
-        error = float(self.ae.reconstruction_error(seq).item())
-        return (error - self._ae_mean) / self._ae_std
-
     def _open_or_extend_event(self, tid, frame_idx, ts, ae_score, social_score, ae_flagged, soc_flagged):
         if self._active_events.get(tid) is None:
             triggered_by = "both" if ae_flagged and soc_flagged else ("ae" if ae_flagged else "social")
@@ -227,12 +241,14 @@ class AnomalyDetector:
                 max_social_score=social_score,
                 mean_social_score=social_score,
                 triggered_by=triggered_by,
+                keyframe_count=1,
             )
         else:
             ev = self._active_events[tid]
             assert ev is not None
             ev.end_frame = frame_idx
             ev.end_time_ms = ts
+            ev.keyframe_count += 1
             ev.max_ae_score = max(ev.max_ae_score, ae_score)
             ev.max_social_score = max(ev.max_social_score, social_score)
             n = ev.end_frame - ev.start_frame + 1
@@ -248,5 +264,5 @@ class AnomalyDetector:
         ev = self._active_events.pop(tid, None)
         if ev is None:
             return
-        if ev.end_frame - ev.start_frame + 1 >= self.cfg.min_anomaly_duration:
+        if ev.keyframe_count >= self.cfg.min_anomaly_duration:
             self._completed_events.append(ev)

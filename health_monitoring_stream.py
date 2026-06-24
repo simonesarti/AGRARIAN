@@ -25,8 +25,6 @@ from src.shared.processes.constants import (
     LOCAL_OUTPUT_DIR,
     VIDEO_STREAM_READER_PROCESSING_SHAPE,
     VIDEO_STREAM_READER_ORIGINAL_SHAPE,
-    MAX_SIZE_FRAME_READER_OUT,
-    MAX_SIZE_DETECTION_IN,
     MAX_SIZE_NOTIFICATIONS_STREAM,
     MAX_SIZE_VIDEO_STREAM,
     FPS,
@@ -75,7 +73,7 @@ def main():
 
     _engine_path = Path("engine/detection_1280_720_yolo11m.engine")
     _use_engine  = _engine_path.is_file()
-    _anomaly_cfg_file = "configs/health_monitoring/anomaly_detector_8fps.yaml"
+    _anomaly_cfg_file = "configs/health_monitoring/anomaly_detector_5fps.yaml"
 
     try:
         tracking_args          = read_yaml_config("configs/health_monitoring/tracker.yaml")
@@ -111,16 +109,16 @@ def main():
     # ============== FRAME BUFFERS ==============
     # n_slots matches the corresponding metadata queue maxsize: each queue entry
     # holds exactly one slot index, so queue capacity == max in-flight frames.
+    # 2*_frame_skip + 3: holds two full groups (K + frame_skip passthrough frames each)
+    # plus one slot of headroom to avoid stalling while the interpolator flushes a burst.
+    _slot_count = 2 * _frame_skip + 3
 
-    # _frame_skip + 4 = keyframe1 + passthorugh + keyframe2 + headroom of 2 
-    # for backpressure relieve, like for other processes
-
-    reader_to_tracking_buf       = FrameBuffer(_3ch, n_slots=MAX_SIZE_FRAME_READER_OUT)
-    tracking_to_anomaly_buf      = FrameBuffer(_3ch, n_slots=MAX_SIZE_DETECTION_IN)
-    anomaly_to_interpolator_buf    = FrameBuffer(_3ch, n_slots=_frame_skip + 4)
-    interpolator_to_annotation_buf = FrameBuffer(_3ch, n_slots=_frame_skip + 4)
-    annotation_to_alert_buf      = FrameBuffer(_ann, n_slots=MAX_SIZE_NOTIFICATIONS_STREAM)
-    annotation_to_video_buf      = FrameBuffer(_ann, n_slots=MAX_SIZE_VIDEO_STREAM)
+    reader_to_tracking_buf         = FrameBuffer(_3ch, n_slots=_slot_count)
+    tracking_to_anomaly_buf        = FrameBuffer(_3ch, n_slots=_slot_count)
+    anomaly_to_interpolator_buf    = FrameBuffer(_3ch, n_slots=_slot_count)
+    interpolator_to_annotation_buf = FrameBuffer(_3ch, n_slots=_slot_count)
+    annotation_to_alert_buf        = FrameBuffer(_ann, n_slots=MAX_SIZE_NOTIFICATIONS_STREAM)
+    annotation_to_video_buf        = FrameBuffer(_ann, n_slots=_slot_count)
 
     frame_buffers = [
         reader_to_tracking_buf,
@@ -133,12 +131,12 @@ def main():
 
     # ============== METADATA QUEUES ==============
 
-    reader_to_tracking_q         = mp.Queue(maxsize=MAX_SIZE_FRAME_READER_OUT)
-    tracking_to_anomaly_q        = mp.Queue(maxsize=MAX_SIZE_DETECTION_IN)
-    anomaly_to_interpolator_q    = mp.Queue(maxsize=_frame_skip + 4)
-    interpolator_to_annotation_q = mp.Queue(maxsize=_frame_skip + 4)
+    reader_to_tracking_q         = mp.Queue(maxsize=_slot_count)
+    tracking_to_anomaly_q        = mp.Queue(maxsize=_slot_count)
+    anomaly_to_interpolator_q    = mp.Queue(maxsize=_slot_count)
+    interpolator_to_annotation_q = mp.Queue(maxsize=_slot_count)
     annotation_to_alert_q        = mp.Queue(maxsize=MAX_SIZE_NOTIFICATIONS_STREAM)
-    annotation_to_video_q        = mp.Queue(maxsize=MAX_SIZE_VIDEO_STREAM)
+    annotation_to_video_q        = mp.Queue(maxsize=_slot_count)
     video_to_persistence_q       = mp.Queue(maxsize=1)
 
     # ============== BUILD PROCESS CONFIGS ==============
@@ -339,6 +337,7 @@ def main():
     except Exception as e:
         logger.critical(f"Failed to instantiate one of the processes: {e}", exc_info=True)
         for buf in frame_buffers:
+            buf.close()
             buf.unlink()
         return
 
@@ -396,7 +395,17 @@ def main():
         p.join()
         logger.info(f"{p.name} joined.")
 
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            logger.info("CUDA context flushed.")
+    except Exception as e:
+        logger.warning(f"CUDA cleanup failed (non-fatal): {e}")
+
     for buf in frame_buffers:
+        buf.close()
         buf.unlink()
     logger.info("Shared memory freed. Pipeline shut down.")
 

@@ -15,14 +15,12 @@ CLASS_COLOR = [BLUE, PURPLE]
 
 
 # generate the constant images based on the frame shape and color
-def get_danger_intersect_colored_frames(shape) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def get_danger_intersect_colored_frames(shape) -> tuple[np.ndarray, np.ndarray]:
     red_quarter    = tuple(int(c * 0.25) for c in RED)
     yellow_quarter = tuple(int(c * 0.25) for c in YELLOW)
     color_danger_frame    = np.full(shape, red_quarter,    dtype=np.uint8)
     color_intersect_frame = np.full(shape, yellow_quarter, dtype=np.uint8)
-    danger_buf  = np.zeros(shape, dtype=np.uint8)
-    overlay_buf = np.zeros(shape, dtype=np.uint8)
-    return color_danger_frame, color_intersect_frame, danger_buf, overlay_buf
+    return color_danger_frame, color_intersect_frame
 
 def draw_safety_areas(
         annotated_frame,
@@ -44,21 +42,6 @@ def draw_detections(
     for obj_class, box_corner1, box_corner2 in zip(classes, boxes_corner1, boxes_corner2):
         # Draw bounding box on annotated frame (blue sheep, purple goat), on top of safety circles
         cv2.rectangle(annotated_frame, box_corner1, box_corner2, CLASS_COLOR[obj_class], 2)
-
-def draw_dangerous_area(
-        annotated_frame,
-        dangerous_mask_no_intersection,
-        intersection,
-        color_danger_frame,
-        color_intersect_frame,
-        danger_buf,
-        overlay_buf,
-):
-    cv2.add(annotated_frame, color_danger_frame,    dst=danger_buf)
-    cv2.add(annotated_frame, color_intersect_frame, dst=overlay_buf)
-    cv2.copyTo(danger_buf,  dangerous_mask_no_intersection, annotated_frame)
-    cv2.copyTo(overlay_buf, intersection,                   annotated_frame)
-
 
 def draw_count(
         classes,

@@ -11,7 +11,6 @@ from pydantic import BaseModel, PositiveFloat
 
 from src.danger_detection.output.frames import (
     draw_count,
-    draw_dangerous_area,
     draw_detections,
     draw_safety_areas,
     get_danger_intersect_colored_frames,
@@ -93,8 +92,6 @@ class AnnotationWorker(mp.Process):
 
         color_danger_frame = None
         color_intersect_frame = None
-        danger_buf = None
-        overlay_buf = None
         _resize_buf = None
 
         try:
@@ -128,7 +125,7 @@ class AnnotationWorker(mp.Process):
                 frame_height, frame_width = frame.shape[:2]
 
                 if color_danger_frame is None:
-                    color_danger_frame, color_intersect_frame, danger_buf, overlay_buf = get_danger_intersect_colored_frames(shape=frame.shape)
+                    color_danger_frame, color_intersect_frame = get_danger_intersect_colored_frames(shape=frame.shape)
                     orig_w, orig_h = meta.original_wh
                     _resize_buf = np.empty((orig_h, orig_w, 3), dtype=np.uint8)
                     logger.info(f"Annotation process setup with frame size W×H = {frame_width}×{frame_height}")
@@ -140,11 +137,13 @@ class AnnotationWorker(mp.Process):
                     draw_safety_areas(frame, meta.boxes_centers, meta.safety_radius_pixels)
                 t_safety = time()
 
-                draw_dangerous_area(frame, danger_mask, intersection_mask, color_danger_frame, color_intersect_frame, danger_buf, overlay_buf)
+                # add danger overlay
+                cv2.add(frame, color_danger_frame, dst=frame, mask=danger_mask)
+                # add intersection overlay
+                if meta.alert_msg != "":
+                    cv2.add(frame, color_intersect_frame, dst=frame, mask=intersection_mask)
                 t_danger = time()
-
-                self.input_frame_buffer.release(meta.slot_index)
-
+                
                 draw_detections(frame, meta.classes, meta.boxes_corner1, meta.boxes_corner2)
                 t_detections = time()
 
@@ -159,6 +158,9 @@ class AnnotationWorker(mp.Process):
                     interpolation=cv2.INTER_LINEAR,
                 )
                 t_resize = time()
+
+                # Release only after the last read from the SHM view (cv2.resize).
+                self.input_frame_buffer.release(meta.slot_index)
 
                 # ---- fan-out: write annotated frame to both consumers independently----
                 danger_exists = bool(meta.alert_msg)
