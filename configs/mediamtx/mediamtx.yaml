@@ -21,3 +21,12 @@ paths:
     source: publisher
   annot:
     source: publisher
+    record: yes
+    recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+    recordFormat: fmp4
+    # One segment per publisher session (new segment only on reconnect, not by time).
+    # Set to e.g. 1h to split long sessions into hourly files.
+    recordSegmentDuration: 0s
+    # Notify the recorder sidecar when a segment is complete so it can upload it.
+    # $MTX_SEGMENT_PATH is set by MediaMTX at hook runtime.
+    runOnRecordSegmentComplete: wget -q -O /dev/null --post-data="path=$MTX_SEGMENT_PATH" http://recorder:8000/on-segment-complete

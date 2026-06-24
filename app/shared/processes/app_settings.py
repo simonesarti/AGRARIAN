@@ -28,8 +28,6 @@ DRONE_SENSOR_HEIGHT_MM,
     TELEMETRY_LISTENER_HOST,
     TELEMETRY_LISTENER_PORT,
     TELEMETRY_LISTENER_QOS_LEVEL,
-    VIDEO_OUT_STORE_DELETE_LOCAL_ON_SUCCESS,
-    VIDEO_OUT_STORE_LOCAL_TARGET_DIR,
     VIDEO_OUT_STREAM_HOST,
     VIDEO_OUT_STREAM_PORT,
     VIDEO_OUT_STREAM_STREAM_KEY,
@@ -157,28 +155,6 @@ class AppSettings(BaseSettings):
     video_out_stream_username: Optional[str]       = None
     video_out_stream_password: Optional[SecretStr] = None
 
-    # ------------------------------------------------------------------ #
-    # VIDEO STORAGE (cloud / local upload after recording)
-    # ------------------------------------------------------------------ #
-
-    # Service: azure, aws, local
-    video_out_store_service:                 Literal["azure", "aws", "local"] = "local"
-    video_out_store_delete_local_on_success: bool = VIDEO_OUT_STORE_DELETE_LOCAL_ON_SUCCESS
-    # Azure Blob Storage
-    video_out_store_azure_connection_string: Optional[SecretStr] = None
-    video_out_store_azure_container_name:    Optional[str]       = None
-    video_out_store_azure_blob_prefix:       str                 = ""
-    # AWS S3
-    video_out_store_aws_bucket_name:         Optional[str]       = None
-    video_out_store_aws_key_prefix:          str                 = ""
-    video_out_store_aws_access_key_id:       Optional[str]       = None
-    video_out_store_aws_secret_access_key:   Optional[SecretStr] = None
-    video_out_store_aws_region_name:         Optional[str]       = None
-    # Local (testing / no-cloud fallback)
-    video_out_store_local_target_dir: str = VIDEO_OUT_STORE_LOCAL_TARGET_DIR
-
-
-
     # ================================================================== #
     # FIELD VALIDATORS
     # ================================================================== #
@@ -187,7 +163,6 @@ class AppSettings(BaseSettings):
         "video_stream_reader_protocol",
         "telemetry_listener_protocol",
         "video_out_stream_protocol",
-        "video_out_store_service",
         mode="before",
     )
     @classmethod
@@ -272,25 +247,6 @@ class AppSettings(BaseSettings):
         else:
             self.video_out_stream_username = None
             self.video_out_stream_password = None
-
-        # --- video storage ---
-        if self.video_out_store_service == "azure":
-            if not self.video_out_store_azure_connection_string:
-                raise ValueError(
-                    "VIDEO_OUT_STORE_AZURE_CONNECTION_STRING is required when "
-                    "VIDEO_OUT_STORE_SERVICE=azure."
-                )
-            if not self.video_out_store_azure_container_name:
-                raise ValueError(
-                    "VIDEO_OUT_STORE_AZURE_CONTAINER_NAME is required when "
-                    "VIDEO_OUT_STORE_SERVICE=azure."
-                )
-        elif self.video_out_store_service == "aws":
-            if not self.video_out_store_aws_bucket_name:
-                raise ValueError(
-                    "VIDEO_OUT_STORE_AWS_BUCKET_NAME is required when "
-                    "VIDEO_OUT_STORE_SERVICE=aws."
-                )
 
         return self
 

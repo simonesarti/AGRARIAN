@@ -9,13 +9,12 @@ import cv2
 import numpy as np
 from pydantic import BaseModel, PositiveFloat, PositiveInt
 
-from app.shared.processes.video_stream_manager import VideoStreamManager, VideoFileWriter
+from app.shared.processes.video_stream_manager import VideoStreamManager
 from app.shared.processes.frame_buffer import FrameBuffer
 from app.shared.processes.messages import AnnotationSlotMetadata
 from app.shared.processes.constants import (
     FPS,
     PIPELINE_QUEUE_TIMEOUT,
-    VIDEO_WRITER_HANDOFF_TIMEOUT,
     MAX_SIZE_VIDEO_STREAM,
     VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT,
     VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,
@@ -44,46 +43,30 @@ class VideoProducerProcessConfig(BaseModel):
     fps: PositiveInt = FPS
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
 
-    # ------- Local file save --------
-    video_file_path: str
-
-    # ------- RTMP stream (media_server_url=None to disable) --------
-    media_server_url: Optional[str] = None
+    # ------- RTMP stream → media server (MediaMTX records on its side) --------
+    media_server_url: str
     stream_manager_queue_max_size: PositiveInt = MAX_SIZE_VIDEO_STREAM
     stream_manager_ffmpeg_startup_timeout: PositiveFloat = VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT
     stream_manager_ffmpeg_shutdown_timeout: PositiveFloat = VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT
     stream_manager_startup_timeout: PositiveFloat = VIDEO_OUT_STREAM_STARTUP_TIMEOUT
     stream_manager_shutdown_timeout: PositiveFloat = VIDEO_OUT_STREAM_SHUTDOWN_TIMEOUT
 
-    # ------- Persistence handoff --------
-    storage_manager_handoff_timeout: PositiveFloat = VIDEO_WRITER_HANDOFF_TIMEOUT
-
 
 class VideoProducerProcess(mp.Process):
     """
-    Terminal process in the danger detection pipeline's video branch.
+    Terminal process in the pipeline's video branch.
 
-    Receives its own dedicated input from DangerAnnotationWorker (fan-out): reads
-    AnnotationSlotMetadata from the input queue and the full-resolution annotated
-    frame from the dedicated input FrameBuffer.
+    Reads AnnotationSlotMetadata from the input queue, copies each frame out of its
+    SHM slot, releases the slot, and pushes the frame to VideoStreamManager which
+    encodes and streams it to the media server via RTMP. The media server (MediaMTX)
+    records the stream on its side; no local file is written here.
 
-    The main loop copies each frame out of its SHM slot, releases the slot, and fans
-    the frame out to two independent FFmpeg sinks. Each sink owns a background thread
-    and bounded queue, so the slow encode/write happens off the main loop and a stall
-    in one sink never blocks the other:
+    VideoStreamManager owns a background thread and bounded queue so the slow
+    FFmpeg encode/push never blocks the main loop. It reconnects automatically if
+    the RTMP link drops.
 
-    - VideoFileWriter: GPU-encoded (h264_nvenc) local mp4 recording. Connection-
-      independent and never reconnects. Encoding on the GPU's dedicated encoder ASIC
-      keeps the recording at full frame rate even when the CPU is saturated by the
-      rest of the pipeline (the previous in-process cv2.VideoWriter software encode
-      was CPU-starved and dropped ~half the frames under load).
-    - VideoStreamManager: libx264 RTMP stream to the media server (only if
-      media_server_url is configured). Reconnects automatically if the link drops.
-
-    Both sinks are lazily started on the first frame, since FFmpeg needs the frame
-    dimensions at launch. On clean shutdown (POISON_PILL) each sink drains its queue
-    and closes FFmpeg so the encoded outputs are finalized; the local video path is
-    then passed to the downstream PersistenceProcess via output_queue for upload.
+    The sink is lazily started on the first frame, since FFmpeg needs the frame
+    dimensions at launch.
 
     Termination:
     - Clean shutdown: POISON_PILL received on the input queue.
@@ -94,7 +77,6 @@ class VideoProducerProcess(mp.Process):
             self,
             input_meta_queue: mp.Queue,
             input_frame_buffer: FrameBuffer,
-            output_queue: mp.Queue,             # to PersistenceProcess (path + pill only)
             error_event: multiprocessing.synchronize.Event,
             config: VideoProducerProcessConfig,
     ):
@@ -102,62 +84,25 @@ class VideoProducerProcess(mp.Process):
 
         self.input_meta_queue = input_meta_queue
         self.input_frame_buffer = input_frame_buffer
-        self.output_queue = output_queue
         self.error_event = error_event
         self.config = config
 
         self.work_finished = mp.Event()
 
         # Lazily started on the first frame (FFmpeg needs frame dims at launch).
-        self.file_writer: Optional[VideoFileWriter] = None
         self.stream_manager: Optional[VideoStreamManager] = None
-        self._video_filename: str = ""      # set at run() start from config
-        self._recording_active = False      # True once the file sink starts cleanly
 
-    def _start_sinks(self, width: int, height: int):
-        """Start both FFmpeg sinks on the first frame, once dimensions are known."""
-        if self.file_writer is not None:
-            self.file_writer.set_frame_dims(width, height)
-            if self.file_writer.start():
-                self._recording_active = True
-                logger.info(f"Recording started: '{self._video_filename}' ({width}×{height})")
-            else:
-                logger.error("VideoFileWriter failed to start; local recording disabled.")
-                self.file_writer = None
-
-        if self.stream_manager is not None:
-            self.stream_manager.set_frame_dims(width, height)
-            if not self.stream_manager.start():
-                logger.warning("VideoStreamManager failed to start; RTMP streaming disabled.")
-                self.stream_manager = None
+    def _start_sink(self, width: int, height: int):
+        """Start the RTMP stream manager on the first frame, once dimensions are known."""
+        self.stream_manager.set_frame_dims(width, height)
+        if not self.stream_manager.start():
+            logger.warning("VideoStreamManager failed to start; RTMP streaming disabled.")
+            self.stream_manager = None
 
     def _shutdown(self):
-        """Stop both sinks (drain + finalize), then hand the recording off to persistence."""
-
-        # Finalize the recording first so the mp4 is safe even if stream cleanup is slow.
-        save_succeeded = False
-        if self.file_writer is not None:
-            self.file_writer.stop()
-            save_succeeded = self._recording_active
-            if save_succeeded:
-                logger.info(f"Recording saved at '{self._video_filename}'")
-
-        # Stop the RTMP stream manager (can be slow; local file is already safe).
+        """Drain and finalize the RTMP stream."""
         if self.stream_manager is not None:
             self.stream_manager.stop()
-
-        # Notify PersistenceProcess: send path on success, None on failure/absence.
-        # The persistence process exits as soon as it receives this value — no pill needed.
-        payload = self._video_filename if save_succeeded else None
-        try:
-            self.output_queue.put(payload, timeout=self.config.storage_manager_handoff_timeout)
-            if save_succeeded:
-                logger.info("Video path passed to persistence process.")
-            else:
-                logger.info("Video save failed/absent: persistence process notified to skip upload.")
-        except Exception as e:
-            logger.error(f"Failed to communicate with persistence process: {e}. Setting error event.")
-            self.error_event.set()
 
     def run(self):
 
@@ -165,15 +110,8 @@ class VideoProducerProcess(mp.Process):
 
         poison_pill_received = False
 
-        # Reset in case run() is ever called again (defensive)
-        self.file_writer = None
-        self.stream_manager = None
-        self._recording_active = False
-        self._video_filename = self.config.video_file_path
-
-        # Local GPU-encoded recording sink (always present).
-        self.file_writer = VideoFileWriter(
-            file_path=self._video_filename,
+        self.stream_manager = VideoStreamManager(
+            mediaserver_url=self.config.media_server_url,
             fps=self.config.fps,
             queue_max_size=self.config.stream_manager_queue_max_size,
             queue_get_timeout=self.config.queue_timeout,
@@ -183,20 +121,7 @@ class VideoProducerProcess(mp.Process):
             shutdown_timeout=self.config.stream_manager_shutdown_timeout,
         )
 
-        # Optional RTMP streaming sink.
-        if self.config.media_server_url:
-            self.stream_manager = VideoStreamManager(
-                mediaserver_url=self.config.media_server_url,
-                fps=self.config.fps,
-                queue_max_size=self.config.stream_manager_queue_max_size,
-                queue_get_timeout=self.config.queue_timeout,
-                ffmpeg_startup_timeout=self.config.stream_manager_ffmpeg_startup_timeout,
-                ffmpeg_shutdown_timeout=self.config.stream_manager_ffmpeg_shutdown_timeout,
-                startup_timeout=self.config.stream_manager_startup_timeout,
-                shutdown_timeout=self.config.stream_manager_shutdown_timeout,
-            )
-
-        sinks_started = False
+        sink_started = False
 
         # ---- diagnostics: is the loop input-starved (supply-bound) or backlogged
         #      (VideoProducer-bound). Summarised once per second at INFO. ----
@@ -232,15 +157,12 @@ class VideoProducerProcess(mp.Process):
                 frame = self.input_frame_buffer.read(meta.slot_index)
                 self.input_frame_buffer.release(meta.slot_index)
 
-                # Lazy-start both sinks on the first frame (dims known only at runtime).
-                if not sinks_started:
+                # Lazy-start on the first frame (dims known only at runtime).
+                if not sink_started:
                     h, w = frame.shape[:2]
-                    self._start_sinks(w, h)
-                    sinks_started = True
+                    self._start_sink(w, h)
+                    sink_started = True
 
-                # Fan out: each sink encodes/writes on its own thread (non-blocking).
-                if self.file_writer is not None:
-                    self.file_writer.push_to_queue(frame)
                 if self.stream_manager is not None:
                     self.stream_manager.push_to_queue(frame)
 
@@ -314,21 +236,18 @@ if __name__ == "__main__":
         logging.getLogger(_ln).setLevel(logging.DEBUG)
 
     # ---- shared objects ----
-    error_event   = mp.Event()
-    input_meta_q  = mp.Queue(maxsize=N_SLOTS)
-    input_buf     = FrameBuffer(frame_shape=FRAME_SHAPE, n_slots=N_SLOTS)
-    output_q      = mp.Queue(maxsize=1)
+    error_event  = mp.Event()
+    input_meta_q = mp.Queue(maxsize=N_SLOTS)
+    input_buf    = FrameBuffer(frame_shape=FRAME_SHAPE, n_slots=N_SLOTS)
 
     config = VideoProducerProcessConfig(
         fps=PRODUCER_FPS,
-        video_file_path="./logs/bench_output.mp4",
         media_server_url=RTMP_URL,
     )
 
     process = VideoProducerProcess(
         input_meta_queue=input_meta_q,
         input_frame_buffer=input_buf,
-        output_queue=output_q,
         error_event=error_event,
         config=config,
     )
@@ -409,15 +328,11 @@ if __name__ == "__main__":
         error_event.set()
 
     prod_thread = threading.Thread(target=producer_loop, daemon=True, name="BenchProducer")
-    pers_thread = threading.Thread(target=persistence_consumer, daemon=True, name="BenchPersistence")
 
     print(f"[Main] Config: FPS={PRODUCER_FPS}  duration={DURATION_S}s  RTMP={'yes' if RTMP_URL else 'no'}")
     print("[Main] Starting VideoProducerProcess ...")
     process.start()
     sleep(0.5)  # let the process fully initialise before feeding it
-
-    print("[Main] Starting persistence consumer ...")
-    pers_thread.start()
 
     print("[Main] Starting producer ...")
     prod_thread.start()
@@ -427,7 +342,6 @@ if __name__ == "__main__":
 
     process.join()
     prod_thread.join(timeout=5.0)
-    pers_thread.join(timeout=15.0)
 
     input_buf.unlink()
 
@@ -440,6 +354,5 @@ if __name__ == "__main__":
         f"(no_slot={stats['dropped_no_slot']}  queue_full={stats['dropped_queue_full']})\n"
         f"  Drop rate: {total_dropped / max(1, total + total_dropped) * 100:.1f}%\n"
         f"  Producer log : logs/video_out.log\n"
-        f"  File sink    : logs/video_out_file.log   (h264_nvenc recording)\n"
         f"  Stream sink  : logs/video_out_stream.log (libx264 RTMP)\n"
     )

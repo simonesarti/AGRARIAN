@@ -1,0 +1,4 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+azure-storage-blob>=12.0
+boto3>=1.0

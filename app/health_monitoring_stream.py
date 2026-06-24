@@ -12,14 +12,6 @@ from app.health_monitoring.processes.hm_interpolator import HMVideoInterpolatorP
 from app.health_monitoring.processes.hm_annotation_worker import HMAnnotationWorker, HMAnnotationWorkerConfig
 from app.shared.processes.output_alert_streamer import NotificationsStreamWriter, NotificationsStreamWriterConfig
 from app.shared.processes.output_video_streamer import VideoProducerProcess, VideoProducerProcessConfig
-from app.shared.processes.video_storage_manager import (
-    AzureBlobStorageConfig,
-    AzureBlobStoragePersistenceProcess,
-    S3StorageConfig,
-    S3StoragePersistenceProcess,
-    LocalStorageConfig,
-    LocalStoragePersistenceProcess,
-)
 from app.shared.processes.frame_buffer import FrameBuffer
 from app.shared.processes.constants import (
     LOCAL_OUTPUT_DIR,
@@ -43,10 +35,6 @@ from app.shared.processes.constants import (
     VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,
     VIDEO_OUT_STREAM_STARTUP_TIMEOUT,
     VIDEO_OUT_STREAM_SHUTDOWN_TIMEOUT,
-    VIDEO_WRITER_HANDOFF_TIMEOUT,
-    VIDEO_OUT_STORE_QUEUE_GET_TIMEOUT,
-    VIDEO_OUT_STORE_MAX_UPLOAD_RETRIES,
-    VIDEO_OUT_STORE_RETRY_BACKOFF_TIME,
 )
 from app.health_monitoring.inference.config import FeaturesConfig, AnomalyConfig, ModelConfig
 from app.utils import read_yaml_config
@@ -133,7 +121,6 @@ def main():
     interpolator_to_annotation_q = mp.Queue(maxsize=_slot_count)
     annotation_to_alert_q        = mp.Queue(maxsize=MAX_SIZE_NOTIFICATIONS_STREAM)
     annotation_to_video_q        = mp.Queue(maxsize=_slot_count)
-    video_to_persistence_q       = mp.Queue(maxsize=1)
 
     # ============== BUILD PROCESS CONFIGS ==============
 
@@ -214,47 +201,13 @@ def main():
     video_producer_config = VideoProducerProcessConfig(
         fps=FPS,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
-        video_file_path=str(output_dir / f"{session_ts}.mp4"),
         media_server_url=s.video_out_stream_url,
         stream_manager_queue_max_size=MAX_SIZE_VIDEO_STREAM,
         stream_manager_ffmpeg_startup_timeout=VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT,
         stream_manager_ffmpeg_shutdown_timeout=VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,
         stream_manager_startup_timeout=VIDEO_OUT_STREAM_STARTUP_TIMEOUT,
         stream_manager_shutdown_timeout=VIDEO_OUT_STREAM_SHUTDOWN_TIMEOUT,
-        storage_manager_handoff_timeout=VIDEO_WRITER_HANDOFF_TIMEOUT,
     )
-
-    _persistence_base = dict(
-        delete_local_on_success=s.video_out_store_delete_local_on_success,
-        queue_get_timeout=VIDEO_OUT_STORE_QUEUE_GET_TIMEOUT,
-        max_retries=VIDEO_OUT_STORE_MAX_UPLOAD_RETRIES,
-        retry_backoff_s=VIDEO_OUT_STORE_RETRY_BACKOFF_TIME,
-    )
-    if s.video_out_store_service == "azure":
-        assert s.video_out_store_azure_connection_string is not None
-        video_persistence_config = AzureBlobStorageConfig(
-            connection_string=s.video_out_store_azure_connection_string.get_secret_value(),
-            container_name=s.video_out_store_azure_container_name,
-            blob_prefix=s.video_out_store_azure_blob_prefix,
-            **_persistence_base,
-        )
-        VideoPersistenceProcessClass = AzureBlobStoragePersistenceProcess
-    elif s.video_out_store_service == "aws":
-        video_persistence_config = S3StorageConfig(
-            bucket_name=s.video_out_store_aws_bucket_name,
-            key_prefix=s.video_out_store_aws_key_prefix,
-            aws_access_key_id=s.video_out_store_aws_access_key_id,
-            aws_secret_access_key=s.video_out_store_aws_secret_access_key.get_secret_value() if s.video_out_store_aws_secret_access_key else None,
-            region_name=s.video_out_store_aws_region_name,
-            **_persistence_base,
-        )
-        VideoPersistenceProcessClass = S3StoragePersistenceProcess
-    else:
-        video_persistence_config = LocalStorageConfig(
-            target_directory=s.video_out_store_local_target_dir,
-            **_persistence_base,
-        )
-        VideoPersistenceProcessClass = LocalStoragePersistenceProcess
 
     # ============== INSTANTIATE PROCESSES ==============
 
@@ -314,15 +267,8 @@ def main():
         video_producer_process = VideoProducerProcess(
             input_meta_queue=annotation_to_video_q,
             input_frame_buffer=annotation_to_video_buf,
-            output_queue=video_to_persistence_q,
             error_event=error_event,
             config=video_producer_config,
-        )
-
-        video_persistence_process = VideoPersistenceProcessClass(
-            input_queue=video_to_persistence_q,
-            error_event=error_event,
-            config=video_persistence_config,
         )
 
     except Exception as e:
@@ -343,7 +289,6 @@ def main():
         annotation_process,
         alert_writer_process,
         video_producer_process,
-        video_persistence_process,
     ]
 
     try:

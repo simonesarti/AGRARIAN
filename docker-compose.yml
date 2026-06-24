@@ -9,6 +9,10 @@
 # WebSocket alerts (via Traefik, WS):    ws://localhost/ws
 # WebSocket alerts (via Traefik, WSS):   wss://<domain>/ws
 # WebSocket alerts (direct):            ws://localhost:8765
+#
+# Recording:  MediaMTX records the annotated stream to the 'recordings' volume.
+#             The recorder sidecar uploads each segment on completion.
+#             Set RECORDING_STORE_SERVICE in .env to local | azure | aws.
 
 name: agrarian
 
@@ -21,6 +25,7 @@ volumes:
   mosquitto-log:
   postgres-data:
   letsencrypt:
+  recordings:
 
 services:
 
@@ -55,12 +60,16 @@ services:
     image: bluenviron/mediamtx:latest
     restart: unless-stopped
     networks: [session-net]
+    depends_on:
+      recorder:
+        condition: service_healthy
     ports:
       - "8554:8554"     # RTSP  — drone publishes here
       - "1935:1935"     # RTMP  — app pushes annotated video here
       - "8889:8889"     # WebRTC — viewer connects here
     volumes:
       - ./configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro
+      - recordings:/recordings
     labels:
       - "traefik.enable=true"
       # HLS playback — strip /hls prefix before forwarding to MediaMTX port 8888
@@ -154,6 +163,31 @@ services:
       - "traefik.http.routers.wss.service=ws-svc"
       - "traefik.http.routers.wss.tls=true"
       - "traefik.http.routers.wss.tls.certresolver=letsencrypt"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # ── Recording upload sidecar ──────────────────────────────────────────────────
+  recorder:
+    build:
+      context: recorder
+    restart: unless-stopped
+    networks: [session-net]
+    environment:
+      RECORDING_STORE_SERVICE:           ${RECORDING_STORE_SERVICE:-local}
+      RECORDING_DELETE_LOCAL_ON_SUCCESS: ${RECORDING_DELETE_LOCAL_ON_SUCCESS:-false}
+      RECORDING_AZURE_CONNECTION_STRING: ${RECORDING_AZURE_CONNECTION_STRING:-}
+      RECORDING_AZURE_CONTAINER_NAME:    ${RECORDING_AZURE_CONTAINER_NAME:-}
+      RECORDING_AZURE_BLOB_PREFIX:       ${RECORDING_AZURE_BLOB_PREFIX:-}
+      RECORDING_AWS_BUCKET_NAME:         ${RECORDING_AWS_BUCKET_NAME:-}
+      RECORDING_AWS_KEY_PREFIX:          ${RECORDING_AWS_KEY_PREFIX:-}
+      RECORDING_AWS_ACCESS_KEY_ID:       ${RECORDING_AWS_ACCESS_KEY_ID:-}
+      RECORDING_AWS_SECRET_ACCESS_KEY:   ${RECORDING_AWS_SECRET_ACCESS_KEY:-}
+      RECORDING_AWS_REGION_NAME:         ${RECORDING_AWS_REGION_NAME:-}
+    volumes:
+      - recordings:/recordings
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 5s

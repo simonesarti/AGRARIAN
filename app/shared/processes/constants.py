@@ -224,11 +224,6 @@ DB_MANAGER_THREAD_CLOSE_TIMEOUT = 5.0                   # 5.0 s
 
 
 # -------------------------------------------------------------------
-# -------------------------- OUT VIDEO WRITER --------------------------
-# -------------------------------------------------------------------
-
-VIDEO_WRITER_HANDOFF_TIMEOUT = 1.0
-
 # ------------------------- OUT VIDEO STREAM  --------------------------
 
 VIDEO_OUT_STREAM_HOST = ALL_INTERFACES
@@ -240,12 +235,3 @@ VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT = 8.0              # 8.0 s
 VIDEO_OUT_STREAM_STARTUP_TIMEOUT = 2.0                      # 2.0 s
 VIDEO_OUT_STREAM_SHUTDOWN_TIMEOUT = 5.0                     # 5.0 s
 
-# ------------------------- OUT VIDEO STORE  --------------------------
-
-VIDEO_OUT_STORE_DELETE_LOCAL_ON_SUCCESS = True
-VIDEO_OUT_STORE_QUEUE_GET_TIMEOUT = 3.0                     # 3.0 s
-VIDEO_OUT_STORE_MAX_UPLOAD_RETRIES = 3                      # 3 attempts
-VIDEO_OUT_STORE_RETRY_BACKOFF_TIME = 5.0                    # 5 s
-
-# Local storage (testing / fallback)
-VIDEO_OUT_STORE_LOCAL_TARGET_DIR = LOCAL_OUTPUT_DIR
