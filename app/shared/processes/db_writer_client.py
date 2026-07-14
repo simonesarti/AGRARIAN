@@ -30,7 +30,10 @@ class DbWriterClient:
         """
         resp = requests.post(
             f"{self._base}/session/start",
-            json={"email": username, "password": password},
+            json={
+                "email": username,
+                "password": password,
+            },
             timeout=self._timeout,
         )
         resp.raise_for_status()

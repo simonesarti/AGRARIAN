@@ -8,7 +8,7 @@ from typing import Optional
 import base64
 from datetime import datetime as dtt
 import logging
-from time import time
+from time import time, sleep
 from pydantic import BaseModel, PositiveFloat, PositiveInt, Field
 
 from app.shared.processes.db_writer_client import DbWriterClient
@@ -123,11 +123,15 @@ class NotificationsStreamWriter(mp.Process):
         # Initialize log file manager (required — exception propagates to run())
         self.log_file = open(self.config.log_file_path, 'a', buffering=1, encoding='utf-8')
 
-        # Initialize DB writer client (required — exception propagates to run())
-        self.db_client = DbWriterClient(self.config.db_writer_url)
-        self.db_client.initialize(self.config.database_username, self.config.database_password)
-        if self.config.video_stream_url:
-            self.db_client.set_stream_url(self.config.video_stream_url)
+        # Initialize DB writer client — auth failure is non-fatal; DB writes are skipped if init fails
+        try:
+            self.db_client = DbWriterClient(self.config.db_writer_url)
+            self.db_client.initialize(self.config.database_username, self.config.database_password)
+            if self.config.video_stream_url:
+                self.db_client.set_stream_url(self.config.video_stream_url)
+        except Exception as e:
+            logger.warning(f"DB writer initialisation failed — DB writes disabled for this session: {e}")
+            self.db_client = None
 
         # Initialize WebSocket server client (required — exception propagates to run())
         self.ws_client = WsServerClient(self.config.ws_server_url)
@@ -210,20 +214,21 @@ class NotificationsStreamWriter(mp.Process):
         self.ws_client.send_alert(alert_data)
 
         # Save to database via sidecar
-        saved = self.db_client.save_alert(
-            frame_id=meta.frame_id,
-            alert_msg=meta.alert_msg,
-            timestamp=meta.timestamp,
-            datetime=alert_datetime,
-            image_data=compressed_bytes,
-            image_width=width,
-            image_height=height,
-        )
-        if not saved:
-            logger.warning(
-                f"Alert for frame {meta.frame_id} was not persisted to DB "
-                f"(worker unavailable or queue full)"
+        if self.db_client:
+            saved = self.db_client.save_alert(
+                frame_id=meta.frame_id,
+                alert_msg=meta.alert_msg,
+                timestamp=meta.timestamp,
+                datetime=alert_datetime,
+                image_data=compressed_bytes,
+                image_width=width,
+                image_height=height,
             )
+            if not saved:
+                logger.warning(
+                    f"Alert for frame {meta.frame_id} was not persisted to DB "
+                    f"(worker unavailable or queue full)"
+                )
 
     def _cleanup(self):
         """Close all output managers."""
@@ -357,3 +362,104 @@ class NotificationsStreamWriter(mp.Process):
                 f"Error event: {self.error_event.is_set()}."
             )
             self.work_finished.set()
+
+
+# ── Smoke-test entrypoint ─────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+    import itertools
+
+    parser = argparse.ArgumentParser(description="Send simulated alerts to ws-server and/or db-writer")
+    parser.add_argument("--ws-url",      default="http://localhost:8001", help="ws-server HTTP API base URL")
+    parser.add_argument("--db-url",      default=None,                    help="db-writer HTTP API base URL (omit to skip DB)")
+    parser.add_argument("--db-username", default="",                      help="app user email for db-writer authentication")
+    parser.add_argument("--db-password", default="",                      help="app user password for db-writer authentication")
+    parser.add_argument("--interval",    type=float, default=2.0,         help="Seconds between alerts")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log = logging.getLogger("smoke")
+
+    ws_client = WsServerClient(args.ws_url)
+    log.info(f"WebSocket target : {args.ws_url}")
+
+    db_client = None
+    if args.db_url:
+        db_client = DbWriterClient(args.db_url)
+        db_client.initialize(args.db_username, args.db_password)
+        log.info(f"DB target        : {args.db_url}  (flight_id={db_client.flight_id})")
+    else:
+        log.info("DB target        : disabled (pass --db-url to enable)")
+
+    log.info(f"Interval         : {args.interval}s — Ctrl+C to stop")
+
+    messages = itertools.cycle([
+        "Animal detected in restricted zone",
+        "Unauthorized vehicle detected",
+        "Perimeter breach detected",
+    ])
+    colors = itertools.cycle([
+        (0, 0, 200),    # red
+        (0, 165, 255),  # orange
+        (0, 200, 0),    # green
+    ])
+
+    frame_id = 0
+    try:
+        while True:
+            msg = next(messages)
+            color = next(colors)
+
+            # Synthetic 640×360 frame: solid background + centred label
+            frame = np.full((360, 640, 3), color, dtype=np.uint8)
+            cv2.putText(
+                frame, f"[{frame_id}] {msg}", (20, 190),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA,
+            )
+
+            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            raw_bytes = buf.tobytes()
+            jpg_b64 = base64.b64encode(raw_bytes).decode()
+
+            now = dtt.now()
+
+            alert = {
+                "frame_id":    frame_id,
+                "alert_msg":   msg,
+                "timestamp":   now.timestamp(),
+                "datetime":    now.isoformat(),
+                "image":       jpg_b64,
+                "width":       640,
+                "height":      360,
+                "compression": "jpeg",
+            }
+
+            ws_ok = ws_client.send_alert(alert)
+
+            db_ok = None
+            if db_client:
+                db_ok = db_client.save_alert(
+                    frame_id=frame_id,
+                    alert_msg=msg,
+                    timestamp=now.timestamp(),
+                    datetime=now,
+                    image_data=raw_bytes,
+                    image_width=640,
+                    image_height=360,
+                )
+
+            status = f"ws={'ok' if ws_ok else 'FAIL'}"
+            if db_ok is not None:
+                status += f"  db={'ok' if db_ok else 'FAIL'}"
+            log.info(f"frame {frame_id:04d} — {status} — {msg}")
+
+            frame_id += 1
+            sleep(args.interval)
+
+    except KeyboardInterrupt:
+        log.info("Stopping...")
+    finally:
+        if db_client:
+            db_client.close()
+            log.info("DB session closed.")

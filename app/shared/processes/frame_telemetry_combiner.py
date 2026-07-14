@@ -545,138 +545,181 @@ class FrameTelemetryCombiner(mp.Process):
 
 if __name__ == "__main__":
 
-    import numpy as np
-    from time import sleep
-    from queue import Empty as QueueEmptyException
+    import argparse
 
-    FRAME_SHAPE = (720, 1280, 3)  # (H, W, C) — numpy convention
-    N_SLOTS = 3
-
-    # Producer & Consumer read frequency — set manually to test slow/medium/fast consumer behaviour.
-    # slow=10, medium=30, fast=50  (fps)
-    PRODUCER_FPS = 20
-    CONSUMER_FPS = 30
-
-    # Set to True to trigger error_event after 10 s, testing clean error-path shutdown.
-    TRIGGER_ERROR_AFTER_10S = False
-
-    _PRODUCER_FRAME_INTERVAL = 1.0 / PRODUCER_FPS
-    _CONSUMER_FRAME_INTERVAL = 1.0 / CONSUMER_FPS
-
-    error_event = mp.Event()
-
-    input_meta_queue = mp.Queue(maxsize=N_SLOTS)
-    input_frame_buffer = FrameBuffer(frame_shape=FRAME_SHAPE, n_slots=N_SLOTS)
-
-    output_meta_queue = mp.Queue(maxsize=N_SLOTS)
-    output_frame_buffer = FrameBuffer(frame_shape=FRAME_SHAPE, n_slots=N_SLOTS)
-
-    config = FrameTelemetryCombinerConfig(
-        mqtt_broker_host="127.0.0.1",
-        mqtt_broker_port=TELEMETRY_LISTENER_PORT,
-        mqtt_cert_validation=None,  # no TLS in test
+    _parser = argparse.ArgumentParser(description="FrameTelemetryCombiner test modes")
+    _parser.add_argument("--mqtt-host", default="127.0.0.1", help="MQTT broker host")
+    _parser.add_argument("--mqtt-port", type=int, default=TELEMETRY_LISTENER_PORT, help="MQTT broker port")
+    _parser.add_argument(
+        "--listen", action="store_true",
+        help="MQTT-only connectivity test: subscribe and print raw telemetry messages (no frame machinery)",
     )
+    _args = _parser.parse_args()
 
-    combiner = FrameTelemetryCombiner(
-        input_meta_queue=input_meta_queue,
-        input_frame_buffer=input_frame_buffer,
-        output_meta_queue=output_meta_queue,
-        output_frame_buffer=output_frame_buffer,
-        error_event=error_event,
-        config=config,
-    )
+    if _args.listen:
 
-    def producer_loop():
-        """Push fake frames continuously into the input shared memory buffer."""
-        frame_id = 0
-        while not error_event.is_set():
-            iter_start = time()
-            slot = input_frame_buffer.acquire()
-            if slot is not None:
-                frame = np.random.randint(0, 256, FRAME_SHAPE, dtype=np.uint8)
-                input_frame_buffer.write(slot, frame)
-                meta = FrameSlotMetadata(
-                    frame_id=frame_id,
-                    timestamp=time(),
-                    original_wh=(1920, 1080),
-                    slot_index=slot,
-                )
+        async def _listen():
+            from aiomqtt import Client
+            from aiomqtt.exceptions import MqttError
+
+            print(f"Connecting to {_args.mqtt_host}:{_args.mqtt_port} ...")
+            while True:
                 try:
-                    input_meta_queue.put(meta, timeout=1.0)
-                except Exception:
-                    input_frame_buffer.release(slot)
-            else:
-                print(f"[Producer] No free input slot — frame {frame_id} dropped.")
-            frame_id += 1
-            elapsed = time() - iter_start
-            remaining = _PRODUCER_FRAME_INTERVAL - elapsed
-            if remaining > 0:
-                sleep(remaining)
-        # Signal end-of-stream after error or external stop
-        input_meta_queue.put(POISON_PILL)
-        print("[Producer] Stopped.")
+                    async with Client(hostname=_args.mqtt_host, port=_args.mqtt_port) as client:
+                        for topic in TELEMETRY_LISTENER_TOPICS_TO_SUBSCRIBE:
+                            await client.subscribe(topic=topic, qos=TELEMETRY_LISTENER_QOS_LEVEL)
+                        print(
+                            f"Subscribed to {TELEMETRY_LISTENER_TOPICS_TO_SUBSCRIBE}\n"
+                            "Waiting for messages — Ctrl+C to stop ...\n"
+                        )
+                        async for message in client.messages:
+                            key = TELEMETRY_LISTENER_TOPICS_TO_TELEMETRY_MAPPING.get(
+                                message.topic.value, message.topic.value
+                            )
+                            print(f"{key:12s} = {message.payload.decode()}")
+                except MqttError as e:
+                    print(f"MQTT error: {e}. Retrying in {TELEMETRY_LISTENER_RECONNECT_DELAY}s ...")
+                    await asyncio.sleep(TELEMETRY_LISTENER_RECONNECT_DELAY)
+                except KeyboardInterrupt:
+                    print("Stopped.")
+                    return
 
-    def consumer_loop():
-        """Drain the output queue and release output slots."""
-        frames_received = 0
-        start = time()
-        while True:
-            iter_start = time()
-            try:
-                msg = output_meta_queue.get(timeout=5.0)
-            except QueueEmptyException:
+        asyncio.run(_listen())
+
+    else:
+
+        import numpy as np
+        from time import sleep
+        from queue import Empty as QueueEmptyException
+
+        FRAME_SHAPE = (720, 1280, 3)  # (H, W, C) — numpy convention
+        N_SLOTS = 3
+
+        # Producer & Consumer read frequency — set manually to test slow/medium/fast consumer behaviour.
+        # slow=10, medium=30, fast=50  (fps)
+        PRODUCER_FPS = 20
+        CONSUMER_FPS = 30
+
+        # Set to True to trigger error_event after 10 s, testing clean error-path shutdown.
+        TRIGGER_ERROR_AFTER_10S = False
+
+        _PRODUCER_FRAME_INTERVAL = 1.0 / PRODUCER_FPS
+        _CONSUMER_FRAME_INTERVAL = 1.0 / CONSUMER_FPS
+
+        error_event = mp.Event()
+
+        input_meta_queue = mp.Queue(maxsize=N_SLOTS)
+        input_frame_buffer = FrameBuffer(frame_shape=FRAME_SHAPE, n_slots=N_SLOTS)
+
+        output_meta_queue = mp.Queue(maxsize=N_SLOTS)
+        output_frame_buffer = FrameBuffer(frame_shape=FRAME_SHAPE, n_slots=N_SLOTS)
+
+        config = FrameTelemetryCombinerConfig(
+            mqtt_broker_host=_args.mqtt_host,
+            mqtt_broker_port=_args.mqtt_port,
+            mqtt_cert_validation=None,  # no TLS in test
+        )
+
+        combiner = FrameTelemetryCombiner(
+            input_meta_queue=input_meta_queue,
+            input_frame_buffer=input_frame_buffer,
+            output_meta_queue=output_meta_queue,
+            output_frame_buffer=output_frame_buffer,
+            error_event=error_event,
+            config=config,
+        )
+
+        def producer_loop():
+            """Push fake frames continuously into the input shared memory buffer."""
+            frame_id = 0
+            while not error_event.is_set():
+                iter_start = time()
+                slot = input_frame_buffer.acquire()
+                if slot is not None:
+                    frame = np.random.randint(0, 256, FRAME_SHAPE, dtype=np.uint8)
+                    input_frame_buffer.write(slot, frame)
+                    meta = FrameSlotMetadata(
+                        frame_id=frame_id,
+                        timestamp=time(),
+                        original_wh=(1920, 1080),
+                        slot_index=slot,
+                    )
+                    try:
+                        input_meta_queue.put(meta, timeout=1.0)
+                    except Exception:
+                        input_frame_buffer.release(slot)
+                else:
+                    print(f"[Producer] No free input slot — frame {frame_id} dropped.")
+                frame_id += 1
+                elapsed = time() - iter_start
+                remaining = _PRODUCER_FRAME_INTERVAL - elapsed
+                if remaining > 0:
+                    sleep(remaining)
+            # Signal end-of-stream after error or external stop
+            input_meta_queue.put(POISON_PILL)
+            print("[Producer] Stopped.")
+
+        def consumer_loop():
+            """Drain the output queue and release output slots."""
+            frames_received = 0
+            start = time()
+            while True:
+                iter_start = time()
+                try:
+                    msg = output_meta_queue.get(timeout=5.0)
+                except QueueEmptyException:
+                    if error_event.is_set():
+                        break
+                    print("[Consumer] Queue empty, retrying ...")
+                    continue
+                if isinstance(msg, str) and msg == POISON_PILL:
+                    output_meta_queue.put(POISON_PILL)  # re-queue for any additional downstream consumers
+                    print(f"[Consumer] Poison pill received. {frames_received} frames processed.")
+                    break
                 if error_event.is_set():
                     break
-                print("[Consumer] Queue empty, retrying ...")
-                continue
-            if isinstance(msg, str) and msg == POISON_PILL:
-                output_meta_queue.put(POISON_PILL)  # re-queue for any additional downstream consumers
-                print(f"[Consumer] Poison pill received. {frames_received} frames processed.")
-                break
-            if error_event.is_set():
-                break
-            assert isinstance(msg, CombinedSlotMetadata)
-            output_frame_buffer.release(msg.slot_index)
-            frames_received += 1
-            elapsed = time() - start
-            print(
-                f"[Consumer] frame_id={msg.frame_id} "
-                f"slot={msg.slot_index} "
-                f"telemetry={'yes' if msg.telemetry else 'None'} "
-                f"fps={frames_received / elapsed:.1f}"
-            )
-            # Throttle to the configured consumer fps
-            elapsed_iter = time() - iter_start
-            remaining = _CONSUMER_FRAME_INTERVAL - elapsed_iter
-            if remaining > 0:
-                sleep(remaining)
+                assert isinstance(msg, CombinedSlotMetadata)
+                output_frame_buffer.release(msg.slot_index)
+                frames_received += 1
+                elapsed = time() - start
+                print(
+                    f"[Consumer] frame_id={msg.frame_id} "
+                    f"slot={msg.slot_index} "
+                    f"telemetry={'yes' if msg.telemetry else 'None'} "
+                    f"fps={frames_received / elapsed:.1f}"
+                )
+                # Throttle to the configured consumer fps
+                elapsed_iter = time() - iter_start
+                remaining = _CONSUMER_FRAME_INTERVAL - elapsed_iter
+                if remaining > 0:
+                    sleep(remaining)
 
-    def error_trigger():
-        sleep(10)
-        print("[ErrorTrigger] Setting error event after 10 s.")
-        error_event.set()
+        def error_trigger():
+            sleep(10)
+            print("[ErrorTrigger] Setting error event after 10 s.")
+            error_event.set()
 
-    prod_thread = threading.Thread(target=producer_loop, daemon=True)
-    cons_thread = threading.Thread(target=consumer_loop, daemon=True)
+        prod_thread = threading.Thread(target=producer_loop, daemon=True)
+        cons_thread = threading.Thread(target=consumer_loop, daemon=True)
 
-    print("[Main] Starting combiner ...")
-    combiner.start()
-    sleep(0.5)  # let the combiner process fully start before feeding it
+        print("[Main] Starting combiner ...")
+        combiner.start()
+        sleep(0.5)  # let the combiner process fully start before feeding it
 
-    print("[Main] Starting consumer ...")
-    cons_thread.start()
+        print("[Main] Starting consumer ...")
+        cons_thread.start()
 
-    print("[Main] Starting producer ...")
-    prod_thread.start()
+        print("[Main] Starting producer ...")
+        prod_thread.start()
 
-    if TRIGGER_ERROR_AFTER_10S:
-        error_trigger_thread = threading.Thread(target=error_trigger, daemon=True)
-        error_trigger_thread.start()
+        if TRIGGER_ERROR_AFTER_10S:
+            error_trigger_thread = threading.Thread(target=error_trigger, daemon=True)
+            error_trigger_thread.start()
 
-    combiner.join()
-    prod_thread.join(timeout=5.0)
-    cons_thread.join(timeout=5.0)
+        combiner.join()
+        prod_thread.join(timeout=5.0)
+        cons_thread.join(timeout=5.0)
 
-    input_frame_buffer.unlink()
-    output_frame_buffer.unlink()
-    print("[Main] Done.")
+        input_frame_buffer.unlink()
+        output_frame_buffer.unlink()
+        print("[Main] Done.")
