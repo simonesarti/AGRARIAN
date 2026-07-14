@@ -71,9 +71,12 @@ services:
       recorder:
         condition: service_healthy
     ports:
-      - "8554:8554"     # RTSP  — drone publishes + app pulls raw stream
-      - "1935:1935"     # RTMP  — app pushes annotated stream
-      - "8889:8889"     # WebRTC — viewer connects here
+      - "8554:8554"       # RTSP  — drone publishes + app pulls raw stream
+      - "1935:1935"       # RTMP  — app pushes annotated stream
+      - "8889:8889"       # WebRTC signalling (WHEP)
+      - "8189:8189/udp"   # WebRTC ICE — actual media UDP flow
+    environment:
+      MTX_WEBRTCICEHOSTNAT1TO1IPS: ${MEDIAMTX_HOST}
     volumes:
       - ./configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro
       - recordings:/recordings

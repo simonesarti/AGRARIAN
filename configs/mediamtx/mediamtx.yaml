@@ -15,6 +15,7 @@ hlsAddress: :8888
 
 readTimeout: 10s
 writeTimeout: 10s
+writeQueueSize: 1024
 
 paths:
   drone:
