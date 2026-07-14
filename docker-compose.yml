@@ -3,19 +3,18 @@
 # Deploy this on the partner VM (or locally alongside the app container).
 # All services restart automatically unless explicitly stopped.
 #
-# Traefik dashboard (development):       http://<host>:8080
-# HLS playback (via Traefik):            http://<host>/hls/annot/index.m3u8
-# WebRTC play (via Traefik):             http://<host>/webrtc/annot/whep
-# WebSocket alerts (via Traefik, WS):    ws://<host>/ws
-# WebSocket alerts (via Traefik, WSS):   wss://<domain>/ws
-# WebSocket alerts (direct):             ws://<host>:${WS_PORT}
-#
 # Ports exposed to the app machine:
 #   8554  — MediaMTX RTSP  (app pulls raw drone stream)
 #   1935  — MediaMTX RTMP  (app pushes annotated stream)
 #   1883  — Mosquitto MQTT (app subscribes to telemetry)
 #   8001  — ws-server HTTP API (app POSTs alerts)
 #   8002  — db-writer HTTP API (app POSTs alerts)
+#
+# Ports exposed to the viewer:
+#   8888  — MediaMTX HLS
+#   8889  — MediaMTX WebRTC (WHEP signalling)
+#   8189  — MediaMTX WebRTC (ICE/media UDP)
+#   ${WS_PORT} — WebSocket alert stream
 #
 # Recording: MediaMTX records the annotated stream to the 'recordings' volume.
 #            The recorder sidecar uploads each segment on completion.
@@ -31,36 +30,9 @@ networks:
 volumes:
   mosquitto-data:
   mosquitto-log:
-  letsencrypt:
   recordings:
 
 services:
-
-  # ── Reverse proxy ─────────────────────────────────────────────────────────────
-  traefik:
-    image: traefik:v3.6
-    restart: unless-stopped
-    networks: [comms-net]
-    ports:
-      - "80:80"
-      - "443:443"
-      - "8080:8080"     # dashboard — disable in production
-    command:
-      - "--providers.docker=true"
-      - "--providers.docker.network=comms-net"
-      - "--providers.docker.exposedbydefault=false"
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.websecure.address=:443"
-      - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
-      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
-      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
-      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
-      - "--api.dashboard=true"
-      - "--api.insecure=true"   # no auth — development only
-      - "--log.level=WARN"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - letsencrypt:/letsencrypt
 
   # ── Video server ──────────────────────────────────────────────────────────────
   mediamtx:
@@ -81,22 +53,6 @@ services:
     volumes:
       - ./configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro
       - recordings:/recordings
-    labels:
-      - "traefik.enable=true"
-      # HLS playback — strip /hls prefix before forwarding to MediaMTX port 8888
-      - "traefik.http.middlewares.hls-strip.stripprefix.prefixes=/hls"
-      - "traefik.http.routers.hls.rule=PathPrefix(`/hls`)"
-      - "traefik.http.routers.hls.entrypoints=web"
-      - "traefik.http.routers.hls.middlewares=hls-strip"
-      - "traefik.http.routers.hls.service=hls-svc"
-      - "traefik.http.services.hls-svc.loadbalancer.server.port=8888"
-      # WebRTC signalling — strip /webrtc prefix before forwarding to MediaMTX port 8889
-      - "traefik.http.middlewares.webrtc-strip.stripprefix.prefixes=/webrtc"
-      - "traefik.http.routers.webrtc.rule=PathPrefix(`/webrtc`)"
-      - "traefik.http.routers.webrtc.entrypoints=web"
-      - "traefik.http.routers.webrtc.middlewares=webrtc-strip"
-      - "traefik.http.routers.webrtc.service=webrtc-svc"
-      - "traefik.http.services.webrtc-svc.loadbalancer.server.port=8889"
 
   # ── MQTT broker ───────────────────────────────────────────────────────────────
   mosquitto:
@@ -144,19 +100,6 @@ services:
       - "8001:8000"                             # HTTP API — app POSTs alerts here from outside the comms network
     environment:
       WS_PORT: ${WS_PORT:-8765}
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.services.ws-svc.loadbalancer.server.port=${WS_PORT:-8765}"
-      # WS  — plain WebSocket over HTTP
-      - "traefik.http.routers.ws.rule=PathPrefix(`/ws`)"
-      - "traefik.http.routers.ws.entrypoints=web"
-      - "traefik.http.routers.ws.service=ws-svc"
-      # WSS — WebSocket over TLS (requires ACME_EMAIL and a public domain in .env)
-      - "traefik.http.routers.wss.rule=PathPrefix(`/ws`)"
-      - "traefik.http.routers.wss.entrypoints=websecure"
-      - "traefik.http.routers.wss.service=ws-svc"
-      - "traefik.http.routers.wss.tls=true"
-      - "traefik.http.routers.wss.tls.certresolver=letsencrypt"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 5s
