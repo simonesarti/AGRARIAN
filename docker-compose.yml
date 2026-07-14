@@ -26,6 +26,7 @@ name: agrarian-comms
 networks:
   comms-net:
     driver: bridge
+    name: comms-net
 
 volumes:
   mosquitto-data:
@@ -37,7 +38,7 @@ services:
 
   # ── Reverse proxy ─────────────────────────────────────────────────────────────
   traefik:
-    image: traefik:v3.1
+    image: traefik:v3.6
     restart: unless-stopped
     networks: [comms-net]
     ports:
@@ -57,8 +58,6 @@ services:
       - "--api.dashboard=true"
       - "--api.insecure=true"   # no auth — development only
       - "--log.level=WARN"
-    environment:
-      DOCKER_API_VERSION: "1.55"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - letsencrypt:/letsencrypt
