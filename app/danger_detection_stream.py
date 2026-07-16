@@ -238,12 +238,12 @@ def main():
     )
 
     annotation_worker_config = AnnotationWorkerConfig(
+        alerts_cooldown_s=s.alerts_cooldown_seconds,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
     alert_writer_config = NotificationsStreamWriterConfig(
-        alerts_cooldown_s=s.alerts_cooldown_seconds,
         alerts_jpeg_quality=s.alerts_jpeg_compression_quality,
         alerts_max_consecutive_failures=ALERTS_MAX_CONSECUTIVE_FAILURES,
         queue_get_timeout=ALERTS_QUEUE_GET_TIMEOUT,

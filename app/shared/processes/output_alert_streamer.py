@@ -40,9 +40,6 @@ if not logger.handlers:  # Avoid duplicate handlers
 class NotificationsStreamWriterConfig(BaseModel):
     """Configuration for NotificationsStreamWriter."""
 
-    # Alert filtering
-    # Minimum seconds that must pass between two consecutive alert dispatches.
-    alerts_cooldown_s: PositiveFloat
     alerts_jpeg_quality: int = Field(default=ALERTS_JPEG_COMPRESSION_QUALITY, ge=0, le=100)
     alerts_max_consecutive_failures: PositiveInt = ALERTS_MAX_CONSECUTIVE_FAILURES
 
@@ -258,9 +255,6 @@ class NotificationsStreamWriter(mp.Process):
         consecutive_failures = 0
         poison_pill_received = False
 
-        # Initialised to -inf so the very first alert is always dispatched regardless of cooldown.
-        last_alert_timestamp = -float('inf')
-
         logger.info("NotificationsStreamWriter process starting.")
         logger.info(f"  WebSocket     : {self.config.ws_server_url}")
         logger.info(f"  Database      : {self.config.db_writer_url}")
@@ -300,25 +294,12 @@ class NotificationsStreamWriter(mp.Process):
                 frame = self.input_frame_buffer.view(meta.slot_index)
                 logger.info("slot acquired (zero-copy)")
 
-                # ---- cooldown check and alert dispatch ----
+                # ---- alert dispatch (cooldown and filtering handled upstream by annotation worker) ----
                 try:
                     if meta.alert_msg:
-                        since_last = meta.timestamp - last_alert_timestamp
-                        if since_last >= self.config.alerts_cooldown_s:
-                            logger.info("tried to process alert")
-                            self._process_alert(frame, meta)
-                            logger.info("processed alert")
-                            last_alert_timestamp = meta.timestamp
-                            alert_count += 1
-                            logger.debug(
-                                f"Frame {meta.frame_id}: alert dispatched. "
-                                f"Msg: '{meta.alert_msg}'."
-                            )
-                        else:
-                            logger.debug(
-                                f"Frame {meta.frame_id}: alert '{meta.alert_msg}' suppressed by cooldown "
-                                f"({since_last:.1f}s elapsed, {self.config.alerts_cooldown_s}s required)."
-                            )
+                        self._process_alert(frame, meta)
+                        alert_count += 1
+                        logger.debug(f"Frame {meta.frame_id}: alert dispatched. Msg: '{meta.alert_msg}'.")
 
                     # reset consecutive failure counter on any successful pass through this frame
                     consecutive_failures = 0

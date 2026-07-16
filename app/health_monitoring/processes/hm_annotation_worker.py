@@ -14,6 +14,7 @@ from app.health_monitoring.anomaly_detection.detector import FrameAnomalyResult
 from app.shared.processes.messages import AnnotationSlotMetadata
 from app.shared.processes.frame_buffer import FrameBuffer
 from app.shared.processes.constants import (
+    ALERTS_COOLDOWN_SECONDS,
     PIPELINE_QUEUE_TIMEOUT,
     POISON_PILL,
     POISON_PILL_TIMEOUT,
@@ -97,6 +98,7 @@ def _annotate(frame: np.ndarray, tracks: list, r: FrameAnomalyResult) -> np.ndar
 class HMAnnotationWorkerConfig(BaseModel):
     """Configuration for HMAnnotationWorker."""
 
+    alerts_cooldown_s: PositiveFloat = ALERTS_COOLDOWN_SECONDS
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
     poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
@@ -164,6 +166,7 @@ class HMAnnotationWorker(mp.Process):
         poison_pill_received = False
 
         _resize_buf = None
+        last_alert_timestamp = -float('inf')
 
         try:
 
@@ -219,30 +222,35 @@ class HMAnnotationWorker(mp.Process):
                 # ---- fan-out: write annotated frame to both consumers independently ----
                 append_start = time()
 
-                # -- Alert output --
-                alert_slot = self.alert_output_frame_buffer.acquire()
-                if alert_slot is None:
-                    logger.warning(
-                        f"No free slot in alert output frame buffer. "
-                        f"Frame {meta.frame_id} dropped for alert writer. Consumer too slow?"
-                    )
-                else:
-                    self.alert_output_frame_buffer.write(alert_slot, _resize_buf)
-                    alert_meta = AnnotationSlotMetadata(
-                        frame_id=meta.frame_id,
-                        timestamp=meta.timestamp,
-                        slot_index=alert_slot,
-                        alert_msg=alert_msg,
-                    )
-                    try:
-                        self.alert_output_meta_queue.put(alert_meta, timeout=self.config.queue_timeout)
-                        logger.debug(f"Frame {meta.frame_id} → alert slot {alert_slot}.")
-                    except QueueFullException:
-                        self.alert_output_frame_buffer.release(alert_slot)
+                # -- Alert output: only forward confirmed alerts that pass the cooldown --
+                alert_confirmed = bool(alert_msg) and (
+                    meta.timestamp - last_alert_timestamp >= self.config.alerts_cooldown_s
+                )
+                if alert_confirmed:
+                    alert_slot = self.alert_output_frame_buffer.acquire()
+                    if alert_slot is None:
                         logger.warning(
-                            f"Alert output metadata queue full. Frame {meta.frame_id} dropped for alert writer. "
-                            "Consumer too slow or stopped?"
+                            f"No free slot in alert output frame buffer. "
+                            f"Frame {meta.frame_id} dropped for alert writer. Consumer too slow?"
                         )
+                    else:
+                        self.alert_output_frame_buffer.write(alert_slot, _resize_buf)
+                        alert_meta = AnnotationSlotMetadata(
+                            frame_id=meta.frame_id,
+                            timestamp=meta.timestamp,
+                            slot_index=alert_slot,
+                            alert_msg=alert_msg,
+                        )
+                        try:
+                            self.alert_output_meta_queue.put(alert_meta, timeout=self.config.queue_timeout)
+                            last_alert_timestamp = meta.timestamp
+                            logger.debug(f"Frame {meta.frame_id} → alert slot {alert_slot}. Anomaly: {alert_msg}.")
+                        except QueueFullException:
+                            self.alert_output_frame_buffer.release(alert_slot)
+                            logger.warning(
+                                f"Alert output metadata queue full. Frame {meta.frame_id} dropped for alert writer. "
+                                "Consumer too slow or stopped?"
+                            )
 
                 # -- Video output --
                 video_slot = self.video_output_frame_buffer.acquire()
@@ -266,7 +274,7 @@ class HMAnnotationWorker(mp.Process):
                         self.video_output_frame_buffer.release(video_slot)
                         logger.warning(
                             f"Video output metadata queue full. Frame {meta.frame_id} dropped for video writer. "
-                            "Consumer too slow or stopped?"
+                            f"Consumer too slow or stopped?"
                         )
 
                 iter_time = time() - iter_start
