@@ -37,11 +37,13 @@ RUN pip install --no-cache-dir \
 COPY ./app/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy project structure (filtered by ./.dockerignore)
+# Copy project structure (filtered by ./app/Dockerfile.dockerignore)
 COPY . .
 
-# Set permissions for entire /app directory at once
-RUN chmod -R 777 /app
+# Create runtime-populated directories excluded from the build context,
+# then apply permissions in one pass so all content is readable/writable.
+RUN mkdir -p /app/logs /app/dem /app/engine \
+    && chmod -R 777 /app
 
 # Set entrypoint
 ENTRYPOINT ["python3", "-m", "app.main"]

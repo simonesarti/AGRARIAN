@@ -3,6 +3,10 @@
 .gitignore
 .gitattributes
 
+# Docker build files
+app/Dockerfile
+app/Dockerfile.dockerignore
+
 # Operating System specific
 .DS_Store
 
@@ -41,6 +45,20 @@ venv/
 # IDEs
 .idea/
 .vscode/
+.claude/
+
+# Docs
+*.md
+
+# Compose
+docker-compose.yml
+
+# Text files — exclude all except app/requirements.txt which is needed by the build
+*.txt
+!app/requirements.txt
+
+# Shell scripts
+*.sh
 
 # Test / dev artifacts
 tests/
@@ -48,14 +66,23 @@ tests/
 
 # Project specific directories
 assets/
+processing_results/
 
-# Logs — never bake log files into the image
+# Runtime-populated directories — created empty via Dockerfile mkdir
 logs/
-
-# Engine
+dem/
 engine/
 
-# configs and app/ are included in full — both pipelines are in the same image
+# Sidecar services — not part of the app container
+db_writer/
+ws_server/
+recorder/
 
-# Shell scripts
-*.sh
+# Comms stack configs (mediamtx, mosquitto) — not needed in app container
+configs/mediamtx/
+configs/mosquitto/
+
+# python scripts that are not part of the app container
+scripts/
+
+
