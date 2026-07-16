@@ -260,7 +260,6 @@ class NotificationsStreamWriter(mp.Process):
         logger.info(f"  Database      : {self.config.db_writer_url}")
         logger.info(f"  Log file      : {self.config.log_file_path}")
         logger.info(f"  JPEG quality  : {self.config.alerts_jpeg_quality}")
-        logger.info(f"  Alert cooldown: {self.config.alerts_cooldown_s} s")
 
         try:
 
