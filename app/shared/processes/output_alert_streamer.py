@@ -15,11 +15,11 @@ from app.shared.processes.db_writer_client import DbWriterClient
 from app.shared.processes.ws_server_client import WsServerClient
 from app.shared.processes.messages import AnnotationSlotMetadata
 from app.shared.processes.frame_buffer import FrameBuffer
+from app.shared.processes.signals import reset_child_signal_handlers
 from app.shared.processes.constants import (
     ALERTS_QUEUE_GET_TIMEOUT,
     ALERTS_JPEG_COMPRESSION_QUALITY,
     ALERTS_MAX_CONSECUTIVE_FAILURES,
-    POISON_PILL,
 )
 
 
@@ -88,9 +88,9 @@ class NotificationsStreamWriter(mp.Process):
     process shuts down.
 
     Termination:
-    - Clean shutdown: POISON_PILL received on the input queue stops the loop.
-    - Error shutdown: if error_event is set by any process, the loop stops
-      immediately without flushing.
+    - error_event, set by this or any other process, is the only stop signal: the
+      loop exits immediately when it is set. An idle input queue simply means no
+      alerts are being raised, so the writer keeps waiting.
     """
 
     def __init__(
@@ -249,11 +249,13 @@ class NotificationsStreamWriter(mp.Process):
 
     def run(self):
         """Main process loop."""
+        # Drop the SIGTERM/SIGINT handlers inherited from the orchestrator at fork.
+        reset_child_signal_handlers()
+
 
 
         alert_count = 0
         consecutive_failures = 0
-        poison_pill_received = False
 
         logger.info("NotificationsStreamWriter process starting.")
         logger.info(f"  WebSocket     : {self.config.ws_server_url}")
@@ -279,12 +281,6 @@ class NotificationsStreamWriter(mp.Process):
                 except QueueEmptyException:
                     logger.debug("Input queue empty. Waiting for next frame ...")
                     continue
-
-                # ---- poison pill: stop ----
-                if isinstance(meta, str) and meta == POISON_PILL:
-                    poison_pill_received = True
-                    logger.info("Found sentinel value on queue. Stopping.")
-                    break
 
                 assert isinstance(meta, AnnotationSlotMetadata)
 
@@ -337,8 +333,7 @@ class NotificationsStreamWriter(mp.Process):
             
             logger.info(
                 "NotificationsStreamWriter process stopped. "
-                f"Total alerts dispatched: {alert_count}."
-                f"Poison pill received: {poison_pill_received}. "
+                f"Total alerts dispatched: {alert_count}. "
                 f"Error event: {self.error_event.is_set()}."
             )
             self.work_finished.set()

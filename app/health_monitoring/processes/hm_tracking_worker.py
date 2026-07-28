@@ -11,11 +11,8 @@ from app.health_monitoring.tracking.yolo_tracker import YOLOTracker
 from app.health_monitoring.processes.messages import HMTrackingSlotMetadata
 from app.shared.processes.messages import FrameSlotMetadata
 from app.shared.processes.frame_buffer import FrameBuffer
-from app.shared.processes.constants import (
-    PIPELINE_QUEUE_TIMEOUT,
-    POISON_PILL,
-    POISON_PILL_TIMEOUT,
-)
+from app.shared.processes.signals import reset_child_signal_handlers
+from app.shared.processes.constants import PIPELINE_QUEUE_TIMEOUT
 
 
 # ================================================================
@@ -39,7 +36,6 @@ class HMTrackingWorkerConfig(BaseModel):
     # Frames discarded between each tracked frame (0 = track every frame, 3 = 1 in 4).
     frame_skip: NonNegativeInt = 0
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
-    poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
 
 class HMTrackingWorker(mp.Process):
@@ -52,8 +48,9 @@ class HMTrackingWorker(mp.Process):
     HMTrackingSlotMetadata on the output queue carrying the slot index, tracks, and H.
 
     Termination:
-    - Clean shutdown: POISON_PILL received on the input queue is propagated downstream.
-    - Error shutdown: if error_event is set, the loop stops immediately.
+    - error_event is the only stop signal: the loop exits immediately when it is set.
+      An idle input queue means the video source is temporarily unavailable, so the
+      worker keeps waiting rather than shutting down.
 
     Frame drop policy: if no output buffer slot is free or the output queue is full,
     the current frame is discarded.
@@ -81,8 +78,10 @@ class HMTrackingWorker(mp.Process):
 
     def run(self):
 
+        # Drop the SIGTERM/SIGINT handlers inherited from the orchestrator at fork.
+        reset_child_signal_handlers()
+
         logger.info("HM tracking process started.")
-        poison_pill_received = False
 
         try:
 
@@ -104,11 +103,6 @@ class HMTrackingWorker(mp.Process):
                 except QueueEmptyException:
                     logger.debug("Input queue timed out. Upstream producer may be stalled. Retrying ...")
                     continue
-
-                if isinstance(meta, str) and meta == POISON_PILL:
-                    logger.info("Found sentinel value on queue.")
-                    poison_pill_received = True
-                    break
 
                 assert isinstance(meta, FrameSlotMetadata)
 
@@ -169,20 +163,7 @@ class HMTrackingWorker(mp.Process):
                     f"PROPAGATE: {(time() - append_start) * 1000:.2f} ms."
                 )
 
-            if not self.error_event.is_set():
-                try:
-                    logger.info("Attempting to put sentinel value on output queue ...")
-                    self.output_meta_queue.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
-                    logger.info("Sentinel value passed to output queue.")
-                except Exception as e:
-                    logger.error(f"Error propagating Poison Pill: {e}")
-                    self.error_event.set()
-                    logger.warning(
-                        "Error event set: force-stop application since downstream process "
-                        "is unable to receive the poison pill."
-                    )
-            else:
-                logger.info("Terminating and skipping Poison Pill sending. Error event is set.")
+            logger.info("Error event observed. Stopping the HM tracking worker.")
 
         except Exception as e:
             logger.critical(f"An unexpected critical error happened in HM tracking process: {e}", exc_info=True)
@@ -195,7 +176,6 @@ class HMTrackingWorker(mp.Process):
 
             logger.info(
                 "HM tracking process terminated. "
-                f"Poison pill received: {poison_pill_received}. "
                 f"Error event: {self.error_event.is_set()}."
             )
             self.work_finished.set()

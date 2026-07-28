@@ -12,6 +12,7 @@ from pydantic import BaseModel, PositiveFloat, PositiveInt
 from app.shared.processes.video_stream_manager import VideoStreamManager
 from app.shared.processes.frame_buffer import FrameBuffer
 from app.shared.processes.messages import AnnotationSlotMetadata
+from app.shared.processes.signals import reset_child_signal_handlers
 from app.shared.processes.constants import (
     FPS,
     PIPELINE_QUEUE_TIMEOUT,
@@ -20,7 +21,6 @@ from app.shared.processes.constants import (
     VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,
     VIDEO_OUT_STREAM_STARTUP_TIMEOUT,
     VIDEO_OUT_STREAM_SHUTDOWN_TIMEOUT,
-    POISON_PILL,
 )
 
 
@@ -69,8 +69,9 @@ class VideoProducerProcess(mp.Process):
     dimensions at launch.
 
     Termination:
-    - Clean shutdown: POISON_PILL received on the input queue.
-    - Error shutdown: error_event set by any process stops the loop immediately.
+    - error_event, set by any process, is the only stop signal: it stops the loop
+      immediately. An idle input queue means the video source is temporarily
+      unavailable, so the producer keeps waiting with the sink open.
     """
 
     def __init__(
@@ -106,9 +107,10 @@ class VideoProducerProcess(mp.Process):
 
     def run(self):
 
-        logger.info("VideoProducerProcess started.")
+        # Drop the SIGTERM/SIGINT handlers inherited from the orchestrator at fork.
+        reset_child_signal_handlers()
 
-        poison_pill_received = False
+        logger.info("VideoProducerProcess started.")
 
         self.stream_manager = VideoStreamManager(
             mediaserver_url=self.config.media_server_url,
@@ -140,12 +142,6 @@ class VideoProducerProcess(mp.Process):
                 except QueueEmptyException:
                     _diag_empty += 1
                     continue
-
-                # ---- poison pill: stop ----
-                if isinstance(meta, str) and meta == POISON_PILL:
-                    poison_pill_received = True
-                    logger.info("Poison pill received. Shutting down ...")
-                    break
 
                 assert isinstance(meta, AnnotationSlotMetadata)
 
@@ -195,7 +191,6 @@ class VideoProducerProcess(mp.Process):
             self.input_frame_buffer.close()
             logger.info(
                 "VideoProducerProcess stopped. "
-                f"Poison pill received: {poison_pill_received}. "
                 f"Error event: {self.error_event.is_set()}."
             )
             self.work_finished.set()
@@ -207,7 +202,6 @@ if __name__ == "__main__":
     from pathlib import Path
 
     from app.shared.processes.messages import AnnotationSlotMetadata
-    from app.shared.processes.constants import POISON_PILL
 
     # ---- config ----
     # Frame shape must match what AnnotationWorker produces (original output resolution).
@@ -219,9 +213,8 @@ if __name__ == "__main__":
     # Set to an RTMP URL to benchmark with streaming, or None to test disk-write only.
     RTMP_URL = "rtmp://172.17.0.2:1935/annot"  # e.g. "rtmp://localhost:1935/live/bench"
 
-    # Set one to True to test the corresponding shutdown path.
-    TRIGGER_POISON_PILL = True   # clean shutdown after DURATION_S
-    TRIGGER_ERROR       = False  # force error_event instead
+    # error_event is the only shutdown path: set after DURATION_S.
+    TRIGGER_ERROR       = True
 
     # ---- logging ----
     Path("./logs").mkdir(exist_ok=True)
@@ -302,9 +295,6 @@ if __name__ == "__main__":
             elapsed = perf_counter() - t0
             sleep(max(0.0, interval - elapsed))
 
-        if TRIGGER_POISON_PILL:
-            print(f"[Producer] Sending poison pill after {frame_id} frames.")
-            input_meta_q.put(POISON_PILL)
         print(
             f"[Producer] Done.  produced={stats['produced']}  "
             f"dropped_no_slot={stats['dropped_no_slot']}  "
@@ -337,7 +327,7 @@ if __name__ == "__main__":
     print("[Main] Starting producer ...")
     prod_thread.start()
 
-    if TRIGGER_ERROR and not TRIGGER_POISON_PILL:
+    if TRIGGER_ERROR:
         threading.Thread(target=error_trigger, daemon=True).start()
 
     process.join()

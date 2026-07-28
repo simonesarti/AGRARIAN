@@ -23,11 +23,10 @@ from app.danger_detection.utils import (
 )
 from app.danger_detection.processes.messages import SegmentationSlotMetadata, GeoSlotMetadata
 from app.shared.processes.frame_buffer import FrameBuffer, MultiFrameBuffer
+from app.shared.processes.signals import reset_child_signal_handlers
 from app.shared.processes.constants import (
     GEO_DEM_CACHE_BUFFER_SCALE,
     PIPELINE_QUEUE_TIMEOUT,
-    POISON_PILL,
-    POISON_PILL_TIMEOUT,
 )
 
 
@@ -83,7 +82,6 @@ class GeoWorkerConfig(BaseModel):
     animal_reference_size_m: PositiveFloat = 1.3
 
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
-    poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
     dem_cache_buffer_scale: PositiveFloat = GEO_DEM_CACHE_BUFFER_SCALE
 
 
@@ -104,10 +102,9 @@ class GeoWorker(mp.Process):
     When telemetry is None, geo masks default to all-zeros and safety_radius_pixels to -1.
 
     Termination:
-    - Clean shutdown: POISON_PILL received from the input metadata queue is
-      propagated to the output metadata queue.
-    - Error shutdown: if error_event is set by any process, the loop stops
-      immediately without flushing.
+    - error_event, set by this or any other process, is the only stop signal: the
+      loop exits immediately when it is set. An idle input queue means the video
+      source is temporarily unavailable, so the worker keeps waiting.
 
     Frame drop policy: if no output buffer slot is free (consumer too slow) or
     the output metadata queue is full, the current frame is discarded.
@@ -139,9 +136,11 @@ class GeoWorker(mp.Process):
         """
         Main loop of the process: opens DEM files once, then processes frames.
         """
+        # Drop the SIGTERM/SIGINT handlers inherited from the orchestrator at fork.
+        reset_child_signal_handlers()
+
 
         logger.info("Geo-handling process started.")
-        poison_pill_received = False
 
         # Open DEM and DEM-mask rasters once for the lifetime of this process.
         # dem_tif / dem_mask_tif may be None if paths were not provided.
@@ -187,12 +186,6 @@ class GeoWorker(mp.Process):
                 except QueueEmptyException:
                     logger.debug("Input queue timed out. Upstream producer may be stalled. Retrying ...")
                     continue
-
-                # ---- poison pill: propagate downstream and exit ----
-                if isinstance(meta, str) and meta == POISON_PILL:
-                    logger.info("Found sentinel value on queue.")
-                    poison_pill_received = True
-                    break
 
                 assert isinstance(meta, SegmentationSlotMetadata)
 
@@ -460,21 +453,7 @@ class GeoWorker(mp.Process):
                 )
                 # iteration completed correctly, move on to process next frame
 
-            # Propagate termination signal via poison pill on clean shutdown.
-            if not self.error_event.is_set():
-                try:
-                    logger.info("Attempting to put sentinel value on output queue ...")
-                    self.output_meta_queue.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
-                    logger.info("Sentinel value has been passed on to the next process.")
-                except Exception as e:
-                    logger.error(f"Error propagating Poison Pill: {e}")
-                    self.error_event.set()
-                    logger.warning(
-                        "Error event set: force-stop application since downstream processes "
-                        "are unable to receive the poison pill."
-                    )
-            else:
-                logger.info("Terminating and skipping Poison Pill sending. Error event is set.")
+            logger.info("Error event observed. Stopping the geo worker.")
 
         except Exception as e:
             logger.critical(f"An unexpected critical error happened in the Geo process: {e}", exc_info=True)
@@ -489,7 +468,6 @@ class GeoWorker(mp.Process):
 
             logger.info(
                 "Geo process terminated successfully. "
-                f"Poison pill received: {poison_pill_received}. "
                 f"Error event: {self.error_event.is_set()}."
             )
             self.work_finished.set()
@@ -563,7 +541,6 @@ if __name__ == "__main__":
                 except Exception:
                     input_frame_buffer.release(slot)
             sleep(1 / 10)
-        input_meta_queue.put(POISON_PILL)
 
     def consumer_loop():
         """Drain the output queue and release output slots."""
@@ -573,10 +550,6 @@ if __name__ == "__main__":
                 msg = output_meta_queue.get(timeout=10.0)
             except Exception:
                 print("[Consumer] Timed out. Stopping.")
-                break
-            if isinstance(msg, str) and msg == POISON_PILL:
-                output_meta_queue.put(POISON_PILL)
-                print(f"[Consumer] Poison pill received. {frames_received} frames processed.")
                 break
             if error_event.is_set():
                 break

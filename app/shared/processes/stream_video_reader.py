@@ -9,18 +9,16 @@ from pydantic import BaseModel, PositiveFloat, PositiveInt, field_validator
 
 from app.shared.processes.frame_buffer import FrameBuffer
 from app.shared.processes.messages import FrameSlotMetadata
+from app.shared.processes.signals import reset_child_signal_handlers
 from app.shared.processes.constants import (
     VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S,
     VIDEO_STREAM_READER_RECONNECT_DELAY,
-    VIDEO_STREAM_READER_MAX_CONSECUTIVE_CONNECTION_FAILURES,
     VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S,
     VIDEO_STREAM_READER_FRAME_RETRY_DELAY,
     VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES,
     VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO,
     VIDEO_STREAM_READER_PROCESSING_SHAPE,
     PIPELINE_QUEUE_TIMEOUT,
-    POISON_PILL,
-    POISON_PILL_TIMEOUT,
 )
 
 
@@ -47,7 +45,6 @@ class StreamVideoReaderConfig(BaseModel):
     # Connection
     connect_open_timeout_s: PositiveFloat = VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S
     connect_retry_delay_s: PositiveFloat = VIDEO_STREAM_READER_RECONNECT_DELAY
-    connect_max_consecutive_failures: PositiveInt = VIDEO_STREAM_READER_MAX_CONSECUTIVE_CONNECTION_FAILURES
 
     # Frame reading
     frame_read_timeout_s: PositiveFloat = VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S
@@ -60,7 +57,6 @@ class StreamVideoReaderConfig(BaseModel):
 
     # Output
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
-    poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
     @field_validator('processing_shape')
     @classmethod
@@ -77,12 +73,14 @@ class StreamVideoReader(mp.Process):
     a shared FrameBuffer slot, and places a lightweight FrameSlotMetadata on the output
     metadata queue for the next process to consume.
 
+    This is a long-running service process: it runs until torn down externally.
+    An unavailable video source is a transient condition, not end-of-life — the
+    reader reconnects indefinitely, idling until the drone starts publishing again.
+
     Termination:
-    - Clean shutdown: when the stream ends or connection retries are exhausted, a
-      POISON_PILL is placed on the metadata queue so downstream processes flush and
-      stop in order.
-    - Error shutdown: if error_event is set by any process, this process stops
-      immediately without flushing.
+    - error_event, set by this or any other process on a fatal error, is the only
+      way this process stops. Downstream processes observe the same event and stop
+      where they stand.
 
     Frame drop policy: if no buffer slot is free (consumer too slow) or the metadata
     queue is full, the current frame is discarded so the consumer always receives the
@@ -127,6 +125,9 @@ class StreamVideoReader(mp.Process):
 
     def run(self):
         """Main process loop."""
+        # Drop the SIGTERM/SIGINT handlers inherited from the orchestrator at fork.
+        reset_child_signal_handlers()
+
 
 
         # connection failure counters
@@ -151,10 +152,21 @@ class StreamVideoReader(mp.Process):
 
                 # --------------------------------------------------------------
                 # setup videocapture
-                # - failure treated as connection failure, retry after a delay for a max number of times
-                # ensure connection is actually open if setup failed silently
-                # - failure treated as connection failure, retry after a delay for a max number of times
+                # - failure is treated as a transient connection failure: retry
+                #   indefinitely after a delay, since the drone may simply not be
+                #   streaming yet (or may have gone temporarily out of range).
+                # - ensure the connection is actually open if setup failed silently
                 # --------------------------------------------------------------
+
+                # Release any previous capture before opening a new one. Without this
+                # the FFmpeg context of every failed attempt would leak, which matters
+                # now that reconnection is unbounded.
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception as e:
+                        logger.warning(f"Failed to release the previous VideoCapture object: {e}")
+                    cap = None
 
                 # attempt to connect to the video source.
                 # A new connection is created at every failure to ensure clean state
@@ -176,28 +188,13 @@ class StreamVideoReader(mp.Process):
                     consecutive_connection_failures += 1
                     logger.warning(
                         f"Unable to setup videocapture for {self.config.video_stream_url}: {e}. "
-                        f"N. Consecutive connection failures: {consecutive_connection_failures} "
-                        f"(max: {self.config.connect_max_consecutive_failures}). "
+                        f"Video source not available yet — retrying in "
+                        f"{self.config.connect_retry_delay_s} seconds. "
+                        f"N. Consecutive connection failures: {consecutive_connection_failures}. "
                         f"N. Total connection failures: {total_connection_failures}."
                     )
-
-                    # when the max number of connection attempts has not been surpassed yet, retry to connect
-                    if consecutive_connection_failures < self.config.connect_max_consecutive_failures:
-                        logger.warning(
-                            f"Retrying to setup VideoCapture "
-                            f"in {self.config.connect_retry_delay_s} seconds ..."
-                        )
-                        sleep(self.config.connect_retry_delay_s)
-                        continue
-
-                    # otherwise, initiate clean shutdown via poison pill
-                    else:
-                        logger.error(
-                            "Max consecutive connection attempts surpassed. "
-                            "Video stream not available. Shutting down the pipeline ..."
-                        )
-                        break
-                        # after break, jump out of this outer loop to the poison pill / cleanup code
+                    sleep(self.config.connect_retry_delay_s)
+                    continue
 
                 # --------------------------------------------------------------
                 # connection established
@@ -336,26 +333,9 @@ class StreamVideoReader(mp.Process):
 
                     # end of successful frame read — move on to read the next frame
 
-            # Propagate termination signal via poison pill on clean shutdown.
-            # Reaching here without error_event means connection retries were exhausted,
-            # which is the "clean" end-of-stream signal for this pipeline.
-            # In case of error_event, all processes stop where they are, so no pill is needed.
-            # If sending the poison pill fails, set the error event to force-stop downstream processes.
-            if not self.error_event.is_set():
-                try:
-                    logger.info("Attempting to put sentinel value on output metadata queue ...")
-                    self.output_meta_queue.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
-                    logger.info("Sentinel value has been passed on to the next process.")
-                except Exception as e:
-                    logger.error(f"Error sending Poison Pill: {e}")
-                    self.error_event.set()
-                    logger.warning(
-                        "Error event set: "
-                        "force-stopping downstream processes as poison pill could not be delivered."
-                    )
-            else:
-                # error event has been set: all processes will stop where they are.
-                logger.info("Terminating and skipping Poison Pill sending. Error event is set.")
+            # The loop above only exits once error_event is set, at which point every
+            # other process is stopping too — nothing to signal downstream.
+            logger.info("Error event observed. Stopping the reader.")
 
         except Exception as e:
             logger.critical(f"An unexpected error happened in StreamVideoReader: {e}")
@@ -431,9 +411,6 @@ if __name__ == "__main__":
                 # Stream may be temporarily unavailable — keep waiting
                 print("[Consumer] Queue empty (stream down?), retrying ...")
                 continue
-            if isinstance(msg, str) and msg == POISON_PILL:
-                output_meta_queue.put(POISON_PILL)  # re-queue for any other consumer
-                break
             if error_event.is_set():
                 break
             assert isinstance(msg, FrameSlotMetadata)

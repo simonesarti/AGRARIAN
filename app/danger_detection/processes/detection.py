@@ -12,11 +12,8 @@ from app.danger_detection.detection.detection import postprocess_detection_resul
 from app.danger_detection.processes.messages import DetectionSlotMetadata
 from app.shared.processes.frame_buffer import FrameBuffer
 from app.shared.processes.messages import CombinedSlotMetadata
-from app.shared.processes.constants import (
-    PIPELINE_QUEUE_TIMEOUT,
-    POISON_PILL,
-    POISON_PILL_TIMEOUT,
-)
+from app.shared.processes.signals import reset_child_signal_handlers
+from app.shared.processes.constants import PIPELINE_QUEUE_TIMEOUT
 
 
 # ================================================================
@@ -39,7 +36,6 @@ class DetectionWorkerConfig(BaseModel):
     predict_args: dict = Field(default_factory=dict)   # YOLO predict kwargs (conf, iou, device, etc.)
 
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
-    poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
     @field_validator('model_checkpoint')
     @classmethod
@@ -74,10 +70,9 @@ class DetectionWorker(mp.Process):
     process can operate on it in the next chain step.
 
     Termination:
-    - Clean shutdown: POISON_PILL received from the input metadata queue is
-      propagated to the output metadata queue.
-    - Error shutdown: if error_event is set by any process, the loop stops
-      immediately without flushing.
+    - error_event, set by this or any other process, is the only stop signal: the
+      loop exits immediately when it is set. An idle input queue means the video
+      source is temporarily unavailable, so the worker keeps waiting.
 
     Frame drop policy: if no output buffer slot is free (consumer too slow) or
     the output metadata queue is full, the current frame is discarded.
@@ -111,9 +106,11 @@ class DetectionWorker(mp.Process):
         """
         Main loop of the process: instantiates the detector once, then processes frames.
         """
+        # Drop the SIGTERM/SIGINT handlers inherited from the orchestrator at fork.
+        reset_child_signal_handlers()
+
 
         logger.info("Animal detection process started.")
-        poison_pill_received = False
 
         try:
 
@@ -137,12 +134,6 @@ class DetectionWorker(mp.Process):
                 except QueueEmptyException:
                     logger.debug("Input queue timed out. Upstream producer may be stalled. Retrying ...")
                     continue
-
-                # ---- poison pill: propagate downstream and exit ----
-                if isinstance(meta, str) and meta == POISON_PILL:
-                    logger.info("Found sentinel value on queue.")
-                    poison_pill_received = True
-                    break
 
                 assert isinstance(meta, CombinedSlotMetadata)
 
@@ -214,24 +205,7 @@ class DetectionWorker(mp.Process):
                 )
                 # iteration completed correctly, move on to process next frame
 
-            # Propagate termination signal via poison pill on clean shutdown.
-            # In case of error_event, all processes stop where they are, so no pill is needed.
-            # If sending the poison pill fails, set the error event to force-stop downstream.
-            if not self.error_event.is_set():
-                try:
-                    logger.info("Attempting to put sentinel value on output queue ...")
-                    self.output_meta_queue.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
-                    logger.info("Sentinel value has been passed on to the next process.")
-                except Exception as e:
-                    logger.error(f"Error propagating Poison Pill: {e}")
-                    self.error_event.set()
-                    logger.warning(
-                        "Error event set: force-stop application since downstream processes "
-                        "are unable to receive the poison pill."
-                    )
-            else:
-                # error event has been set: all processes will stop where they are
-                logger.info("Terminating and skipping Poison Pill sending. Error event is set.")
+            logger.info("Error event observed. Stopping the animal detection worker.")
 
         except Exception as e:
             logger.critical(f"An unexpected critical error happened in the animal detection process: {e}")
@@ -247,7 +221,6 @@ class DetectionWorker(mp.Process):
 
             logger.info(
                 "Animal detection process terminated successfully. "
-                f"Poison pill received: {poison_pill_received}. "
                 f"Error event: {self.error_event.is_set()}."
             )
             self.work_finished.set()
@@ -266,9 +239,6 @@ if __name__ == "__main__":
     # Consumer read frequency — set manually to test slow/medium/fast consumer behaviour.
     # slow=10, medium=30, fast=50  (fps)
     CONSUMER_FPS = 20
-
-    # Set to True to put a poison pill on the input queue after 10 s, testing clean shutdown.
-    TRIGGER_POISON_PILL_AFTER_10S = False
 
     # Set to True to trigger error_event after 10 s, testing clean error-path shutdown.
     TRIGGER_ERROR_AFTER_10S = True
@@ -324,7 +294,6 @@ if __name__ == "__main__":
             remaining = _PRODUCER_FRAME_INTERVAL - elapsed
             if remaining > 0:
                 sleep(remaining)
-        input_meta_queue.put(POISON_PILL)
         print("[Producer] Stopped.")
 
     def consumer_loop():
@@ -340,10 +309,6 @@ if __name__ == "__main__":
                     break
                 print("[Consumer] Queue empty, retrying ...")
                 continue
-            if isinstance(msg, str) and msg == POISON_PILL:
-                output_meta_queue.put(POISON_PILL)  # re-queue for any additional downstream consumers
-                print(f"[Consumer] Poison pill received. {frames_received} frames processed.")
-                break
             if error_event.is_set():
                 break
             assert isinstance(msg, DetectionSlotMetadata)
@@ -360,11 +325,6 @@ if __name__ == "__main__":
             remaining = _CONSUMER_FRAME_INTERVAL - elapsed_iter
             if remaining > 0:
                 sleep(remaining)
-
-    def poison_pill_trigger():
-        sleep(10)
-        print("[PoisonPillTrigger] Putting poison pill on input queue after 10 s.")
-        input_meta_queue.put(POISON_PILL)
 
     def error_trigger():
         sleep(10)
@@ -383,9 +343,6 @@ if __name__ == "__main__":
 
     print("[Main] Starting producer ...")
     prod_thread.start()
-
-    if TRIGGER_POISON_PILL_AFTER_10S:
-        threading.Thread(target=poison_pill_trigger, daemon=True).start()
 
     if TRIGGER_ERROR_AFTER_10S:
         threading.Thread(target=error_trigger, daemon=True).start()

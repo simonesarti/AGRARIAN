@@ -9,10 +9,14 @@ FPS = 30
 
 ALERTS_COOLDOWN_SECONDS = 1.0                                          # 1 second
 
-# value of the poison pill to stop following processes
-POISON_PILL = "HALT"
-POISON_PILL_TIMEOUT = 5.0                                               # 5.0 s
+# The pipeline is a long-running service: it is torn down externally (SIGTERM /
+# container stop), never by end-of-stream. Loss of the video feed is a transient
+# condition, so processes stay alive and idle until the feed returns. The only
+# shutdown path is error_event, which force-stops every process where it stands.
 SHUTDOWN_TIMEOUT = 10.0                                                 # 10.0 s
+
+# Grace granted to each process on teardown before escalating SIGTERM to SIGKILL.
+PROCESS_JOIN_TIMEOUT = 10.0                                             # 10.0 s
 
 
 # str: Name of the directory where the results of the analysis will be saved
@@ -119,7 +123,6 @@ VIDEO_STREAM_READER_STREAM_KEY = "drone"
 
 VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S = 5.0
 VIDEO_STREAM_READER_RECONNECT_DELAY = 5.0
-VIDEO_STREAM_READER_MAX_CONSECUTIVE_CONNECTION_FAILURES = 5
 
 VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S = 0.05                         # 50 ms
 VIDEO_STREAM_READER_FRAME_RETRY_DELAY = 0.05                            # 50 ms

@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import signal
 from datetime import datetime
 from pathlib import Path
 from time import sleep
@@ -27,11 +28,10 @@ from app.shared.processes.constants import (
     MAX_SIZE_NOTIFICATIONS_STREAM,
     MAX_SIZE_VIDEO_STREAM,
     FPS,
-    POISON_PILL_TIMEOUT,
     PIPELINE_QUEUE_TIMEOUT,
+    PROCESS_JOIN_TIMEOUT,
     VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S,
     VIDEO_STREAM_READER_RECONNECT_DELAY,
-    VIDEO_STREAM_READER_MAX_CONSECUTIVE_CONNECTION_FAILURES,
     VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S,
     VIDEO_STREAM_READER_FRAME_RETRY_DELAY,
     VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES,
@@ -149,14 +149,12 @@ def main():
         video_stream_url=s.video_stream_reader_url,
         connect_open_timeout_s=VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S,
         connect_retry_delay_s=VIDEO_STREAM_READER_RECONNECT_DELAY,
-        connect_max_consecutive_failures=VIDEO_STREAM_READER_MAX_CONSECUTIVE_CONNECTION_FAILURES,
         frame_read_timeout_s=VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S,
         frame_read_retry_delay_s=VIDEO_STREAM_READER_FRAME_RETRY_DELAY,
         frame_read_max_consecutive_failures=VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES,
         expected_aspect_ratio=VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO,
         processing_shape=VIDEO_STREAM_READER_PROCESSING_SHAPE,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
-        poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
     combiner_config = FrameTelemetryCombinerConfig(
@@ -177,7 +175,6 @@ def main():
         telemetry_buffer_max_size=FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
         max_time_diff_s=FRAMETELCOMB_MAX_TIME_DIFF,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
-        poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
     # Resolve detector checkpoint: use TensorRT engine if present, otherwise .pt from yaml.
@@ -194,7 +191,6 @@ def main():
         model_checkpoint=_det_checkpoint,
         predict_args=detection_args,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
-        poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
     # Resolve segmentation checkpoint: use TensorRT engine if present, otherwise .onnx from yaml.
     _yaml_seg_checkpoint = segmentation_args.pop("model_checkpoint")
@@ -210,7 +206,6 @@ def main():
         model_checkpoint=_seg_checkpoint,
         predict_args=segmentation_args,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
-        poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
     geo_config = GeoWorkerConfig(
@@ -229,18 +224,15 @@ def main():
             "sensor_height_pixels": s.drone_sensor_height_pixels,
         },
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
-        poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
     danger_worker_config = DangerWorkerConfig(
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
-        poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
     annotation_worker_config = AnnotationWorkerConfig(
         alerts_cooldown_s=s.alerts_cooldown_seconds,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
-        poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
 
     alert_writer_config = NotificationsStreamWriterConfig(
@@ -368,8 +360,37 @@ def main():
         video_producer_process,
     ]
 
+    # ============== SIGNAL HANDLING ==============
+    # This is a long-running service: an operator or the orchestrator (container
+    # stop, pod eviction) tears it down with SIGTERM, which Python does NOT turn
+    # into KeyboardInterrupt. Without a handler the default disposition kills this
+    # process outright, so nothing runs its cleanup and the shared memory segments
+    # are never unlinked.
+    #
+    # Armed BEFORE the children are started, so a signal arriving during the
+    # multi-second model-loading startup is still handled. Each child drops the
+    # handlers it inherits at fork (reset_child_signal_handlers, first statement of
+    # every run()), which is what keeps p.terminate() working as the force-kill
+    # escalation below.
+    #
+    # The handler only records the signal: calling error_event.set() here could
+    # deadlock, because mp.Event.set() takes a lock that the interrupted main
+    # thread may already hold. The monitor loop below performs the actual set.
+    shutdown_signals: list[int] = []
+    signal.signal(signal.SIGTERM, lambda signum, _frame: shutdown_signals.append(signum))
+    signal.signal(signal.SIGINT, lambda signum, _frame: shutdown_signals.append(signum))
+
     try:
         for p in reversed(processes):
+            # Bail out rather than spend seconds loading more models onto the GPU
+            # only to tear them straight back down; under Kubernetes that can eat
+            # the whole termination grace period and get us SIGKILLed mid-cleanup.
+            if shutdown_signals:
+                logger.warning(
+                    f"{signal.Signals(shutdown_signals[0]).name} received during startup. "
+                    "Aborting the start sequence."
+                )
+                break
             p.start()
             sleep(1.0)
     except Exception as e:
@@ -380,6 +401,13 @@ def main():
 
     try:
         while True:
+            if shutdown_signals:
+                logger.info(
+                    f"{signal.Signals(shutdown_signals[0]).name} received. "
+                    "Shutting down pipeline."
+                )
+                error_event.set()
+                break
             all_finished = all(p.work_finished.is_set() for p in processes)
             if all_finished or error_event.is_set():
                 if error_event.is_set():
@@ -389,6 +417,7 @@ def main():
                 break
             sleep(0.5)
     except KeyboardInterrupt:
+        # Safety net for a SIGINT arriving before the handler above was installed.
         logger.info("KeyboardInterrupt received. Shutting down pipeline.")
         error_event.set()
     except Exception as e:
@@ -399,13 +428,25 @@ def main():
     sleep(5.0)
 
     for p in processes:
+        # Skip anything never started: Process.join() asserts on an unstarted process.
+        if p.pid is None:
+            logger.info(f"{p.name} was never started. Nothing to join.")
+            continue
         if p.is_alive():
             logger.warning(
                 f"{p.name} still running after grace period "
                 f"(work_finished={p.work_finished.is_set()}). Terminating."
             )
             p.terminate()
-        p.join()
+        # Bounded join, then escalate to SIGKILL. An unbounded join would hang the
+        # whole teardown on a single process wedged in an uninterruptible call
+        # (e.g. a stuck FFmpeg pipe), which under Kubernetes means waiting out
+        # terminationGracePeriodSeconds before the pod is killed anyway.
+        p.join(timeout=PROCESS_JOIN_TIMEOUT)
+        if p.is_alive():
+            logger.error(f"{p.name} ignored SIGTERM. Sending SIGKILL.")
+            p.kill()
+            p.join(timeout=PROCESS_JOIN_TIMEOUT)
         logger.info(f"{p.name} joined.")
 
     try:

@@ -13,11 +13,10 @@ from app.health_monitoring.processes.messages import HMAnomalySlotMetadata
 from app.health_monitoring.anomaly_detection.detector import FrameAnomalyResult
 from app.shared.processes.messages import AnnotationSlotMetadata
 from app.shared.processes.frame_buffer import FrameBuffer
+from app.shared.processes.signals import reset_child_signal_handlers
 from app.shared.processes.constants import (
     ALERTS_COOLDOWN_SECONDS,
     PIPELINE_QUEUE_TIMEOUT,
-    POISON_PILL,
-    POISON_PILL_TIMEOUT,
 )
 
 
@@ -100,7 +99,6 @@ class HMAnnotationWorkerConfig(BaseModel):
 
     alerts_cooldown_s: PositiveFloat = ALERTS_COOLDOWN_SECONDS
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
-    poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
 
 class HMAnnotationWorker(mp.Process):
@@ -129,8 +127,9 @@ class HMAnnotationWorker(mp.Process):
     A failure on one output (full queue or no free slot) does not affect the other.
 
     Termination:
-    - Clean shutdown: POISON_PILL is propagated to both output queues.
-    - Error shutdown: loop stops immediately when error_event is set.
+    - error_event is the only stop signal: the loop exits immediately when it is set.
+      An idle input queue means the video source is temporarily unavailable, so the
+      worker keeps waiting rather than shutting down.
     """
 
     def __init__(
@@ -162,8 +161,10 @@ class HMAnnotationWorker(mp.Process):
 
     def run(self):
 
+        # Drop the SIGTERM/SIGINT handlers inherited from the orchestrator at fork.
+        reset_child_signal_handlers()
+
         logger.info("HM annotation process started.")
-        poison_pill_received = False
 
         _resize_buf = None
         last_alert_timestamp = -float('inf')
@@ -179,11 +180,6 @@ class HMAnnotationWorker(mp.Process):
                 except QueueEmptyException:
                     logger.debug("Input queue timed out. Upstream producer may be stalled. Retrying ...")
                     continue
-
-                if isinstance(meta, str) and meta == POISON_PILL:
-                    logger.info("Found sentinel value on queue.")
-                    poison_pill_received = True
-                    break
 
                 assert isinstance(meta, HMAnomalySlotMetadata)
 
@@ -286,25 +282,7 @@ class HMAnnotationWorker(mp.Process):
                     f"PROPAGATE: {(time() - append_start) * 1000:.2f} ms."
                 )
 
-            # Propagate termination to both consumers.
-            if not self.error_event.is_set():
-                for name, q in [
-                    ("alert", self.alert_output_meta_queue),
-                    ("video", self.video_output_meta_queue),
-                ]:
-                    try:
-                        logger.info(f"Attempting to put sentinel value on {name} output queue ...")
-                        q.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
-                        logger.info(f"Sentinel value passed to {name} output queue.")
-                    except Exception as e:
-                        logger.error(f"Error propagating Poison Pill to {name} output queue: {e}")
-                        self.error_event.set()
-                        logger.warning(
-                            "Error event set: force-stop application since downstream process "
-                            "is unable to receive the poison pill."
-                        )
-            else:
-                logger.info("Terminating and skipping Poison Pill sending. Error event is set.")
+            logger.info("Error event observed. Stopping the HM annotation worker.")
 
         except Exception as e:
             logger.critical(f"An unexpected critical error happened in HM annotation process: {e}", exc_info=True)
@@ -318,7 +296,6 @@ class HMAnnotationWorker(mp.Process):
 
             logger.info(
                 "HM annotation process terminated. "
-                f"Poison pill received: {poison_pill_received}. "
                 f"Error event: {self.error_event.is_set()}."
             )
             self.work_finished.set()

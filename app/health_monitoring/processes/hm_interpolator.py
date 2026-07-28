@@ -13,11 +13,8 @@ from app.health_monitoring.anomaly_detection.detector import FrameAnomalyResult
 from app.health_monitoring.processes.messages import HMAnomalySlotMetadata
 from app.health_monitoring.tracking.yolo_tracker import TrackState
 from app.shared.processes.frame_buffer import FrameBuffer
-from app.shared.processes.constants import (
-    PIPELINE_QUEUE_TIMEOUT,
-    POISON_PILL,
-    POISON_PILL_TIMEOUT,
-)
+from app.shared.processes.signals import reset_child_signal_handlers
+from app.shared.processes.constants import PIPELINE_QUEUE_TIMEOUT
 
 
 # ================================================================
@@ -42,7 +39,6 @@ class _GroupFrame:
 
 class HMVideoInterpolatorConfig(BaseModel):
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
-    poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
 
 class HMVideoInterpolatorProcess(mp.Process):
@@ -64,8 +60,13 @@ class HMVideoInterpolatorProcess(mp.Process):
         Tracks that only appear in K1 are first shown at K1.
       - K1 becomes the new K0; the cycle repeats.
 
-    On shutdown (POISON_PILL or error): flushes K0 and any buffered passthrough
-    frames using K0-only annotations (last known positions, no interpolation).
+    On shutdown (error_event) the loop stops where it stands: K0 has already been
+    emitted on receipt, and the pending passthrough frames are dropped along with
+    their slots, since every downstream process is stopping at the same moment.
+
+    A gap in the input stream (video source temporarily unavailable) leaves the
+    current group pending indefinitely; interpolation resumes when the next
+    keyframe arrives.
 
     SHM note: input slots are held (zero-copy) until each frame is written to
     the output buffer in _emit, exactly like every other pipeline worker.
@@ -101,8 +102,10 @@ class HMVideoInterpolatorProcess(mp.Process):
 
     def run(self):
 
+        # Drop the SIGTERM/SIGINT handlers inherited from the orchestrator at fork.
+        reset_child_signal_handlers()
+
         logger.info("HMVideoInterpolatorProcess started.")
-        poison_pill_received = False
 
         _k0_meta: Optional[HMAnomalySlotMetadata] = None  # metadata only; frame emitted immediately
         _pending: list[_GroupFrame] = []
@@ -117,11 +120,6 @@ class HMVideoInterpolatorProcess(mp.Process):
                 except QueueEmptyException:
                     logger.debug("Input queue empty. Waiting ...")
                     continue
-
-                if isinstance(meta, str) and meta == POISON_PILL:
-                    logger.info("Poison pill received.")
-                    poison_pill_received = True
-                    break
 
                 assert isinstance(meta, HMAnomalySlotMetadata)
 
@@ -148,20 +146,7 @@ class HMVideoInterpolatorProcess(mp.Process):
                         continue
                     _pending.append(_GroupFrame(meta=meta, frame=frame))
 
-            if not self.error_event.is_set():
-                try:
-                    logger.info("Attempting to put sentinel value on output queue ...")
-                    self.output_meta_queue.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
-                    logger.info("Poison pill propagated downstream.")
-                except Exception as e:
-                    logger.error(f"Failed to propagate poison pill: {e}")
-                    self.error_event.set()
-                    logger.warning(
-                        "Error event set: force-stop application since downstream process "
-                        "is unable to receive the poison pill."
-                    )
-            else:
-                logger.info("Skipping poison pill propagation. Error event is set.")
+            logger.info("Error event observed. Stopping the interpolator.")
 
         except Exception as e:
             logger.critical(f"An unexpected critical error occurred in HMVideoInterpolatorProcess: {e}", exc_info=True)
@@ -173,7 +158,6 @@ class HMVideoInterpolatorProcess(mp.Process):
             self.output_frame_buffer.close()
             logger.info(
                 "HMVideoInterpolatorProcess stopped. "
-                f"Poison pill received: {poison_pill_received}. "
                 f"Error event: {self.error_event.is_set()}."
             )
             self.work_finished.set()

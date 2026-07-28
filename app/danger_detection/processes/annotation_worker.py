@@ -18,11 +18,10 @@ from app.danger_detection.output.frames import (
 from app.danger_detection.processes.messages import DangerSlotMetadata
 from app.shared.processes.messages import AnnotationSlotMetadata
 from app.shared.processes.frame_buffer import FrameBuffer, MultiFrameBuffer
+from app.shared.processes.signals import reset_child_signal_handlers
 from app.shared.processes.constants import (
     ALERTS_COOLDOWN_SECONDS,
     PIPELINE_QUEUE_TIMEOUT,
-    POISON_PILL,
-    POISON_PILL_TIMEOUT,
 )
 
 
@@ -44,7 +43,6 @@ class AnnotationWorkerConfig(BaseModel):
 
     alerts_cooldown_s: PositiveFloat = ALERTS_COOLDOWN_SECONDS
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
-    poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
 
 class AnnotationWorker(mp.Process):
@@ -61,6 +59,11 @@ class AnnotationWorker(mp.Process):
 
     Fan-out: the annotated frame is written independently to two output FrameBuffers —
     one for the alert writer and one for the video writer.
+
+    Termination:
+    - error_event, set by this or any other process, is the only stop signal: the
+      loop exits immediately when it is set. An idle input queue means the video
+      source is temporarily unavailable, so the worker keeps waiting.
     """
 
     def __init__(
@@ -89,8 +92,10 @@ class AnnotationWorker(mp.Process):
 
     def run(self):
 
+        # Drop the SIGTERM/SIGINT handlers inherited from the orchestrator at fork.
+        reset_child_signal_handlers()
+
         logger.info("Danger annotation process started.")
-        poison_pill_received = False
 
         color_danger_frame = None
         color_intersect_frame = None
@@ -109,11 +114,6 @@ class AnnotationWorker(mp.Process):
                 except QueueEmptyException:
                     logger.debug("Input queue timed out. Upstream producer may be stalled. Retrying ...")
                     continue
-
-                if isinstance(meta, str) and meta == POISON_PILL:
-                    logger.info("Found sentinel value on queue.")
-                    poison_pill_received = True
-                    break
 
                 assert isinstance(meta, DangerSlotMetadata)
 
@@ -239,24 +239,7 @@ class AnnotationWorker(mp.Process):
                     f"video_write: {ms(t_alert_write, iter_end)} ms"
                 )
 
-            if not self.error_event.is_set():
-                for name, q in [
-                    ("alert", self.alert_output_meta_queue),
-                    ("video", self.video_output_meta_queue),
-                ]:
-                    try:
-                        logger.info(f"Attempting to put sentinel value on {name} output queue ...")
-                        q.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
-                        logger.info(f"Sentinel value passed to {name} output queue.")
-                    except Exception as e:
-                        logger.error(f"Error propagating Poison Pill to {name} output queue: {e}")
-                        self.error_event.set()
-                        logger.warning(
-                            "Error event set: force-stop application since downstream process "
-                            "is unable to receive the poison pill."
-                        )
-            else:
-                logger.info("Terminating and skipping Poison Pill sending. Error event is set.")
+            logger.info("Error event observed. Stopping the danger annotation worker.")
 
         except Exception as e:
             logger.critical(f"An unexpected critical error happened in danger annotation process: {e}", exc_info=True)
@@ -270,7 +253,6 @@ class AnnotationWorker(mp.Process):
 
             logger.info(
                 "Danger annotation process terminated. "
-                f"Poison pill received: {poison_pill_received}. "
                 f"Error event: {self.error_event.is_set()}."
             )
             self.work_finished.set()

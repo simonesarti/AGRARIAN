@@ -15,12 +15,11 @@ from aiomqtt import Client, TLSParameters
 from aiomqtt.exceptions import MqttError
 from pydantic import BaseModel, PositiveFloat, PositiveInt, Field
 
+from app.shared.processes.signals import reset_child_signal_handlers
 from app.shared.processes.constants import (
     FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
     FRAMETELCOMB_MAX_TIME_DIFF,
     PIPELINE_QUEUE_TIMEOUT,
-    POISON_PILL,
-    POISON_PILL_TIMEOUT,
     TELEMETRY_LISTENER_HOST,
     TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES,
     TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT,
@@ -70,9 +69,6 @@ class FrameTelemetryCombinerConfig(BaseModel):
 
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
 
-    # Shutdown
-    poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
-
 
 
 class FrameTelemetryCombiner(mp.Process):
@@ -97,10 +93,9 @@ class FrameTelemetryCombiner(mp.Process):
     the pipeline.
 
     Termination:
-    - Clean shutdown: POISON_PILL received from the input metadata queue is propagated
-      to the output metadata queue so downstream processes flush and stop in order.
-    - Error shutdown: if error_event is set by any process, the frame loop and the
-      MQTT thread stop immediately without flushing.
+    - error_event, set by this or any other process, is the only stop signal: the frame
+      loop and the MQTT thread stop immediately when it is set. An idle input queue
+      means the video source is temporarily unavailable, so the loop keeps waiting.
 
     Frame drop policy: if no output buffer slot is free (consumer too slow) or the
     output metadata queue is full, the current frame is discarded.
@@ -385,6 +380,9 @@ class FrameTelemetryCombiner(mp.Process):
 
     def run(self) -> None:
         """Main process entry point."""
+        # Drop the SIGTERM/SIGINT handlers inherited from the orchestrator at fork.
+        reset_child_signal_handlers()
+
 
         logger.info("FrameTelemetryCombiner process started")
 
@@ -406,11 +404,10 @@ class FrameTelemetryCombiner(mp.Process):
 
         failed_matches = 0
         consecutive_failed_matches = 0
-        poison_pill_received = False
 
         try:
 
-            # Process runs until the error_event is set or a poison pill arrives
+            # Process runs until the error_event is set
             while not self.error_event.is_set():
 
                 # ---- pull next frame metadata from the input queue ----
@@ -420,13 +417,6 @@ class FrameTelemetryCombiner(mp.Process):
                 except QueueEmptyException:
                     logger.debug("Input metadata queue empty. Waiting for frames ...")
                     continue
-
-                # If the object found is the poison pill, stop the frame loop.
-                # The pill will be propagated downstream after the loop exits.
-                if isinstance(meta, str) and meta == POISON_PILL:
-                    logger.info("Poison pill received from upstream.")
-                    poison_pill_received = True
-                    break
 
                 assert isinstance(meta, FrameSlotMetadata)
 
@@ -492,25 +482,7 @@ class FrameTelemetryCombiner(mp.Process):
 
                 # end of frame processing — move on to the next frame
 
-            # Propagate termination signal via poison pill on clean shutdown.
-            # Reaching here without error_event means the upstream sent a pill (expected end-of-stream).
-            # In case of error_event, all processes stop where they are, so no pill is needed.
-            # If sending the poison pill fails, set the error event to force-stop downstream processes.
-            if not self.error_event.is_set():
-                try:
-                    logger.info("Propagating poison pill to downstream process ...")
-                    self.output_meta_queue.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
-                    logger.info("Poison pill propagated to downstream.")
-                except Exception as e:
-                    logger.error(f"Failed to propagate poison pill: {e}")
-                    self.error_event.set()
-                    logger.warning(
-                        "Error event set: "
-                        "force-stopping downstream processes as poison pill could not be delivered."
-                    )
-            else:
-                # error event has been set: all processes will stop where they are
-                logger.info("Terminating and skipping poison pill propagation. Error event is set.")
+            logger.info("Error event observed. Stopping the frame/telemetry combiner.")
 
         except Exception as e:
             logger.critical(f"Unexpected error in FrameTelemetryCombiner: {e}")
@@ -537,7 +509,6 @@ class FrameTelemetryCombiner(mp.Process):
             # Log process conclusion
             logger.info(
                 "FrameTelemetryCombiner process stopped. "
-                f"Poison pill received: {poison_pill_received}. "
                 f"Error event: {self.error_event.is_set()}."
             )
             self.work_finished.set()
@@ -655,8 +626,6 @@ if __name__ == "__main__":
                 remaining = _PRODUCER_FRAME_INTERVAL - elapsed
                 if remaining > 0:
                     sleep(remaining)
-            # Signal end-of-stream after error or external stop
-            input_meta_queue.put(POISON_PILL)
             print("[Producer] Stopped.")
 
         def consumer_loop():
@@ -672,10 +641,6 @@ if __name__ == "__main__":
                         break
                     print("[Consumer] Queue empty, retrying ...")
                     continue
-                if isinstance(msg, str) and msg == POISON_PILL:
-                    output_meta_queue.put(POISON_PILL)  # re-queue for any additional downstream consumers
-                    print(f"[Consumer] Poison pill received. {frames_received} frames processed.")
-                    break
                 if error_event.is_set():
                     break
                 assert isinstance(msg, CombinedSlotMetadata)

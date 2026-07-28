@@ -13,10 +13,9 @@ from app.health_monitoring.tracking.feature_extractor import FeatureExtractor
 from app.health_monitoring.anomaly_detection.detector import AnomalyDetector, FrameAnomalyResult
 from app.health_monitoring.processes.messages import HMTrackingSlotMetadata, HMAnomalySlotMetadata
 from app.shared.processes.frame_buffer import FrameBuffer
+from app.shared.processes.signals import reset_child_signal_handlers
 from app.shared.processes.constants import (
     PIPELINE_QUEUE_TIMEOUT,
-    POISON_PILL,
-    POISON_PILL_TIMEOUT,
     VIDEO_STREAM_READER_PROCESSING_SHAPE,
 )
 
@@ -43,7 +42,6 @@ class HMAnomalyDetectionWorkerConfig(BaseModel):
     weights_path: Optional[str] = None  # path to AE checkpoint; None = uninitialised (scores will be uncalibrated)
     device: str = "cpu"
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
-    poison_pill_timeout: PositiveFloat = POISON_PILL_TIMEOUT
 
 
 class HMAnomalyDetectionWorker(mp.Process):
@@ -65,8 +63,9 @@ class HMAnomalyDetectionWorker(mp.Process):
     active tracks (for bounding-box drawing), and the FrameAnomalyResult.
 
     Termination:
-    - Clean shutdown: POISON_PILL is propagated downstream.
-    - Error shutdown: loop stops immediately when error_event is set.
+    - error_event is the only stop signal: the loop exits immediately when it is set.
+      An idle input queue means the video source is temporarily unavailable, so the
+      worker keeps waiting rather than shutting down.
 
     Frame drop policy: if no output buffer slot is free or the output queue is
     full, the current frame is discarded.
@@ -94,8 +93,10 @@ class HMAnomalyDetectionWorker(mp.Process):
 
     def run(self):
 
+        # Drop the SIGTERM/SIGINT handlers inherited from the orchestrator at fork.
+        reset_child_signal_handlers()
+
         logger.info("HM anomaly detection process started.")
-        poison_pill_received = False
 
         try:
 
@@ -128,11 +129,6 @@ class HMAnomalyDetectionWorker(mp.Process):
                 except QueueEmptyException:
                     logger.debug("Input queue timed out. Upstream producer may be stalled. Retrying ...")
                     continue
-
-                if isinstance(meta, str) and meta == POISON_PILL:
-                    logger.info("Found sentinel value on queue.")
-                    poison_pill_received = True
-                    break
 
                 assert isinstance(meta, HMTrackingSlotMetadata)
 
@@ -216,20 +212,7 @@ class HMAnomalyDetectionWorker(mp.Process):
                     f"PROPAGATE: {(time() - append_start) * 1000:.2f} ms."
                 )
 
-            if not self.error_event.is_set():
-                try:
-                    logger.info("Attempting to put sentinel value on output queue ...")
-                    self.output_meta_queue.put(POISON_PILL, timeout=self.config.poison_pill_timeout)
-                    logger.info("Sentinel value passed to output queue.")
-                except Exception as e:
-                    logger.error(f"Error propagating Poison Pill: {e}")
-                    self.error_event.set()
-                    logger.warning(
-                        "Error event set: force-stop application since downstream process "
-                        "is unable to receive the poison pill."
-                    )
-            else:
-                logger.info("Terminating and skipping Poison Pill sending. Error event is set.")
+            logger.info("Error event observed. Stopping the HM anomaly detection worker.")
 
         except Exception as e:
             logger.critical(f"An unexpected critical error happened in HM anomaly detection process: {e}", exc_info=True)
@@ -242,7 +225,6 @@ class HMAnomalyDetectionWorker(mp.Process):
 
             logger.info(
                 "HM anomaly detection process terminated. "
-                f"Poison pill received: {poison_pill_received}. "
                 f"Error event: {self.error_event.is_set()}."
             )
             self.work_finished.set()
