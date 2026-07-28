@@ -1,0 +1,33 @@
+rtsp: yes
+rtspAddress: :8554
+protocols: [tcp, udp]
+
+rtmp: yes
+rtmpAddress: :1935
+
+webrtc: yes
+webrtcAddress: :8889
+webrtcICEServers:
+  - stun:stun.l.google.com:19302
+
+hls: yes
+hlsAddress: :8888
+
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 1024
+
+paths:
+  drone:
+    source: publisher
+  annot:
+    source: publisher
+    record: yes
+    recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+    recordFormat: fmp4
+    # Split long sessions into hourly files; on publisher disconnect the current
+    # segment is always closed and flushed regardless of this setting.
+    recordSegmentDuration: 1h
+    # Notify the recorder sidecar when a segment is complete so it can upload it.
+    # $MTX_SEGMENT_PATH is set by MediaMTX at hook runtime.
+    runOnRecordSegmentComplete: wget -q -O /dev/null --post-data="path=$MTX_SEGMENT_PATH" http://recorder:8000/on-segment-complete

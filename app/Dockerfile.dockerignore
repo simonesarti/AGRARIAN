@@ -1,0 +1,88 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Docker build files
+app/Dockerfile
+app/Dockerfile.dockerignore
+
+# Operating System specific
+.DS_Store
+
+# Byte-compiled / optimized / DLL files
+**/__pycache__/
+**/*.py[cod]
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environment
+.env
+.env.example
+app/.env
+app/.env.example
+.venv/
+venv/
+
+# IDEs
+.idea/
+.vscode/
+.claude/
+
+# Docs
+*.md
+
+# Compose
+docker-compose.yml
+
+# Text files — exclude all except app/requirements.txt which is needed by the build
+*.txt
+!app/requirements.txt
+
+# Shell scripts
+*.sh
+
+# Test / dev artifacts
+tests/
+.pytest_cache/
+
+# Project specific directories
+assets/
+processing_results/
+
+# Runtime-populated directories — created empty via Dockerfile mkdir
+logs/
+dem/
+engine/
+
+# Sidecar services — not part of the app container
+db_writer/
+ws_server/
+recorder/
+
+# Comms stack configs (mediamtx, mosquitto) — not needed in app container
+configs/mediamtx/
+configs/mosquitto/
+
+# python scripts that are not part of the app container
+scripts/
+
+

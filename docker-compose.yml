@@ -1,0 +1,132 @@
+# AGRARIAN — communication services stack
+#
+# Deploy this on the partner VM (or locally alongside the app container).
+# All services restart automatically unless explicitly stopped.
+#
+# Ports exposed to the app machine:
+#   8554  — MediaMTX RTSP  (app pulls raw drone stream)
+#   1935  — MediaMTX RTMP  (app pushes annotated stream)
+#   1883  — Mosquitto MQTT (app subscribes to telemetry)
+#   8001  — ws-server HTTP API (app POSTs alerts)
+#   8002  — db-writer HTTP API (app POSTs alerts)
+#
+# Ports exposed to the viewer:
+#   8888  — MediaMTX HLS
+#   8889  — MediaMTX WebRTC (WHEP signalling)
+#   8189  — MediaMTX WebRTC (ICE/media UDP)
+#   ${WS_PORT} — WebSocket alert stream
+#
+# Recording: MediaMTX records the annotated stream to the 'recordings' volume.
+#            The recorder sidecar uploads each segment on completion.
+#            Set RECORDING_STORE_SERVICE in .env to local | azure | aws.
+
+name: agrarian-comms
+
+networks:
+  comms-net:
+    driver: bridge
+    name: comms-net
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:
+  recordings:
+
+services:
+
+  # ── Video server ──────────────────────────────────────────────────────────────
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    restart: unless-stopped
+    networks: [comms-net]
+    depends_on:
+      recorder:
+        condition: service_healthy
+    ports:
+      - "8554:8554"       # RTSP  — drone publishes + app pulls raw stream
+      - "1935:1935"       # RTMP  — app pushes annotated stream
+      - "8888:8888"       # HLS
+      - "8889:8889"       # WebRTC signalling (WHEP)
+      - "8189:8189/udp"   # WebRTC ICE — actual media UDP flow
+    environment:
+      MTX_WEBRTCICEHOSTNAT1TO1IPS: ${MEDIAMTX_HOST}
+    volumes:
+      - ./configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro
+      - recordings:/recordings
+
+  # ── MQTT broker ───────────────────────────────────────────────────────────────
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    networks: [comms-net]
+    ports:
+      - "1883:1883"     # MQTT  — drone publishes, app subscribes
+      #- "8883:8883"    # MQTTS — uncomment together with the listener block in mosquitto.conf
+    volumes:
+      - ./configs/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+      #- ./certificates/mosquitto:/mosquitto/certs:ro   # required for MQTTS
+
+  # ── DB writer sidecar ─────────────────────────────────────────────────────────
+  db-writer:
+    build:
+      context: db_writer
+    restart: unless-stopped
+    networks: [comms-net]
+    ports:
+      - "8002:8000"     # HTTP API — app POSTs alerts here from outside the comms network
+    environment:
+      DB_SERVICE:         ${DB_SERVICE:-postgresql}
+      DB_HOST:            ${DB_HOST}
+      DB_PORT:            ${DB_PORT:-5432}
+      DB_NAME:            ${DB_NAME}
+      DB_WORKER_NAME:     ${DB_WORKER_NAME}
+      DB_WORKER_PASSWORD: ${DB_WORKER_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # ── WS server ─────────────────────────────────────────────────────────────────
+  ws-server:
+    build:
+      context: ws_server
+    restart: unless-stopped
+    networks: [comms-net]
+    ports:
+      - "${WS_PORT:-8765}:${WS_PORT:-8765}"   # WebSocket — viewers connect here
+      - "8001:8000"                             # HTTP API — app POSTs alerts here from outside the comms network
+    environment:
+      WS_PORT: ${WS_PORT:-8765}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # ── Recording upload sidecar ──────────────────────────────────────────────────
+  recorder:
+    build:
+      context: recorder
+    restart: unless-stopped
+    networks: [comms-net]
+    environment:
+      RECORDING_STORE_SERVICE:           ${RECORDING_STORE_SERVICE:-local}
+      RECORDING_DELETE_LOCAL_ON_SUCCESS: ${RECORDING_DELETE_LOCAL_ON_SUCCESS:-false}
+      RECORDING_AZURE_CONNECTION_STRING: ${RECORDING_AZURE_CONNECTION_STRING:-}
+      RECORDING_AZURE_CONTAINER_NAME:    ${RECORDING_AZURE_CONTAINER_NAME:-}
+      RECORDING_AZURE_BLOB_PREFIX:       ${RECORDING_AZURE_BLOB_PREFIX:-}
+      RECORDING_AWS_BUCKET_NAME:         ${RECORDING_AWS_BUCKET_NAME:-}
+      RECORDING_AWS_KEY_PREFIX:          ${RECORDING_AWS_KEY_PREFIX:-}
+      RECORDING_AWS_ACCESS_KEY_ID:       ${RECORDING_AWS_ACCESS_KEY_ID:-}
+      RECORDING_AWS_SECRET_ACCESS_KEY:   ${RECORDING_AWS_SECRET_ACCESS_KEY:-}
+      RECORDING_AWS_REGION_NAME:         ${RECORDING_AWS_REGION_NAME:-}
+    volumes:
+      - recordings:/recordings
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12

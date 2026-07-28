@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.danger_detection.segmentation.segmentation import postprocess_segmentation_results
+from app.danger_detection.segmentation.segmentation import postprocess_segmentation_results
 
 
 # --- Dummy Classes to Mimic YOLO Segmentation Output ---

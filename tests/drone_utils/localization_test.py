@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from src.shared.drone_utils.localization import get_objects_coordinates
+from app.shared.drone_utils.localization import get_objects_coordinates
 import folium
 
 # Precomputed expected outputs (approximated to 6 decimals) for each angle.
