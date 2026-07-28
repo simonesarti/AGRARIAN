@@ -151,7 +151,7 @@ class DatabaseManager:
         and start the background writer thread.
         Raises ValueError on bad credentials, Exception on DB failure.
         """
-        logger.info(f"Initializing database connection: {self.database_url}")
+        logger.info("Initializing database connection")
         self._db_engine = create_engine(
             self.database_url,
             pool_pre_ping=True,
