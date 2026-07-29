@@ -22,11 +22,25 @@ class DbWriterClient:
         self._base = base_url.rstrip("/")
         self._timeout = timeout
         self.flight_id: Optional[int] = None
+        self.public_uuid: Optional[str] = None
+        # Scoped to this flight alone. Issued by /session/start and presented on every
+        # subsequent write, so a leak cannot be used against any other flight.
+        self._publisher_token: Optional[str] = None
+        self.viewer_token: Optional[str] = None
+
+    @property
+    def publisher_token(self) -> Optional[str]:
+        """Shared with WsServerClient — both write paths accept the same token."""
+        return self._publisher_token
+
+    def _auth_headers(self) -> dict:
+        return {"Authorization": f"Bearer {self._publisher_token}"}
 
     def initialize(self, username: str, password: str) -> None:
         """
         Authenticate the user via the sidecar and create a new flight record.
-        Sets self.flight_id on success; raises on auth failure or network error.
+        Sets self.flight_id and the flight's publisher token on success;
+        raises on auth failure or network error.
         """
         resp = requests.post(
             f"{self._base}/session/start",
@@ -37,7 +51,11 @@ class DbWriterClient:
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        self.flight_id = resp.json()["flight_id"]
+        body = resp.json()
+        self.flight_id = body["flight_id"]
+        self.public_uuid = body.get("public_uuid")
+        self._publisher_token = body["publisher_token"]
+        self.viewer_token = body.get("viewer_token")
         logger.info(f"Session started, flight_id={self.flight_id}")
 
     def set_stream_url(self, url: str) -> bool:
@@ -47,6 +65,7 @@ class DbWriterClient:
             resp = requests.post(
                 f"{self._base}/session/{self.flight_id}/stream-url",
                 json={"url": url},
+                headers=self._auth_headers(),
                 timeout=self._timeout,
             )
             resp.raise_for_status()
@@ -80,6 +99,7 @@ class DbWriterClient:
             resp = requests.post(
                 f"{self._base}/session/{self.flight_id}/alert",
                 json=payload,
+                headers=self._auth_headers(),
                 timeout=self._timeout,
             )
             resp.raise_for_status()
@@ -94,9 +114,11 @@ class DbWriterClient:
         try:
             requests.delete(
                 f"{self._base}/session/{self.flight_id}",
+                headers=self._auth_headers(),
                 timeout=self._timeout,
             )
         except RequestException as e:
             logger.error(f"Failed to close session {self.flight_id}: {e}")
         finally:
             self.flight_id = None
+            self._publisher_token = None

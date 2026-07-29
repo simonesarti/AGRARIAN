@@ -52,7 +52,6 @@ class NotificationsStreamWriterConfig(BaseModel):
     # ------- WebSocket server sidecar --------
     # URL of the ws-server sidecar HTTP API (e.g. http://ws-server:8000).
     ws_server_url: str
-
     # ------- Database writer sidecar --------
     # URL of the db-writer sidecar HTTP API (e.g. http://db-writer:8000).
     # The sidecar holds the privileged DB credentials; the app supplies only
@@ -120,18 +119,25 @@ class NotificationsStreamWriter(mp.Process):
         # Initialize log file manager (required — exception propagates to run())
         self.log_file = open(self.config.log_file_path, 'a', buffering=1, encoding='utf-8')
 
-        # Initialize DB writer client — auth failure is non-fatal; DB writes are skipped if init fails
-        try:
-            self.db_client = DbWriterClient(self.config.db_writer_url)
-            self.db_client.initialize(self.config.database_username, self.config.database_password)
-            if self.config.video_stream_url:
-                self.db_client.set_stream_url(self.config.video_stream_url)
-        except Exception as e:
-            logger.warning(f"DB writer initialisation failed — DB writes disabled for this session: {e}")
-            self.db_client = None
+        # Open the flight session. This is the identity step for the whole alert
+        # path: it authenticates the end user and yields both the flight_id that
+        # scopes DB rows and WebSocket delivery, and the publisher token that
+        # authorises writing to that flight. Failure is fatal (exception propagates
+        # to run()) — without them there is no way to say which viewers an alert
+        # belongs to, and no credential to write it. Later per-alert DB write
+        # failures stay non-fatal.
+        self.db_client = DbWriterClient(self.config.db_writer_url)
+        self.db_client.initialize(self.config.database_username, self.config.database_password)
+        if self.config.video_stream_url:
+            self.db_client.set_stream_url(self.config.video_stream_url)
 
         # Initialize WebSocket server client (required — exception propagates to run())
+        # Same token as the DB path: it names this flight and authorises no other.
         self.ws_client = WsServerClient(self.config.ws_server_url)
+        self.ws_client.bind_flight(
+            self.db_client.flight_id,
+            self.db_client.publisher_token,
+        )
 
     def _compress_frame(self, frame: np.ndarray) -> tuple[str, bytes]:
         """Compress frame to JPEG, returning (base64 string for WS, raw bytes for DB)."""

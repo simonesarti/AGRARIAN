@@ -1,199 +1,267 @@
 import asyncio
 import json
 import logging
-import threading
 from typing import Dict, Optional, Set
+from urllib.parse import parse_qs, urlparse
 
+import redis.asyncio as redis
 import websockets
 from websockets.server import serve
 
+from auth import AuthError, flight_id_from_token
 from constants import (
-    LOCALHOST,
-    WS_PORT,
+    REDIS_CHANNEL_PREFIX,
+    REDIS_POLL_TIMEOUT,
+    REDIS_RETRY_DELAY,
+    REDIS_URL,
+    WS_CLOSE_UNAUTHORIZED,
+    WS_HOST,
     WS_MANAGER_BROADCAST_TIMEOUT,
     WS_MANAGER_PING_INTERVAL,
     WS_MANAGER_PING_TIMEOUT,
-    WS_MANAGER_THREAD_CLOSE_TIMEOUT,
+    WS_PORT,
 )
 
 logger = logging.getLogger("ws_server.manager")
 
 
+def _token_from(websocket) -> Optional[str]:
+    """
+    Pull ?token= out of the handshake path.
+
+    Query string rather than a header because browsers cannot set headers on a
+    WebSocket handshake. The trade-off is that the token reaches proxy access
+    logs, which is why these JWTs are minted short-lived.
+    """
+    # websockets >= 14 exposes the handshake on .request; older versions on .path
+    request = getattr(websocket, "request", None)
+    path = request.path if request is not None else getattr(websocket, "path", "")
+    values = parse_qs(urlparse(path).query).get("token")
+    return values[0] if values else None
+
+
 class WebSocketManager:
     """
-    Manages WebSocket server and client connections for real-time alert broadcasting.
+    Per-flight alert fan-out.
 
-    Runs in a background thread with its own asyncio event loop.
-    Only the most recent alert is broadcast/synced.
+    Every alert belongs to exactly one flight, and a viewer's JWT names exactly
+    one flight, so a socket only ever receives its own tenant's alerts.
+
+    Fan-out goes through Redis so the service can run more than one replica: an
+    app pod may POST to any replica while its viewers are connected to others.
+    Each replica subscribes only to the flights it currently has viewers for, so
+    a tenant's frames are never shipped to replicas with nobody waiting on them.
+
+    Single event loop throughout — the server, the Redis reader, and the client
+    handlers all run as tasks on the loop uvicorn already owns, so the session
+    map needs no locking.
     """
 
     def __init__(
             self,
-            host: str = LOCALHOST,
+            host: str = WS_HOST,
             port: int = WS_PORT,
+            redis_url: str = REDIS_URL,
             ping_interval: float = WS_MANAGER_PING_INTERVAL,
             ping_timeout: float = WS_MANAGER_PING_TIMEOUT,
             broadcast_timeout: float = WS_MANAGER_BROADCAST_TIMEOUT,
-            thread_close_timeout: float = WS_MANAGER_THREAD_CLOSE_TIMEOUT,
+            poll_timeout: float = REDIS_POLL_TIMEOUT,
     ):
         self.host = host
         self.port = port
+        self.redis_url = redis_url
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
         self.broadcast_timeout = broadcast_timeout
-        self.thread_close_timeout = thread_close_timeout
+        self.poll_timeout = poll_timeout
 
-        self.connected_clients: Set = set()
+        # flight_id → sockets watching that flight *on this replica*
+        self._sessions: Dict[int, Set] = {}
 
-        self._last_alert: Optional[Dict] = None
-        self._lock = threading.Lock()
-
-        self._server_thread: Optional[threading.Thread] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._redis: Optional[redis.Redis] = None
+        self._pubsub = None
+        self._server = None
+        self._reader_task: Optional[asyncio.Task] = None
         self._stop_event: Optional[asyncio.Event] = None
-        self._new_alert_event: Optional[asyncio.Event] = None
 
-    def queue_alert(self, alert_data: Dict):
-        """Thread-safe — update latest alert and trigger a broadcast."""
-        with self._lock:
-            self._last_alert = alert_data
-        
-        # Signal the async event loop thread-safely 
-        # (if _new_alert_event exists, so does _stop_event)
-        if self._loop and self._new_alert_event and not self._stop_event.is_set():
-            self._loop.call_soon_threadsafe(self._new_alert_event.set)
-            logger.debug(f"Alert queued for broadcast: frame_id={alert_data.get('frame_id')}")
+    # ── Introspection ─────────────────────────────────────────────────────────
+
+    @property
+    def connected_clients(self) -> int:
+        return sum(len(v) for v in self._sessions.values())
+
+    @property
+    def active_flights(self) -> int:
+        return len(self._sessions)
+
+    # ── Redis keys ────────────────────────────────────────────────────────────
+
+    def _channel(self, flight_id: int) -> str:
+        return f"{REDIS_CHANNEL_PREFIX}:{flight_id}"
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    async def start(self):
+        self._stop_event = asyncio.Event()
+
+        self._redis = redis.from_url(self.redis_url, decode_responses=True)
+        await self._redis.ping()
+        self._pubsub = self._redis.pubsub(ignore_subscribe_messages=True)
+
+        self._server = await serve(
+            self._handle_client,
+            self.host,
+            self.port,
+            ping_interval=self.ping_interval,
+            ping_timeout=self.ping_timeout,
+        )
+        self._reader_task = asyncio.create_task(self._redis_reader(), name="redis-reader")
+        logger.info(f"WebSocket server active on ws://{self.host}:{self.port}")
+
+    async def stop(self):
+        if self._stop_event:
+            self._stop_event.set()
+
+        if self._reader_task:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except asyncio.CancelledError:
+                logger.info("Redis reader task cancelled")
+
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+            logger.info("WebSocket server closed")
+
+        if self._pubsub:
+            await self._pubsub.aclose()
+        if self._redis:
+            await self._redis.aclose()
+        logger.info("Redis connections closed")
+
+    # ── Publish side (app pods) ───────────────────────────────────────────────
+
+    async def publish_alert(self, flight_id: int, alert_data: Dict):
+        """
+        Hand an alert to Redis for delivery to every replica holding a viewer of
+        this flight. Returns once Redis has accepted it, not once viewers have
+        it — delivery is best-effort by design, alerts are not replayed.
+        """
+        message = json.dumps(alert_data)
+
+        replicas = await self._redis.publish(self._channel(flight_id), message)
+
+        logger.info(
+            f"Alert published: flight={flight_id} "
+            f"frame={alert_data.get('frame_id')} replicas={replicas}"
+        )
+
+    # ── Subscribe side (viewers) ──────────────────────────────────────────────
+
+    async def _register(self, flight_id: int, websocket):
+        viewers = self._sessions.get(flight_id)
+        if viewers is None:
+            viewers = set()
+            self._sessions[flight_id] = viewers
+            # First viewer for this flight here — start pulling its alerts.
+            await self._pubsub.subscribe(self._channel(flight_id))
+            logger.debug(f"Subscribed to {self._channel(flight_id)}")
+        viewers.add(websocket)
+
+    async def _unregister(self, flight_id: int, websocket):
+        viewers = self._sessions.get(flight_id)
+        if viewers is None:
+            return
+        viewers.discard(websocket)
+        if not viewers:
+            del self._sessions[flight_id]
+            # Last viewer gone — stop paying to receive this flight's frames.
+            await self._pubsub.unsubscribe(self._channel(flight_id))
+            logger.debug(f"Unsubscribed from {self._channel(flight_id)}")
 
     async def _handle_client(self, websocket):
-        """
-        Handle a WebSocket client connection lifecycle.
-        Sends the most recent alert immediately upon connection (sync).
-        """
+        """Authorise a viewer, then hold the connection open for its flight."""
         client_addr = websocket.remote_address
-        self.connected_clients.add(websocket)
+
+        try:
+            flight_id = flight_id_from_token(_token_from(websocket))
+        except AuthError as e:
+            logger.warning(f"Rejected viewer {client_addr}: {e}")
+            await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="unauthorized")
+            return
+
+        await self._register(flight_id, websocket)
         logger.info(
-            f"Client connected: {client_addr}. "
-            f"Total: {len(self.connected_clients)}"
+            f"Viewer connected: {client_addr} flight={flight_id}. "
+            f"Flight total: {len(self._sessions[flight_id])}"
         )
 
         try:
-            # get latest alert
-            with self._lock:
-                snapshot = self._last_alert
-            # avoid send operation if not alerts exist yet
-            if snapshot:
-                await websocket.send(json.dumps(snapshot))
-                logger.debug(f"Synced last alert to new client {client_addr}")
+            # No replay on connect. A viewer sees only alerts raised while it is
+            # watching: an alert describes a moment in a live flight, and showing a
+            # stale one on a fresh connection would assert something about the field
+            # that may no longer be true. A blank screen is the honest initial state.
+            # Past alerts are in the database, where they carry their timestamp.
 
-            #Keep connection alive.
-            # The 'websockets' library handles pings/pongs automatically in the background.
+            # Keep the connection alive; the library handles ping/pong itself.
             async for message in websocket:
-                logger.debug(f"Received unexpected message from {client_addr}: {message[:50]}")
+                logger.debug(f"Ignoring unexpected message from {client_addr}: {message[:50]}")
 
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Connection closed by {client_addr}")
         except Exception as e:
-            logger.error(f"Error handling client {client_addr}: {e}", exc_info=True)
+            logger.error(f"Error handling viewer {client_addr}: {e}", exc_info=True)
         finally:
-            self.connected_clients.discard(websocket)
-            logger.info(f"Client {client_addr} disconnected. Total: {len(self.connected_clients)}")
+            await self._unregister(flight_id, websocket)
+            logger.info(f"Viewer {client_addr} disconnected from flight {flight_id}")
 
-    async def _broadcast_loop(self):
-        """Continuously broadcast the latest alert to all connected clients."""
-        logger.info("Broadcast loop started")
-        
+    # ── Fan-out ───────────────────────────────────────────────────────────────
+
+    async def _redis_reader(self):
+        """Pump alerts off Redis and onto the local sockets that want them."""
+        logger.info("Redis reader started")
+
         while not self._stop_event.is_set():
-            # Wait for the signal from queue_alert() or stop().
-            await self._new_alert_event.wait()
-            self._new_alert_event.clear()   # reset signal to False
-
-            # terminate if stop signal received
-            if self._stop_event.is_set():
-                break   
-            
-            # acquire lock to get the alert
-            with self._lock:
-                if not self._last_alert or not self.connected_clients:
-                    continue
-                snapshot = self._last_alert
-
-            # unlock and do the heavy serialization
-            # avoids main process having to wait to put a new alert
             try:
-                message = json.dumps(snapshot)
-                frame_id = snapshot.get('frame_id')
+                # get_message() raises if the pubsub holds no subscriptions, which
+                # is the normal state whenever no viewer is connected here.
+                if not self._pubsub.subscribed:
+                    await asyncio.sleep(self.poll_timeout)
+                    continue
+
+                message = await self._pubsub.get_message(timeout=self.poll_timeout)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.error(f"Failed to serialize alert: {e}")
+                logger.error(f"Redis reader error: {e}", exc_info=True)
+                await asyncio.sleep(REDIS_RETRY_DELAY)
                 continue
 
-            # Broadcast in parallel to all clients
-            logger.info(f"Broadcasting alert {frame_id} to {len(self.connected_clients)} client(s)")
-            tasks = [asyncio.create_task(client.send(message)) for client in list(self.connected_clients)]
-            if tasks:
-                # Use a timeout to prevent slow clients from blocking the loop
-                done, pending = await asyncio.wait(tasks, timeout=self.broadcast_timeout)
-                for task in pending:
-                    task.cancel()
-                logger.info(f"Broadcast done: {len(done)}/{len(self.connected_clients)} clients")
+            if message is None:
+                continue
 
-        logger.info("Broadcast loop stopped")
-
-    async def _run_server(self):
-        self._stop_event = asyncio.Event()
-        self._new_alert_event = asyncio.Event()
-
-        async with serve(
-                self._handle_client,
-                self.host,
-                self.port,
-                ping_interval=self.ping_interval,
-                ping_timeout=self.ping_timeout,
-        ):
-            logger.info(f"WebSocket server active on ws://{self.host}:{self.port}")
-            broadcast_task = asyncio.create_task(self._broadcast_loop())
-            await self._stop_event.wait()
-            logger.info("Shutdown signal received — cleaning up")
-            broadcast_task.cancel()
             try:
-                await broadcast_task
-            except asyncio.CancelledError:
-                logger.info("Broadcast task cancelled")
+                flight_id = int(str(message["channel"]).split(":")[1])
+            except (KeyError, IndexError, ValueError):
+                logger.warning(f"Dropping message on unparseable channel: {message.get('channel')}")
+                continue
 
-    def _run_async_loop(self):
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._run_server())
-        except Exception as e:
-            logger.error(f"Error in WebSocket event loop: {e}", exc_info=True)
-        finally:
-            self._loop.close()
-            logger.info("Asyncio event loop closed")
+            await self._fan_out(flight_id, message["data"])
 
-    def start(self):
-        self._server_thread = threading.Thread(
-            target=self._run_async_loop,
-            name="WS_Manager_Thread",
-            daemon=True,
+        logger.info("Redis reader stopped")
+
+    async def _fan_out(self, flight_id: int, message: str):
+        viewers = list(self._sessions.get(flight_id, ()))
+        if not viewers:
+            return
+
+        tasks = [asyncio.create_task(v.send(message)) for v in viewers]
+        done, pending = await asyncio.wait(tasks, timeout=self.broadcast_timeout)
+        for task in pending:
+            # A stalled viewer must not hold up the others or the reader loop.
+            task.cancel()
+
+        logger.info(
+            f"Alert delivered to {len(done)}/{len(viewers)} viewer(s) of flight {flight_id}"
         )
-        self._server_thread.start()
-        logger.info("WebSocket server thread started")
-
-    def stop(self):
-        """
-        Cleanly disconnects clients and shuts down the thread.
-        """
-        if self._loop and self._stop_event:
-            # Both events are needed: 
-            # _stop_event tells _run_server to exit
-            # _new_alert_event unblocks the broadcast loop 
-            #  so that the broadcasting loop can immediately observe _stop_event and return.
-            self._loop.call_soon_threadsafe(self._stop_event.set)
-            self._loop.call_soon_threadsafe(self._new_alert_event.set)
-            logger.info("Stop signal sent to WebSocket event loop")
-        if self._server_thread:
-            self._server_thread.join(timeout=self.thread_close_timeout)
-            if self._server_thread.is_alive():
-                logger.warning("WebSocket thread did not terminate cleanly within timeout")
-            else:
-                logger.info("WebSocket thread terminated successfully")

@@ -1,19 +1,23 @@
 import logging
 import queue
+import secrets
 import threading
+import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
 import bcrypt
 from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, LargeBinary, String, create_engine
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 
 from constants import (
+    ALERT_QUEUE_SIZE,
     DB_MANAGER_MAX_OVERFLOW,
     DB_MANAGER_POOL_SIZE,
-    DB_MANAGER_QUEUE_SIZE,
     DB_MANAGER_QUEUE_WAIT_TIMEOUT,
     DB_MANAGER_THREAD_CLOSE_TIMEOUT,
+    STREAM_KEY_ALPHABET,
+    STREAM_KEY_LENGTH,
 )
 
 logger = logging.getLogger("db_writer.manager")
@@ -21,7 +25,20 @@ logger = logging.getLogger("db_writer.manager")
 """
 DATABASE SCHEMA
 
-User 1 ────<N Flight 1 ────<N Alert
+User 1 ────<N Stream 1 ────<N Flight 1 ────<N Alert
+
+A "stream" is a concurrency slot, not an aircraft: it is one ingest credential the
+user can publish on. Users add streams according to how many feeds they need to run
+at the same time. Nothing here models a physical drone, and no aircraft is tracked
+across owners.
+
+Strictly linear. A flight belongs to a stream, and the owning user is reached through
+it — flights carry no user_id of their own, because a redundant one could contradict
+streams.user_id and there would be no way to tell which was right.
+
+A flight is the tenancy unit of the whole system: it scopes alert rows, WebSocket
+delivery, Redis channels and the annotated output path. Two feeds running at once are
+two streams and therefore two independent flights.
 
 ------
 users
@@ -32,12 +49,23 @@ password
 created_at
 
 -------
+streams
+-------
+stream_id (PK)
+user_id (FK → users.user_id)
+stream_key   # Typed into the controller by hand; doubles as the ingest path
+label        # Operator-facing name ("north field quad")
+revoked_at   # Non-null retires the slot without destroying flight history
+created_at
+
+-------
 flights
 -------
 flight_id (PK)
-user_id (FK → users.user_id)
+stream_id (FK → streams.stream_id)   # Owner reached via streams.user_id
+public_uuid  # Random; names the annotated output path (out/<public_uuid>)
 start_time
-stream_url  # Video stream URL, set once the video writer starts
+output_url   # Annotated output URL, set once the video writer starts
 
 ------
 alerts
@@ -53,6 +81,16 @@ image_width
 image_height
 """
 
+
+def generate_stream_key() -> str:
+    """
+    Mint an ingest key for a stream.
+
+    secrets.choice rather than random.choice — these are credentials, and the
+    default RNG is predictable from prior outputs.
+    """
+    return "".join(secrets.choice(STREAM_KEY_ALPHABET) for _ in range(STREAM_KEY_LENGTH))
+
 Base = declarative_base()
 
 
@@ -64,7 +102,9 @@ class User(Base):
     password = Column(String(128), nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-    flights = relationship("Flight", back_populates="user", cascade="all, delete-orphan")
+    # No direct flights relationship — they hang off streams. Deleting a user cascades
+    # users → streams → flights → alerts down the chain.
+    streams = relationship("Stream", back_populates="user", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<User(id={self.user_id}, email='{self.email}')>"
@@ -82,19 +122,79 @@ class User(Base):
         )
 
 
+class Stream(Base):
+    """
+    One concurrency slot belonging to a user, holding one persistent ingest credential.
+
+    Deliberately NOT a drone. Nothing here identifies a physical aircraft, and none is
+    tracked across owners — a drone sold to someone else is simply that user adding a
+    stream of their own, with a key unrelated to this one.
+
+    Streams exist because a key doubles as the ingest path: one key means one path, so
+    a user who needs two simultaneous feeds needs two streams. Users add slots as their
+    concurrency needs grow and retire them when they shrink. Granular revocation falls
+    out of that for free — retiring one slot leaves the user's others publishing.
+    """
+
+    __tablename__ = 'streams'
+
+    stream_id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey('users.user_id'), nullable=False)
+    # Indexed and unique: every MediaMTX connection attempt resolves a key, so this
+    # lookup sits on the hot path for both publishing and viewing.
+    stream_key = Column(String(64), nullable=False, unique=True, index=True,
+                        default=generate_stream_key)
+    label = Column(String(128), nullable=True)
+    # Revocation is a timestamp, not a delete: flights reference the stream, and the
+    # record of what was published when has to survive both rotation and retirement.
+    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="streams")
+    # This cascade exists for ONE case: deleting a user account, which must erase
+    # everything below it. It is NOT the per-stream "remove" operation — deleting a
+    # stream row would silently destroy its flight history and every alert with it.
+    # Removing a stream means revoke_stream(); there is deliberately no delete_stream().
+    flights = relationship("Flight", back_populates="stream", cascade="all, delete-orphan")
+
+    @property
+    def is_active(self) -> bool:
+        return self.revoked_at is None
+
+    def __repr__(self):
+        state = "active" if self.is_active else "revoked"
+        return f"<Stream(id={self.stream_id}, user_id={self.user_id}, label='{self.label}', {state})>"
+
+
 class Flight(Base):
     __tablename__ = 'flights'
 
     flight_id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey('users.user_id'), nullable=False)
+    # The only ownership link. A flight exists because a publisher connected on a
+    # valid stream key, so there is always a stream; the user is streams.user_id.
+    stream_id = Column(Integer, ForeignKey('streams.stream_id'), nullable=False, index=True)
+    # Names the annotated output path (out/<public_uuid>). Deliberately NOT derived
+    # from flight_id: the sequential PK would make every tenant's video path
+    # enumerable, and read authorisation is the only thing in front of it.
+    public_uuid = Column(String(36), nullable=False, unique=True, index=True,
+                         default=lambda: str(uuid.uuid4()))
     start_time = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    stream_url = Column(String, nullable=True)
+    # The ANNOTATED OUTPUT URL, never the ingest one. Ingest URLs embed the stream key,
+    # so storing one here would scatter live credentials through flight history and
+    # leave dead ones behind after every rotation.
+    output_url = Column(String, nullable=True)
 
-    user = relationship("User", back_populates="flights")
+    stream = relationship("Stream", back_populates="flights")
     alerts = relationship("Alert", back_populates="flight", cascade="all, delete-orphan")
 
+    @property
+    def user_id(self) -> int:
+        """Owner, via the stream. Read-only — no user_id column exists to disagree with."""
+        return self.stream.user_id
+
     def __repr__(self):
-        return f"<Flight(id={self.flight_id}, user_id={self.user_id}, start='{self.start_time}')>"
+        return (f"<Flight(id={self.flight_id}, stream_id={self.stream_id}, "
+                f"start='{self.start_time}')>")
 
 
 class Alert(Base):
@@ -117,141 +217,344 @@ class Alert(Base):
                 f"msg='{self.alert_msg}...', frame={self.frame_id})>")
 
 
-class DatabaseManager:
-    """Manages database operations for alert storage."""
+class UserDirectory:
+    """
+    Lookups and stream management against users/streams/flights.
+
+    Holds no per-flight state, so every method works on any replica. This serves the
+    UI, the MediaMTX auth hook, and flight creation.
+    """
+
+    def __init__(self, database_url: str):
+        # create_engine is lazy — no connection opens until the first query, so
+        # constructing this at import time cannot delay or fail startup.
+        self._engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            pool_size=2,
+            max_overflow=2,
+            connect_args={'connect_timeout': 5},
+        )
+
+    def authenticate(self, email: str, password: str) -> int:
+        """Return the user_id for valid credentials; raise ValueError otherwise."""
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            user = session.query(User).filter_by(email=email).first()
+            if not user or not user.verify_password(password):
+                raise ValueError("Authentication failed: Invalid credentials.")
+            return user.user_id
+
+    # ── Stream management ─────────────────────────────────────────────────────
+
+    def resolve_stream_key(self, stream_key: str) -> Optional[dict]:
+        """
+        Resolve an ingest key to its stream and owner, or None if unknown/revoked.
+
+        This is the hot path — MediaMTX calls it on every connection attempt — and
+        it is also the authorisation decision itself, so it deliberately returns
+        nothing at all for a revoked key rather than reporting why.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            stream = session.query(Stream).filter_by(stream_key=stream_key).first()
+            if stream is None or stream.revoked_at is not None:
+                return None
+            return {"stream_id": stream.stream_id, "user_id": stream.user_id, "label": stream.label}
+
+    def create_stream(self, user_id: int, label: Optional[str] = None) -> dict:
+        """Add a stream slot and mint its ingest key. The key is returned once, here."""
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            stream = Stream(user_id=user_id, label=label, stream_key=generate_stream_key())
+            session.add(stream)
+            session.commit()
+            logger.info(f"Stream added: stream_id={stream.stream_id}, user_id={user_id}")
+            return {"stream_id": stream.stream_id, "stream_key": stream.stream_key, "label": stream.label}
+
+    def list_streams(self, user_id: int, include_revoked: bool = False) -> List[dict]:
+        """
+        Streams belonging to this user.
+
+        Retired ones are hidden by default, which is what makes "remove from my
+        portal" a display concern rather than a delete: the row and its flight
+        history stay, the user simply stops seeing it.
+
+        Stream keys are included: unlike a password these are recoverable by design,
+        because the operator has to retype the ingest URL before every flight.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            query = session.query(Stream).filter_by(user_id=user_id)
+            if not include_revoked:
+                query = query.filter(Stream.revoked_at.is_(None))
+            streams = query.order_by(Stream.stream_id).all()
+            return [
+                {
+                    "stream_id": d.stream_id,
+                    "label": d.label,
+                    "stream_key": d.stream_key,
+                    "revoked_at": d.revoked_at,
+                    "created_at": d.created_at,
+                }
+                for d in streams
+            ]
+
+    def revoke_stream(self, stream_id: int, user_id: int) -> None:
+        """
+        Retire a stream slot, killing its key. This is what "remove" means in the
+        portal — no row is deleted and no flight or alert is touched.
+
+        user_id is required and checked; without it any caller could retire any
+        stream by guessing a sequential id.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            stream = session.query(Stream).filter_by(stream_id=stream_id, user_id=user_id).first()
+            if stream is None:
+                raise ValueError(f"Stream {stream_id} not found for this user")
+            stream.revoked_at = datetime.now(timezone.utc)
+            session.commit()
+            logger.info(f"Stream retired: stream_id={stream_id}, user_id={user_id}")
+
+    def rotate_stream_key(self, stream_id: int, user_id: int) -> str:
+        """
+        Issue a new key for a registration, invalidating the old one immediately.
+
+        This is the response to a leaked key that keeps the registration usable, as
+        opposed to revoking it outright. Any flight currently in the air keeps
+        streaming — MediaMTX only re-checks on connect — so it takes effect from the
+        next flight.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            stream = session.query(Stream).filter_by(stream_id=stream_id, user_id=user_id).first()
+            if stream is None:
+                raise ValueError(f"Stream {stream_id} not found for this user")
+            stream.stream_key = generate_stream_key()
+            stream.revoked_at = None
+            session.commit()
+            logger.info(f"Stream key rotated: stream_id={stream_id}, user_id={user_id}")
+            return stream.stream_key
+
+    # ── Flights ───────────────────────────────────────────────────────────────
+
+    def start_flight(self, email: str, password: str,
+                     stream_id: Optional[int] = None) -> dict:
+        """
+        Authenticate the user and open a flight, returning its identifiers.
+
+        Deliberately returns plain data and keeps no handle: the flight lives in the
+        database, not in this process. That is what lets a later alert for the same
+        flight be served by a different db-writer replica.
+
+        Raises ValueError on bad credentials or an unusable stream.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            user = session.query(User).filter_by(email=email).first()
+            if not user or not user.verify_password(password):
+                raise ValueError("Authentication failed: Invalid credentials.")
+
+            if stream_id is None:
+                # Interim path: the app opens flights with user credentials and has no
+                # stream in hand. The orchestrator always knows the stream, because the
+                # stream key is what identified the flight, and this branch then goes.
+                active = [st for st in user.streams if st.revoked_at is None]
+                if len(active) != 1:
+                    raise ValueError(
+                        f"Cannot infer stream: user has {len(active)} active streams. "
+                        "Pass stream_id explicitly."
+                    )
+                stream = active[0]
+            else:
+                # Never let a caller attach a flight to someone else's stream.
+                stream = session.query(Stream).filter_by(
+                    stream_id=stream_id, user_id=user.user_id).first()
+                if stream is None:
+                    raise ValueError(f"Stream {stream_id} does not belong to this user")
+                if stream.revoked_at is not None:
+                    raise ValueError(f"Stream {stream_id} is retired")
+
+            flight = Flight(stream_id=stream.stream_id)
+            session.add(flight)
+            session.commit()
+
+            logger.info(
+                f"Flight opened: flight_id={flight.flight_id}, "
+                f"stream_id={stream.stream_id}, user_id={user.user_id}"
+            )
+            return {
+                "flight_id": flight.flight_id,
+                "public_uuid": flight.public_uuid,
+                "stream_id": stream.stream_id,
+                "user_id": user.user_id,
+            }
+
+    def set_output_url(self, flight_id: int, url: str) -> bool:
+        """
+        Record where the annotated output went. Never pass an ingest URL here —
+        those embed the stream key, which must not land in flight history.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            flight = session.get(Flight, flight_id)
+            if flight is None:
+                logger.error(f"Flight {flight_id} not found; cannot set output URL.")
+                return False
+            flight.output_url = url
+            session.commit()
+            logger.info(f"Flight {flight_id} output URL set to: {url}")
+            return True
+
+    def latest_flight_id(self, user_id: int) -> Optional[int]:
+        """
+        Most recently started flight for this user, or None if they have none.
+
+        Joins through streams — a flight's owner is streams.user_id. Ambiguous once a
+        user has two streams running at once; see the note in CLOUD_ARCHITECTURE §9.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            flight = (
+                session.query(Flight)
+                .join(Stream, Flight.stream_id == Stream.stream_id)
+                .filter(Stream.user_id == user_id)
+                .order_by(Flight.start_time.desc())
+                .first()
+            )
+            return flight.flight_id if flight else None
+
+
+class AlertWriter:
+    """
+    Process-wide alert writer: ONE per db-writer instance, not one per flight.
+
+    This is what makes db-writer replicable. The previous design kept a manager per
+    flight in a module-level dict, so a replica could only serve flights whose
+    /session/start it had personally handled — a second replica returned 404 for
+    every alert belonging to a flight opened elsewhere. Nothing here is keyed by
+    flight: the flight_id rides on each queued item, so any replica can accept any
+    alert for any flight.
+
+    The queue is kept because it decouples the caller from database latency. The app
+    POSTs an alert from its inference pipeline and must not block on a slow commit,
+    so enqueue() returns as soon as the item is accepted and a background thread does
+    the writing. Alerts are best-effort: a full queue drops rather than blocks, which
+    is the right trade when the alternative is stalling frame processing.
+    """
 
     def __init__(
             self,
             database_url: str,
-            alerts_queue_size: int = DB_MANAGER_QUEUE_SIZE,
+            queue_size: int = ALERT_QUEUE_SIZE,
             pool_size: int = DB_MANAGER_POOL_SIZE,
             max_overflow: int = DB_MANAGER_MAX_OVERFLOW,
             queue_get_timeout: float = DB_MANAGER_QUEUE_WAIT_TIMEOUT,
             thread_close_timeout: float = DB_MANAGER_THREAD_CLOSE_TIMEOUT,
     ):
-        self.database_url = database_url
-        self._db_engine = None
-        self._db_session: Optional[Session] = None
-
-        self.pool_size = pool_size
-        self.max_overflow = max_overflow
-
-        self._db_queue = queue.Queue(maxsize=alerts_queue_size)
-        self._worker_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-
-        self._queue_get_timeout = queue_get_timeout
-        self._thread_close_timeout = thread_close_timeout
-
-        self.flight_id = None
-
-    def initialize(self, username: str, password: str):
-        """
-        Verify credentials, create tables if needed, open a new Flight record,
-        and start the background writer thread.
-        Raises ValueError on bad credentials, Exception on DB failure.
-        """
-        logger.info(f"Initializing database connection: {self.database_url}")
-        self._db_engine = create_engine(
-            self.database_url,
+        self._engine = create_engine(
+            database_url,
             pool_pre_ping=True,
-            pool_size=self.pool_size,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
             connect_args={'connect_timeout': 5},
-            max_overflow=self.max_overflow,
             echo=False,
         )
-        Base.metadata.create_all(self._db_engine)
+        self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        self._stop_event = threading.Event()
+        self._worker_thread: Optional[threading.Thread] = None
+        self._queue_get_timeout = queue_get_timeout
+        self._thread_close_timeout = thread_close_timeout
+        self._dropped = 0
 
-        SessionFactory = sessionmaker(bind=self._db_engine)
-        with SessionFactory() as session:
-            try:
-                user = session.query(User).filter_by(email=username).first()
-                if not user or not user.verify_password(password):
-                    raise ValueError("Authentication failed: Invalid credentials.")
-                logger.info("User credentials approved")
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
-                new_flight = Flight(user_id=user.user_id)
-                session.add(new_flight)
-                session.commit()
-                self.flight_id = new_flight.flight_id
-                logger.info("New flight record created successfully")
-
-            except Exception as e:
-                session.rollback()
-                raise e
-
+    def start(self) -> None:
+        """Create any missing tables and start the writer thread."""
+        Base.metadata.create_all(self._engine)
         self._stop_event.clear()
-        self._worker_thread = threading.Thread(target=self._db_worker, daemon=True)
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop, name="alert-writer", daemon=True)
         self._worker_thread.start()
-        logger.info("Database manager and worker thread initialized")
+        logger.info("Alert writer started")
 
-    def set_stream_url(self, url: str) -> bool:
-        if self._db_engine is None:
-            return False
-        SessionFactory = sessionmaker(bind=self._db_engine)
-        try:
-            with SessionFactory() as session:
-                flight = session.get(Flight, self.flight_id)
-                if flight is None:
-                    logger.error(f"Flight {self.flight_id} not found; cannot set stream URL.")
-                    return False
-                flight.stream_url = url
-                session.commit()
-                logger.info(f"Flight {self.flight_id} stream URL set to: {url}")
-                return True
-        except Exception as e:
-            logger.error(f"Failed to set stream URL for flight {self.flight_id}: {e}")
-            return False
+    def stop(self) -> None:
+        """Drain what is queued, then shut down."""
+        self._stop_event.set()
+        if self._worker_thread:
+            self._worker_thread.join(timeout=self._thread_close_timeout)
+            if self._worker_thread.is_alive():
+                logger.warning("Alert writer thread did not finish draining in time")
+            else:
+                logger.info("Alert writer thread terminated")
+        self._engine.dispose()
+        logger.info("Database engine disposed")
 
-    def save_alert(self, **kwargs) -> bool:
-        if self._db_engine is None:
-            return False
+    # ── Introspection ─────────────────────────────────────────────────────────
+
+    @property
+    def queue_depth(self) -> int:
+        return self._queue.qsize()
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
+
+    # ── Write path ────────────────────────────────────────────────────────────
+
+    def enqueue(self, flight_id: int, **fields) -> bool:
+        """
+        Accept an alert for any flight. Returns False if the queue is full.
+
+        No check that the flight exists: the caller already presented a token this
+        service signed for that flight, and the foreign key is the backstop. Querying
+        here would put a database round-trip back on the hot path the queue exists to
+        keep clear.
+        """
+        fields["flight_id"] = flight_id
         try:
-            kwargs["flight_id"] = self.flight_id
-            self._db_queue.put_nowait(kwargs)
-            logger.debug(f"Alert queued: frame={kwargs.get('frame_id')}, msg={kwargs.get('alert_msg')}")
+            self._queue.put_nowait(fields)
+            logger.debug(f"Alert queued: flight={flight_id} frame={fields.get('frame_id')}")
             return True
         except queue.Full:
+            self._dropped += 1
             logger.warning(
-                f"DB queue full — dropping alert for frame {kwargs.get('frame_id')}. "
-                "Consider increasing DB_MANAGER_QUEUE_SIZE."
+                f"Alert queue full ({self._queue.maxsize}) — dropping alert for "
+                f"flight {flight_id} frame {fields.get('frame_id')}. "
+                f"{self._dropped} dropped since start; consider raising ALERT_QUEUE_SIZE "
+                "or adding replicas."
             )
             return False
 
-    def close(self):
-        self._stop_event.set()
-        if self._worker_thread:
-            try:
-                self._worker_thread.join(timeout=self._thread_close_timeout)
-                logger.info("DB manager thread terminated successfully")
-            except Exception as e:
-                logger.error(f"Failed to terminate DB worker thread: {e}")
-        if self._db_engine:
-            try:
-                self._db_engine.dispose()
-                logger.info("Database engine disposed")
-            except Exception as e:
-                logger.error(f"Error disposing database engine: {e}")
+    def _worker_loop(self) -> None:
+        logger.info("Alert writer thread started")
+        SessionFactory = sessionmaker(bind=self._engine)
 
-    def _db_worker(self):
-        logger.info("Database background worker started")
-        SessionFactory = sessionmaker(bind=self._db_engine)
-
-        while not self._stop_event.is_set() or not self._db_queue.empty():
+        # Keep draining after the stop signal so a shutdown does not discard alerts
+        # already accepted from the app.
+        while not self._stop_event.is_set() or not self._queue.empty():
             try:
-                alert_params = self._db_queue.get(timeout=self._queue_get_timeout)
+                params = self._queue.get(timeout=self._queue_get_timeout)
             except queue.Empty:
                 continue
 
             try:
                 with SessionFactory() as session:
-                    db_alert = Alert(**alert_params)
-                    session.add(db_alert)
+                    session.add(Alert(**params))
                     session.commit()
-                    logger.info(f"Committed alert: frame={alert_params['frame_id']}, msg={alert_params['alert_msg']}")
+                    logger.info(
+                        f"Committed alert: flight={params['flight_id']} "
+                        f"frame={params.get('frame_id')} msg={params.get('alert_msg')}"
+                    )
             except Exception as e:
-                logger.error(f"DB worker error for frame {alert_params.get('frame_id')}: {e}")
+                # One bad row must not kill the thread — every later alert on this
+                # replica would be silently lost with it.
+                logger.error(
+                    f"Failed to write alert for flight {params.get('flight_id')} "
+                    f"frame {params.get('frame_id')}: {e}"
+                )
             finally:
-                self._db_queue.task_done()
+                self._queue.task_done()
 
-        logger.info("Database background worker finished")
+        logger.info("Alert writer thread finished")

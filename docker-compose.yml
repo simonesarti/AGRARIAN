@@ -34,6 +34,23 @@ volumes:
 
 services:
 
+  # ── Alert fan-out bus ─────────────────────────────────────────────────────────
+  # Carries alerts between ws-server replicas so a viewer connected to one replica
+  # still receives alerts published to another. Not exposed to the host.
+  #
+  # Holds no state: pub/sub only, nothing cached, nothing replayed. Persistence is
+  # therefore disabled outright — a restart loses nothing and subscribers reconnect.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [comms-net]
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   # ── Video server ──────────────────────────────────────────────────────────────
   mediamtx:
     image: bluenviron/mediamtx:latest
@@ -83,6 +100,10 @@ services:
       DB_NAME:            ${DB_NAME}
       DB_WORKER_NAME:     ${DB_WORKER_NAME}
       DB_WORKER_PASSWORD: ${DB_WORKER_PASSWORD}
+      # Mints both viewer and publisher tokens; ws-server validates with the same secret.
+      SESSION_JWT_SECRET:    ${SESSION_JWT_SECRET:?set SESSION_JWT_SECRET in .env}
+      VIEWER_TOKEN_TTL_S:    ${VIEWER_TOKEN_TTL_S:-43200}
+      PUBLISHER_TOKEN_TTL_S: ${PUBLISHER_TOKEN_TTL_S:-86400}
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 5s
@@ -95,11 +116,18 @@ services:
       context: ws_server
     restart: unless-stopped
     networks: [comms-net]
+    depends_on:
+      redis:
+        condition: service_healthy
     ports:
-      - "${WS_PORT:-8765}:${WS_PORT:-8765}"   # WebSocket — viewers connect here
+      - "${WS_PORT:-8765}:${WS_PORT:-8765}"   # WebSocket — viewers connect here (proxy terminates WSS)
       - "8001:8000"                             # HTTP API — app POSTs alerts here from outside the comms network
     environment:
       WS_PORT: ${WS_PORT:-8765}
+      REDIS_URL: redis://redis:6379/0
+      # Shared with db-writer, which mints the tokens this validates. No publisher
+      # secret here: app containers present a per-flight token db-writer issued them.
+      SESSION_JWT_SECRET: ${SESSION_JWT_SECRET:?set SESSION_JWT_SECRET in .env}
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 5s
