@@ -157,7 +157,19 @@ class StreamVideoReader(mp.Process):
                 # --------------------------------------------------------------
 
                 # attempt to connect to the video source.
-                # A new connection is created at every failure to ensure clean state
+                # A new connection is created at every failure to ensure clean state.
+                # Release any previously held capture first: this loop is re-entered both
+                # after a failed connection attempt and after the inner read loop breaks
+                # out for reconnection, and in both cases `cap` may still reference an
+                # open capture that would otherwise be silently overwritten and leaked
+                # (relying on GC to close it is not reliable for FFmpeg/RTSP sessions).
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception as e:
+                        logger.warning(f"Failed to release previous VideoCapture object: {e}")
+                    cap = None
+
                 try:
                     logger.info("Setting up VideoCapture Object ...")
                     cap = self._setup_capture()
