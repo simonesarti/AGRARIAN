@@ -83,9 +83,12 @@ def _require_publisher(authorization: Optional[str], flight_id: int) -> None:
 # Request / response models
 # ------------------------------------------------------------------ #
 
-class StartSessionRequest(BaseModel):
+class ViewerTokenRequest(BaseModel):
     email: str
     password: str
+    # Required only when the caller has more than one flight active at once —
+    # omitting it still works for the common case of exactly one.
+    stream_id: Optional[int] = None
 
 class OpenFlightRequest(BaseModel):
     stream_key: str
@@ -345,12 +348,22 @@ def mqtt_auth_acl(req: MqttAclRequest):
 
 
 @app.post("/viewer/token")
-def issue_viewer_token(req: StartSessionRequest):
+def issue_viewer_token(req: ViewerTokenRequest):
     """
-    Issue a viewer token for the caller's most recent flight, without opening a
-    new one. This is how the UI gets the credential it presents to ws-server.
+    Issue a viewer token for one of the caller's own currently active flights,
+    without opening a new one. This is how the UI gets the credential it
+    presents to ws-server.
 
-    The token is scoped to the flight belonging to the authenticated user, so a
+    Used to just return "the most recent flight", which was wrong two ways at
+    once: it could hand out a token for a flight that had already landed (start
+    time is not a liveness signal), and it silently picked one for the caller
+    once a second stream could be active at the same time, rather than asking
+    which. Both are the same underlying bug — "latest" is not "active" — so
+    both are fixed by the same query: with zero active flights there is nothing
+    to hand out, with exactly one there is nothing to ask, and with more than
+    one the caller must say which stream_id it means.
+
+    The token is scoped to a flight belonging to the authenticated user, so a
     user can never be issued a token for someone else's flight.
     """
     try:
@@ -361,9 +374,25 @@ def issue_viewer_token(req: StartSessionRequest):
         logger.error(f"Unexpected error issuing viewer token: {e}")
         raise HTTPException(status_code=500, detail="Failed to issue viewer token")
 
-    flight_id = _directory.latest_flight_id(user_id)
-    if flight_id is None:
-        raise HTTPException(status_code=404, detail="No flight found for this user")
+    active = _directory.active_flights(user_id)
+
+    if req.stream_id is not None:
+        matches = [f for f in active if f["stream_id"] == req.stream_id]
+        if not matches:
+            # Deliberately the same 404 whether stream_id belongs to someone else
+            # or simply has nothing active: the caller already owns every row in
+            # `active`, so distinguishing the two would only leak which is true.
+            raise HTTPException(status_code=404, detail="No active flight on that stream")
+        flight_id = matches[0]["flight_id"]
+    elif len(active) == 1:
+        flight_id = active[0]["flight_id"]
+    elif len(active) == 0:
+        raise HTTPException(status_code=404, detail="No active flight for this user")
+    else:
+        raise HTTPException(status_code=409, detail={
+            "message": "More than one flight is active; specify stream_id",
+            "active_flights": active,
+        })
 
     logger.info(f"Viewer token issued: flight_id={flight_id}, user={req.email}")
     return {

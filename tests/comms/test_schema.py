@@ -15,6 +15,7 @@ Run:  see README.md
 """
 import os
 import sys
+from datetime import datetime, timezone
 
 # db_writer is not a package on the path; point at it explicitly so this file can be
 # run from anywhere. DB_WRITER_DIR overrides for a container mount.
@@ -153,8 +154,40 @@ def main():
     check("cannot revoke another user's stream", refused(d.revoke_stream, a["stream_id"], u2))
     check("cannot rotate another user's stream", refused(d.rotate_stream_key, a["stream_id"], u2))
     check("list_streams is per-user", d.list_streams(u2) == [])
-    check("latest_flight_id is per-user", d.latest_flight_id(u2) is None)
-    check("latest_flight_id finds own flight", d.latest_flight_id(u1) is not None)
+
+    # ── active_flights (viewer-token disambiguation) ─────────────────────────
+    check("active_flights is per-user", d.active_flights(u2) == [])
+    check("u1's three still-open flights (created above) are all active",
+          len(d.active_flights(u1)) == 3)
+
+    with S() as s:
+        fresh = m.User(email="solo@test.io", password=m.User.hash_password("pw"))
+        s.add(fresh)
+        s.commit()
+        solo = fresh.user_id
+    solo_stream = d.create_stream(solo, "solo-feed")
+    with S() as s:
+        f = m.Flight(stream_id=solo_stream["stream_id"])
+        s.add(f)
+        s.commit()
+        solo_flight_id = f.flight_id
+
+    check("exactly one active flight resolves unambiguously — nothing to ask",
+          [x["flight_id"] for x in d.active_flights(solo)] == [solo_flight_id])
+    check("active_flights carries the stream_id needed to disambiguate",
+          d.active_flights(solo)[0]["stream_id"] == solo_stream["stream_id"])
+
+    with S() as s:
+        s.get(m.Flight, solo_flight_id).end_time = datetime.now(timezone.utc)
+        s.commit()
+    check("a landed flight (end_time set) is NOT active — 'latest' is not 'active'",
+          d.active_flights(solo) == [])
+
+    # This user only exists to isolate the assertions above from u1's incidental
+    # flights; remove it so the cascade-delete check below still sees a clean slate.
+    with S() as s:
+        s.delete(s.get(m.User, solo))
+        s.commit()
 
     # ── constraints and cascade ──────────────────────────────────────────────
     with S() as s:

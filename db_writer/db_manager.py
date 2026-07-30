@@ -525,23 +525,31 @@ class UserDirectory:
             flight = session.get(Flight, flight_id)
             return flight.stream_id if flight else None
 
-    def latest_flight_id(self, user_id: int) -> Optional[int]:
+    def active_flights(self, user_id: int) -> list:
         """
-        Most recently started flight for this user, or None if they have none.
+        This user's currently open flights (end_time IS NULL) across all their
+        streams, most recently started first.
 
-        Joins through streams — a flight's owner is streams.user_id. Ambiguous once a
-        user has two streams running at once; see the note in CLOUD_ARCHITECTURE §9.
+        Joins through streams — a flight's owner is streams.user_id. Used to resolve
+        /viewer/token: with one active flight there is nothing to ask; with more than
+        one, the caller must say which stream_id it means rather than have one picked
+        for it silently. Filtering to open flights also means a flight that already
+        landed is never handed out as if it were still live — "latest" alone does not
+        imply "active", and the two used to be conflated here.
         """
         SessionFactory = sessionmaker(bind=self._engine)
         with SessionFactory() as session:
-            flight = (
-                session.query(Flight)
+            rows = (
+                session.query(Flight, Stream)
                 .join(Stream, Flight.stream_id == Stream.stream_id)
-                .filter(Stream.user_id == user_id)
+                .filter(Stream.user_id == user_id, Flight.end_time.is_(None))
                 .order_by(Flight.start_time.desc())
-                .first()
+                .all()
             )
-            return flight.flight_id if flight else None
+            return [
+                {"flight_id": f.flight_id, "stream_id": s.stream_id, "label": s.label}
+                for f, s in rows
+            ]
 
 
 class AlertWriter:

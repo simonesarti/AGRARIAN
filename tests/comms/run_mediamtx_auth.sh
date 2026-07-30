@@ -114,10 +114,25 @@ viewer_token() {  # viewer_token <email> <password>  -- what the portal calls
     -d "{\"email\":\"$1\",\"password\":\"$2\"}"
 }
 
+viewer_token_call() {  # viewer_token_call <email> <password> [stream_id] -> "<body>\n<code>"
+  if [ -n "${3:-}" ]; then
+    curl -s -w $'\n%{http_code}' -X POST "$API/viewer/token" -H 'Content-Type: application/json' \
+      -d "{\"email\":\"$1\",\"password\":\"$2\",\"stream_id\":$3}"
+  else
+    curl -s -w $'\n%{http_code}' -X POST "$API/viewer/token" -H 'Content-Type: application/json' \
+      -d "{\"email\":\"$1\",\"password\":\"$2\"}"
+  fi
+}
+vt_code() { echo "$1" | tail -1; }
+vt_body() { echo "$1" | sed '$d'; }
+
 A=$(open_flight "$KEY_A")
 B=$(open_flight "$KEY_B")
 UUID_A=$(echo "$A" | jsonget public_uuid); PUB_A=$(echo "$A" | jsonget publisher_token)
 UUID_B=$(echo "$B" | jsonget public_uuid)
+FID_A=$(echo "$A" | jsonget flight_id); SID_A=$(echo "$A" | jsonget stream_id)
+FID_B=$(echo "$B" | jsonget flight_id); SID_B=$(echo "$B" | jsonget stream_id)
+UID_A=$(echo "$A" | jsonget user_id)
 [ -n "$UUID_A" ] && [ -n "$UUID_B" ] || { echo "could not open flights: $A / $B"; exit 1; }
 echo "    alice flight uuid=$UUID_A   bob flight uuid=$UUID_B"
 
@@ -209,6 +224,32 @@ d.revoke_stream(s['stream_id'], s['user_id'])
 " >/dev/null 2>&1
 check "a revoked key can no longer publish" \
       rejected "$(publish "rtmp://$RTMP/in/$KEY_A" "in/$KEY_A")"
+
+echo
+echo "── viewer/token: disambiguation once a user has two active flights ────────"
+resp=$(viewer_token_call alice@test.io pw123)
+check "one active flight: 200, no stream_id needed" 200 "$(vt_code "$resp")"
+check "one active flight: resolves to it" "$FID_A" "$(echo "$(vt_body "$resp")" | jsonget flight_id)"
+
+KEY_A2=$(docker run --rm --network "$NET" "${ENVV[@]}" "$IMAGE" python -c "
+from db_manager import UserDirectory
+d = UserDirectory('postgresql://testuser:testpw@mtxa-pg:5432/testdb')
+print(d.create_stream($UID_A, 'alice second stream')['stream_key'])
+" 2>/dev/null | tail -1)
+A2=$(open_flight "$KEY_A2")
+FID_A2=$(echo "$A2" | jsonget flight_id); SID_A2=$(echo "$A2" | jsonget stream_id)
+[ -n "$FID_A2" ] || { echo "could not open alice's second flight: $A2"; exit 1; }
+
+resp=$(viewer_token_call alice@test.io pw123)
+check "two active flights, no stream_id: 409 (ambiguous, not a guess)" 409 "$(vt_code "$resp")"
+resp=$(viewer_token_call alice@test.io pw123 "$SID_A")
+check "two active flights, first stream_id: resolves to that flight" "$FID_A" \
+      "$(echo "$(vt_body "$resp")" | jsonget flight_id)"
+resp=$(viewer_token_call alice@test.io pw123 "$SID_A2")
+check "two active flights, second stream_id: resolves to that flight" "$FID_A2" \
+      "$(echo "$(vt_body "$resp")" | jsonget flight_id)"
+resp=$(viewer_token_call alice@test.io pw123 "$SID_B")
+check "alice cannot get a token for bob's stream_id" 404 "$(vt_code "$resp")"
 
 echo
 echo "=========================================================="

@@ -713,6 +713,23 @@ db-writer, Redis, the recorder, and the orchestrator.
   the still-running flight is tracked again with no duplicate container while the
   exited one is closed in PostgreSQL and removed — then the recovered flight lands
   normally afterwards, same as any flight the orchestrator opened itself.
+- **`/viewer/token` no longer guesses which flight.** It used to return whichever
+  flight a user started most recently — wrong two different ways at once: it could
+  hand out a token for a flight that had already landed (start time is not a liveness
+  signal), and it silently picked one out of several once a second stream could be
+  active at the same time, rather than asking which, now that concurrent flights are
+  a real supported case. Both were the same underlying bug (`latest_flight_id`
+  conflated "most recent" with "active"), fixed by one query:
+  `UserDirectory.active_flights()` returns only currently open flights
+  (`end_time IS NULL`). With zero there is nothing to hand out (404); with exactly
+  one — still the common case — nothing changes for the caller; with more than one
+  the request must include `stream_id` or gets a 409 listing the candidates, rather
+  than silently guessing on the caller's behalf. Verified by 6 assertions against
+  SQLite (`test_schema.py`, including that a landed flight is excluded) and 6 more
+  end-to-end against a real db-writer and PostgreSQL (`run_mediamtx_auth.sh`,
+  22/22 total): the one-flight case still just works, a second concurrent flight
+  makes the plain request 409 rather than pick one, `stream_id` resolves each flight
+  correctly, and a user cannot use `stream_id` to reach another tenant's flight.
 
 Distinct from the section below: these are live weaknesses on this branch right now, not
 work that has yet to start.
@@ -756,5 +773,3 @@ this list — it is set inside `open_flight_for_key` the moment a flight opens, 
   now costs one indexed lookup here. A short-TTL cache is the obvious fix and the wrong
   one to reach for blindly: it delays revocation of a credential that has no expiry.
   Replicas first, cache only if measurement demands it.
-- `/viewer/token` returns "latest flight", which is ambiguous once one user has two
-  concurrent flights

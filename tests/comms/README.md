@@ -88,7 +88,7 @@ token signed with a 17-character wrong secret, not a real key. Expected.
 ```bash
 ./run_db_replication.sh      # 7 + 20×2 assertions, real PostgreSQL
 ./run_redis_failure.sh       # 3 + 7 assertions, Redis restarted mid-test
-./run_mediamtx_auth.sh       # 16 assertions, real MediaMTX + ffmpeg publishes
+./run_mediamtx_auth.sh       # 22 assertions, real MediaMTX + ffmpeg publishes
 ./run_orchestrator.sh        # 21 assertions, real containers spawned and torn down
 ./run_orchestrator_real_app.sh  # 7 assertions, the real GPU app, not the stub
 ./run_recording_upload.sh    # 8 assertions, real segment upload + DB traceability
@@ -134,6 +134,9 @@ through `streams`, so nothing can contradict it), cross-user access is refused, 
 without a `stream_id` is rejected, and deleting a *user* still cascades — the one case
 that cascade exists for. Also asserts `delete_stream()` does **not** exist; a portal
 "Remove" button implemented as a hard delete would silently destroy flight history.
+Also pins `active_flights()`, which resolves `/viewer/token`: only currently open
+flights count (a landed one — `end_time` set — must not come back), and a lone
+active flight resolves with nothing to disambiguate.
 
 **`test_tokens.py`** — viewer and publisher tokens are signed with the same secret, so
 the `scope` claim is the only thing separating them. Checked in both directions, plus
@@ -171,6 +174,12 @@ time round:
 - **MediaMTX's HLS server 302s to `?cookieCheck=1`** and authenticates only the
   followed request. Without `curl -L` and a cookie jar every result is 302 and the
   test silently measures nothing.
+
+It also exercises `/viewer/token`'s disambiguation against a real db-writer and
+PostgreSQL: alice starts a second concurrent flight, the plain request (no
+`stream_id`) turns from 200 into 409 rather than silently picking one, `stream_id`
+resolves each of her two flights correctly, and her own credentials cannot reach
+bob's stream_id.
 
 It also aborts if MediaMTX fails to start, because a MediaMTX that never came up
 denies everything — which reads as a wall of passing deny-assertions.
