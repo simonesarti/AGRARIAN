@@ -27,6 +27,15 @@ webrtcICEServers2:
 hls: yes
 hlsAddress: :8888
 
+# Off explicitly, not left to default. MediaMTX v1.19 enables SRT (:8890) and MoQ
+# (:8892) out of the box. Neither is published in compose, so nothing was reachable
+# and the auth hook would have covered them like any other protocol — but a listener
+# nobody decided to run is a listener nobody is watching, and a future compose change
+# that publishes a port range would expose them silently. Turn them on deliberately
+# if a drone ever needs SRT.
+srt: no
+moq: no
+
 readTimeout: 10s
 writeTimeout: 10s
 writeQueueSize: 1024

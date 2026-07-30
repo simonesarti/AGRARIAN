@@ -329,9 +329,15 @@ There is **no catch-all path**: a path matching neither pattern is rejected by M
 before authentication is consulted at all. The old fixed `drone` and `annot` paths are
 gone — they were shared by every tenant and readable by anyone who knew the name.
 
-`runOnAvailable`/`runOnUnavailable` are present but commented out. They point at the
-orchestrator, which does not exist yet, and pointing a hook at an absent service would
-fire a failing command on every flight.
+`runOnAvailable`/`runOnUnavailable` are live and point at the orchestrator, which is
+built (§6). They were commented out for as long as the orchestrator did not exist,
+since a hook aimed at an absent service fires a failing command on every flight.
+
+Every protocol MediaMTX can listen on is now set explicitly. v1.19 enables **SRT (8890)
+and MoQ (8892)** by default; neither was published in compose, so nothing was reachable
+from outside, but both were running inside the container on every start — MoQ generating
+a self-signed certificate each time — and a later compose change publishing a port range
+would have exposed them with nobody having decided to. `srt: no` and `moq: no` close that.
 
 MediaMTX POSTs `{user, password, token, ip, action, path, protocol, id, query, userAgent}`
 on every connection attempt; any 2xx allows, anything else denies. New users work the
@@ -591,14 +597,15 @@ Externally reachable:
 Internal only — **must never be routed from outside**: ws-server's alert-write API port,
 db-writer, Redis, the recorder, and the orchestrator.
 
-> - **[open]** `RTMPS_PORT = 8443` and `RTSPS_PORT = 441` in
->   `app/shared/processes/constants.py` are wrong (MediaMTX defaults are 1936 and 8322),
->   and 8443 collides with `HTTPS_PORT` and `WSS_PORT` in the same block. Neither
->   constant is referenced anywhere yet, so this is latent rather than live.
-> - **[open]** MediaMTX v1.19 also opens **SRT on 8890** and **MoQ on 8892** by default.
->   Neither is published in compose, so nothing is exposed today, and the auth hook
->   covers them like any other protocol — but both should be disabled explicitly rather
->   than left to default.
+> - **[built]** The port constants in `app/shared/processes/constants.py` are corrected.
+>   `RTMPS_PORT` and `RTSPS_PORT` now carry MediaMTX's actual defaults (1936, 8322)
+>   rather than 8443 and 441, and `HTTPS_PORT`/`WSS_PORT` are 443 rather than 8443,
+>   which is what this table says Traefik terminates and what removes the collision
+>   between them. `WEBSOCKET_PORT` no longer derives from `HTTPS_PORT` — it is
+>   ws-server's WebSocket listener (8765) and had nothing to do with HTTPS. None of
+>   these names is read by any code path today (the app reaches its services through
+>   `app_settings.py`), so this was latent throughout and is now simply correct.
+> - **[built]** SRT and MoQ are disabled explicitly in `mediamtx.yaml` — see §4.
 > - **[note]** compose publishes ws-server's alert-write API on host `8001` and db-writer
 >   on `8002`, which this section says must never be routed from outside. That is the
 >   interim laptop-app deployment described in §7, not the target topology.
@@ -734,11 +741,26 @@ db-writer, Redis, the recorder, and the orchestrator.
 Distinct from the section below: these are live weaknesses on this branch right now, not
 work that has yet to start.
 
-- **`danger_detection` mode has never run end to end.** It requires a TensorRT `.engine`
-  file built for the target GPU (`segmentation.py` hardcodes `device="cuda"` with no CPU
-  fallback), and none exists yet — only `.onnx`/`.pt` checkpoints are on disk. Building
-  and verifying that engine is the remaining piece of driving the real app tier fully
-  end to end.
+- **`danger_detection` mode has never run end to end** — and the blocker is not what
+  this section previously claimed. It said the mode needed a TensorRT `.engine` built
+  for the target GPU and that none existed. Both halves were wrong: `engine/` holds
+  `segmentation_1280_720.engine` and `best_model_segunified_1280_720.engine`, and
+  `segmentation.py` dispatches on the checkpoint's extension — `.engine` loads through
+  `_TrtSession`, anything else through an onnxruntime CUDA session — so the ONNX path
+  that `configs/danger_detection/segmenter.yaml` actually points at runs without any
+  engine at all. `device="cuda"` is hardcoded, but that only means "needs a GPU", which
+  the real-app harness already provides via `--gpus all`.
+
+  What actually blocks it: `run_orchestrator_real_app.sh` hardcodes
+  `APP_ENV_APP_MODE=health_monitoring`, so nothing has ever driven the other mode.
+  **This is also why the telemetry plane is unverified against the real app.**
+  `danger_detection` is the only mode that consumes telemetry — `health_monitoring`
+  builds no `FrameTelemetryCombiner` — so §4's Mosquitto work, the
+  `TELEMETRY_LISTENER_STREAM_KEY` the orchestrator injects, and the app's reuse of its
+  publisher token as an MQTT username have been exercised only by synthetic test
+  clients in `run_mqtt_auth.sh`, never by the container that will really do it.
+  Parameterising the runner and giving the harness a telemetry publisher closes the
+  second mode and the last unexercised plane together.
 - **The orchestrator holds the Docker socket.** Anything that can reach its port can
   start containers on the host. Its port is internal-only, but this is the strongest
   argument for the Kubernetes backend, where the equivalent is a scoped service account.
@@ -768,7 +790,6 @@ this list — it is set inside `open_flight_for_key` the moment a flight opens, 
 - Portal (registration, stream slot CRUD, key rotation, viewer token issuance)
 - Recorder per-tenant upload prefixes
 - TLS certificate issue and renewal
-- Fix `RTMPS_PORT` / `RTSPS_PORT`
 - **Auth-endpoint caching and db-writer replica count.** Every publish and every read
   now costs one indexed lookup here. A short-TTL cache is the obvious fix and the wrong
   one to reach for blindly: it delays revocation of a credential that has no expiry.

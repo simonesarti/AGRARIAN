@@ -92,7 +92,10 @@ MEDIA_SERVER_HOST = "mediamtx"
 TELEMETRY_BROKER_HOST = "mosquitto"
 
 HTTP_PORT = 80
-HTTPS_PORT = 8443
+# 443, not 8443. Traefik terminates HTTPS and WSS on the standard port; 8443 was both
+# wrong and the source of a three-way collision in this block, since RTMPS was also
+# 8443 at the time.
+HTTPS_PORT = 443
 MQTT_PORT = 1883
 MQTTS_PORT = 8883
 RTMP_PORT = 1935
@@ -103,7 +106,7 @@ RTSP_PORT = 8554
 RTSPS_PORT = 8322
 WEBRTC_PORT = 8889
 WS_PORT = 80
-WSS_PORT = 8443
+WSS_PORT = 443
 WS_COMMON_PORT = 8765
 DB_COMMON_PORT = 5432
 
@@ -209,7 +212,11 @@ ALERTS_JPEG_COMPRESSION_QUALITY = 85
 # -------------------------- ALERTS WS --------------------------
 
 WEBSOCKET_HOST = "0.0.0.0"
-WEBSOCKET_PORT = HTTPS_PORT
+# ws-server's WebSocket listener (WS_PORT in ws_server/constants.py), not an HTTPS port.
+# This used to derive from HTTPS_PORT, which was only ever coincidentally non-broken
+# because nothing reads these two names — the app reaches ws-server through
+# app_settings.py, not from here.
+WEBSOCKET_PORT = WS_COMMON_PORT
 
 WS_MANAGER_BROADCAST_TIMEOUT = 2.0
 WS_MANAGER_PING_INTERVAL = 5.0                          # 5.0 s
