@@ -80,6 +80,16 @@ datetime
 image_data  # Compressed JPEG
 image_width
 image_height
+
+----------
+recordings
+----------
+recording_id (PK)
+flight_id (FK → flights.flight_id)
+segment_path      # Filesystem path MediaMTX wrote, under the shared recordings volume
+storage_backend   # local | azure | aws — whichever the recorder was configured with
+storage_location  # Blob/key name the recorder uploaded to; NULL for the local backend
+uploaded_at
 """
 
 
@@ -197,6 +207,7 @@ class Flight(Base):
 
     stream = relationship("Stream", back_populates="flights")
     alerts = relationship("Alert", back_populates="flight", cascade="all, delete-orphan")
+    recordings = relationship("Recording", back_populates="flight", cascade="all, delete-orphan")
 
     @property
     def user_id(self) -> int:
@@ -226,6 +237,35 @@ class Alert(Base):
     def __repr__(self):
         return (f"<Alert(id={self.alert_id}, flight_id={self.flight_id}, "
                 f"msg='{self.alert_msg}...', frame={self.frame_id})>")
+
+
+class Recording(Base):
+    """
+    One uploaded recording segment, tying it back to the flight it came from.
+
+    MediaMTX names segments by output path (out/<public_uuid>), not flight_id, so this
+    is the only place that association is ever recorded. Without it, "give me flight
+    42's recordings" has no answer beyond knowing its public_uuid and listing a storage
+    prefix by hand.
+
+    A flight can own more than one row: recordSegmentDuration splits long sessions into
+    hourly files, and each one completes and uploads independently.
+    """
+
+    __tablename__ = 'recordings'
+
+    recording_id = Column(Integer, primary_key=True, autoincrement=True)
+    flight_id = Column(Integer, ForeignKey('flights.flight_id'), nullable=False, index=True)
+    segment_path = Column(String, nullable=False)
+    storage_backend = Column(String(16), nullable=False)
+    storage_location = Column(String, nullable=True)
+    uploaded_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    flight = relationship("Flight", back_populates="recordings")
+
+    def __repr__(self):
+        return (f"<Recording(id={self.recording_id}, flight_id={self.flight_id}, "
+                f"backend='{self.storage_backend}')>")
 
 
 def ingest_path(stream_key: str) -> str:
@@ -437,6 +477,39 @@ class UserDirectory:
         with SessionFactory() as session:
             flight = session.query(Flight).filter_by(public_uuid=public_uuid).first()
             return flight.flight_id if flight else None
+
+    def record_upload(
+            self,
+            public_uuid: str,
+            segment_path: str,
+            storage_backend: str,
+            storage_location: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        Record that a segment of this flight's output was uploaded. Returns the
+        flight_id, or None if public_uuid names no flight.
+
+        Called by the recorder sidecar after a successful upload — it only knows the
+        output path MediaMTX gave it, never the flight_id, so this is also where that
+        path gets resolved.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            flight = session.query(Flight).filter_by(public_uuid=public_uuid).first()
+            if flight is None:
+                return None
+            recording = Recording(
+                flight_id=flight.flight_id,
+                segment_path=segment_path,
+                storage_backend=storage_backend,
+                storage_location=storage_location,
+            )
+            session.add(recording)
+            session.commit()
+            logger.info(
+                f"Recording logged: flight_id={flight.flight_id}, backend={storage_backend}"
+            )
+            return flight.flight_id
 
     def flight_stream_id(self, flight_id: int) -> Optional[int]:
         """

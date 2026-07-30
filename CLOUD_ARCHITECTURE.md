@@ -248,7 +248,7 @@ letting anyone with read access inject alerts into it.
 | ws-server | Shared, replicated on load | Per-flight JWT (view + publish scopes); Redis pub/sub fan-out | **[built]** |
 | db-writer | Shared, replicated on load | Stateless per request; bcrypt user auth | **[built]** |
 | Redis | Shared | Channel per flight (`flight:{id}`) | **[built]** |
-| Recorder | Shared | Per-tenant upload prefix | **[open]** |
+| Recorder | Shared | Segment → flight_id resolved via `recordings` table | upload **[built]**, per-tenant prefix **[open]** |
 | Orchestrator | Shared | Spawns/stops app containers | **[built]** |
 | Portal | Shared | Session cookie → user | **[open]** |
 
@@ -390,10 +390,10 @@ runOnAvailable command exited: exec: "wget": executable file not found in $PATH
 ```
 
 MediaMTX logs that at INF and carries on. **This is why recordings were never uploaded:**
-`runOnRecordSegmentComplete` has been pointing at the recorder sidecar since it was
-written and has never once fired. The `-ffmpeg` tag is Alpine based and supplies busybox
+`runOnRecordSegmentComplete` pointed at the recorder sidecar from the start but never
+once fired until this was found. The `-ffmpeg` tag is Alpine based and supplies busybox
 `wget`, which posts `application/x-www-form-urlencoded` — the encoding the orchestrator's
-`Form(...)` endpoints expect.
+`Form(...)` endpoints expect. Fixed and verified end to end — see §9.
 
 The same constraint rules out shell syntax in any hook: no pipes, no `&&`, no redirects.
 `-O /dev/null` is an argument, which is why it works.
@@ -649,8 +649,17 @@ db-writer, Redis, the recorder, and the orchestrator.
   Postgres throughout. No alert was expected or produced: the input is an ffmpeg
   `testsrc` pattern with no trajectories to flag. `danger_detection` mode remains
   unverified — see the gap above.
-
-### Known gaps in code that exists today
+- **The recording upload path, end to end, with database traceability.**
+  `runOnRecordSegmentComplete` pointed at the recorder sidecar from the start but never
+  fired until the `-ffmpeg` tag fix (see the auth section above); until now nothing had
+  driven it. `run_recording_upload.sh` publishes to a real `out/<uuid>`, disconnects
+  (which always flushes the current segment regardless of `recordSegmentDuration`), and
+  confirms MediaMTX's hook fires, the recorder receives it and uploads to the `local`
+  backend, and — new this pass — the segment is resolved back to its `flight_id` and
+  logged in a new `recordings` table via a new `POST /recording` endpoint, rather than
+  only existing as an anonymous file under a UUID nobody can join to a flight. 8/8
+  assertions, including the file actually present on the shared volume. Azure/AWS
+  backends remain unverified — no credentials are configured to test against them.
 
 Distinct from the section below: these are live weaknesses on this branch right now, not
 work that has yet to start.
@@ -662,10 +671,6 @@ work that has yet to start.
   end to end.
 - **Mosquitto is still `allow_anonymous true`.** Telemetry is now the only unauthenticated
   channel in the system.
-- **Recordings have never been uploaded.** `runOnRecordSegmentComplete` has pointed at
-  the recorder sidecar since it was written, but the MediaMTX image had no `wget` for it
-  to run, so the hook failed silently on every segment. Fixed by the `-ffmpeg` image tag;
-  the upload path itself has still never executed and is therefore untested.
 - **The orchestrator holds the Docker socket.** Anything that can reach its port can
   start containers on the host. Its port is internal-only, but this is the strongest
   argument for the Kubernetes backend, where the equivalent is a scoped service account.

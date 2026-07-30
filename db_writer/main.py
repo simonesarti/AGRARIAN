@@ -109,6 +109,13 @@ class MediaMTXAuthRequest(BaseModel):
     userAgent: str = ""     # noqa: N815 — MediaMTX sends this key verbatim
 
 
+class RecordingRequest(BaseModel):
+    public_uuid: str
+    segment_path: str
+    storage_backend: str
+    storage_location: Optional[str] = None
+
+
 class AlertRequest(BaseModel):
     frame_id: int
     alert_msg: str
@@ -222,6 +229,28 @@ def close_flight(flight_id: int, authorization: Optional[str] = Header(default=N
     if not _directory.close_flight(flight_id):
         raise HTTPException(status_code=404, detail=f"Flight {flight_id} not found")
     return {"ok": True}
+
+
+@app.post("/recording")
+def record_upload(req: RecordingRequest):
+    """
+    Log an uploaded recording segment against the flight it belongs to.
+
+    Called by the recorder sidecar, never by the app or a tenant. The recorder only
+    ever learns an output path (out/<public_uuid>) from MediaMTX's segment-complete
+    hook, never a flight_id, so this is also where that path is resolved.
+
+    INTERNAL ONLY, like /auth/mediamtx: the caller is a trusted sidecar on the private
+    network, not a tenant, and there is no credential to check here — a public_uuid
+    names no capability by itself, unlike a stream key or a token.
+    """
+    flight_id = _directory.record_upload(
+        req.public_uuid, req.segment_path, req.storage_backend, req.storage_location,
+    )
+    if flight_id is None:
+        logger.warning(f"Recording upload for unknown output path: {req.public_uuid!r}")
+        raise HTTPException(status_code=404, detail="Unknown public_uuid")
+    return {"flight_id": flight_id}
 
 
 @app.post("/auth/mediamtx")

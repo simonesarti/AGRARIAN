@@ -25,10 +25,11 @@ try to run these directly with `python3`.
 | `run_mediamtx_auth.sh` | MediaMTX + db-writer + Postgres, host `ffmpeg` | `./run_mediamtx_auth.sh` |
 | `run_orchestrator.sh` | the above + Docker socket, host `ffmpeg` | `./run_orchestrator.sh` |
 | `run_orchestrator_real_app.sh` | the above + a GPU, `nvidia-container-toolkit`, `checkpoints/*.pt` | `./run_orchestrator_real_app.sh` |
+| `run_recording_upload.sh` | MediaMTX + recorder + db-writer + Postgres, host `ffmpeg` | `./run_recording_upload.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
 
-The two `run_*.sh` scripts build images, stand everything up, run the tests, print the
+The `run_*.sh` scripts build images, stand everything up, run the assertions, print the
 resulting database rows where relevant, and **clean up after themselves on exit** —
 including on failure.
 
@@ -78,6 +79,8 @@ token signed with a 17-character wrong secret, not a real key. Expected.
 ./run_redis_failure.sh       # 3 + 7 assertions, Redis restarted mid-test
 ./run_mediamtx_auth.sh       # 16 assertions, real MediaMTX + ffmpeg publishes
 ./run_orchestrator.sh        # 21 assertions, real containers spawned and torn down
+./run_orchestrator_real_app.sh  # 7 assertions, the real GPU app, not the stub
+./run_recording_upload.sh    # 8 assertions, real segment upload + DB traceability
 ```
 
 `run_mediamtx_auth.sh` needs `ffmpeg` and `curl` **on the host** and binds host ports
@@ -187,6 +190,18 @@ pipeline on the GPU, and publishes to `out/<public_uuid>`. Needs
 `checkpoints/.gitkeep`). `danger_detection` mode is not covered: it requires a
 TensorRT `.engine` built for the target GPU, which does not exist yet.
 
+**`run_recording_upload.sh`** — the recording upload path, which the auth section above
+explains was silently broken from the start (no `wget` on the default MediaMTX image).
+Publishes straight to a real `out/<uuid>` rather than involving the GPU app — the
+recording pipeline does not care what publishes, only that `record: yes` is set on that
+path — then disconnects, which always flushes the current segment regardless of
+`recordSegmentDuration`. Checks that MediaMTX's hook actually fires, the recorder
+receives it and uploads (the `local` backend, since no cloud credentials are configured
+here), and — the part that did not exist before this pass — that the segment is resolved
+back to its `flight_id` and lands in the `recordings` table via the new `POST /recording`
+endpoint, rather than only existing as a file under a UUID with no way to join it back to
+a flight.
+
 **`test_tenancy.py`** — the original leak. ws-server used to broadcast every alert,
 including its JPEG and GPS position, to every connected client. Assertion 6 is the one
 that matters: flight 2's viewer must receive **nothing**.
@@ -202,6 +217,12 @@ There is no coverage for Mosquitto ACLs or TLS — neither exists yet. See
 `health_monitoring` mode — ingest read, pipeline, and annotated-output publish are all
 verified. `danger_detection` mode is not: it needs a TensorRT `.engine` built for the
 target GPU, and none exists yet.
+
+The recording upload path is verified for the `local` storage backend
+(`run_recording_upload.sh`). The `azure` and `aws` backends in `recorder/main.py` are
+still unverified — no test here has credentials to exercise them against a real Blob
+container or S3 bucket. Per-tenant upload prefixes are also not implemented — every
+segment lands at the storage root regardless of which tenant it belongs to.
 
 The **recording upload path** has still never run — the hook that triggers it could not
 execute until the `-ffmpeg` image tag landed, so nothing downstream of it is exercised.

@@ -191,7 +191,11 @@ services:
       context: recorder
     restart: unless-stopped
     networks: [comms-net]
+    depends_on:
+      db-writer:
+        condition: service_healthy
     environment:
+      DB_WRITER_URL:                     http://db-writer:8000
       RECORDING_STORE_SERVICE:           ${RECORDING_STORE_SERVICE:-local}
       RECORDING_DELETE_LOCAL_ON_SUCCESS: ${RECORDING_DELETE_LOCAL_ON_SUCCESS:-false}
       RECORDING_AZURE_CONNECTION_STRING: ${RECORDING_AZURE_CONNECTION_STRING:-}

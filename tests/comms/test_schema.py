@@ -48,8 +48,8 @@ def main():
 
     # ── shape ────────────────────────────────────────────────────────────────
     insp = inspect(d._engine)
-    check("tables are users/streams/flights/alerts",
-          sorted(insp.get_table_names()) == ["alerts", "flights", "streams", "users"],
+    check("tables are users/streams/flights/alerts/recordings",
+          sorted(insp.get_table_names()) == ["alerts", "flights", "recordings", "streams", "users"],
           str(sorted(insp.get_table_names())))
     flight_cols = [c["name"] for c in insp.get_columns("flights")]
     check("flights carries NO user_id (linear ownership)", "user_id" not in flight_cols,
@@ -95,6 +95,25 @@ def main():
     with S() as s:
         f = s.query(m.Flight).first()
         check("flight.user_id resolves via its stream", f.user_id == u1, f"got={f.user_id}")
+        first_flight_id, first_public_uuid = f.flight_id, f.public_uuid
+
+    # ── recordings ───────────────────────────────────────────────────────────
+    with S() as s:
+        base_recordings = s.query(m.Recording).count()
+
+    check("an unknown output uuid resolves to nothing",
+          d.record_upload("00000000-0000-0000-0000-000000000000", "/x", "local") is None)
+    with S() as s:
+        check("an unknown uuid added no recording row",
+              s.query(m.Recording).count() == base_recordings)
+
+    got_flight_id = d.record_upload(first_public_uuid, "/recordings/out/x/seg.mp4", "local")
+    check("a known output uuid resolves to its flight", got_flight_id == first_flight_id)
+    with S() as s:
+        rec = s.query(m.Recording).filter_by(flight_id=first_flight_id).first()
+        check("the recording is stored against that flight", rec is not None)
+        check("storage_location is None for the local backend",
+              rec.storage_location is None, str(rec.storage_location))
 
     # ── 2. ROTATE ────────────────────────────────────────────────────────────
     old = b["stream_key"]
@@ -152,9 +171,9 @@ def main():
     with S() as s:
         s.delete(s.get(m.User, u1))
         s.commit()
-        check("deleting a user cascades to streams/flights/alerts",
+        check("deleting a user cascades to streams/flights/alerts/recordings",
               s.query(m.Stream).count() == 0 and s.query(m.Flight).count() == 0
-              and s.query(m.Alert).count() == 0)
+              and s.query(m.Alert).count() == 0 and s.query(m.Recording).count() == 0)
 
     check("there is deliberately no delete_stream()", not hasattr(d, "delete_stream"))
 
