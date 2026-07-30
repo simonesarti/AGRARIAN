@@ -162,7 +162,7 @@ the party presenting them differ — this is deliberate, not inconsistency.
 | Browser → WebRTC / HLS / WebSocket | **JWT** | Hours | Carried by software; length is free, expiry is free |
 | App container → hub | **Injected token** | Container lifetime | Never touched by a human |
 
-### Stream keys **[designed]**
+### Stream keys **[built]**
 
 The operator types the ingest URL into the drone controller before every flight. That
 single constraint determines the design: the credential must be short enough to type
@@ -193,16 +193,21 @@ every viewer.
 The residual cost is that the key appears in MediaMTX access logs. Revocability is what
 covers that.
 
-### Viewer tokens **[built for WebSocket; MediaMTX read path designed]**
+### Viewer tokens **[built]**
 
 A short-lived JWT (HS256), minted by db-writer, naming exactly one `flight_id`. ws-server
 validates it offline — signature and expiry only, no database or network call — so any
 replica can authorise any viewer. The token travels in the WebSocket query string, because
 browsers cannot set headers on a handshake; that is why it is short-lived.
 
-**Only the WebSocket path enforces this today.** §6 step 7 describes the same token
-gating the WebRTC/HLS read through MediaMTX; no part of that exists yet, so the annotated
-video stream is currently readable by anyone who knows its path.
+The same token now gates the **MediaMTX read** as well, through the auth hook in §4, so
+the annotated video and the alerts describing it are protected by one credential.
+Verified end-to-end: an authorised viewer receives the HLS manifest of a live stream
+while a second tenant's valid viewer token is refused on the same path.
+
+The browser presents it as `Authorization: Bearer` to WebRTC/HLS and in the query string
+to the WebSocket — the same token, two carriers, because a WebSocket handshake cannot
+carry headers.
 
 `flight_id` is an autoincrement primary key and therefore guessable. **The signature, not
 the identifier, carries authority.** No identifier in this system is ever a credential.
@@ -236,8 +241,8 @@ letting anyone with read access inject alerts into it.
 
 | Component | Instances | Tenancy mechanism | State |
 | --- | --- | --- | --- |
-| **GPU app** | **One per active flight** | Sole occupant — no internal tenancy needed | container **[built]**, lifecycle **[designed]** |
-| MediaMTX | Shared, replicated on load | Regex paths + HTTP auth hook | **[designed]** |
+| **GPU app** | **One per active flight** | Sole occupant — no internal tenancy needed | container **[built]**, lifecycle **[designed]**, paths **not yet rewired** |
+| MediaMTX | Shared, replicated on load | Regex paths + HTTP auth hook | **[built]** |
 | Mosquitto | Shared, replicated on load | Per-stream credentials + topic ACLs | **[designed]** |
 | ws-server | Shared, replicated on load | Per-flight JWT (view + publish scopes); Redis pub/sub fan-out | **[built]** |
 | db-writer | Shared, replicated on load | Stateless per request; bcrypt user auth | **[built]** |
@@ -293,7 +298,7 @@ alert carries its timestamp.
 Two ports, and the separation is a security boundary: the WebSocket port is proxied
 externally; the alert-write API port must never be routed from outside the cluster.
 
-### MediaMTX **[designed]**
+### MediaMTX **[built]**
 
 MediaMTX's built-in `authInternalUsers` is a **static list in the config file**. That does
 not survive user 101 arriving while 100 people are streaming. The fix is to give MediaMTX
@@ -304,18 +309,28 @@ authMethod: http
 authHTTPAddress: http://db-writer:8000/auth/mediamtx
 
 paths:
-  ~^in/([a-z0-9]{16})$:          # ingest — $G1 is the stream key
-    runOnAvailable: >
-      wget -q -O /dev/null --post-data="key=$G1"
-      http://orchestrator:8000/stream-online
-    runOnUnavailable: >
-      wget -q -O /dev/null --post-data="key=$G1"
-      http://orchestrator:8000/stream-offline
+  # ingest — $G1 is the stream key. Crockford base32: no i, l, o or u.
+  "~^in/([0-9abcdefghjkmnpqrstvwxyz]{16})$":
+    source: publisher
+    # runOnAvailable / runOnUnavailable land with the orchestrator — see below.
 
-  ~^out/[0-9a-f-]{36}$:          # annotated output — viewers read here
+  # annotated output — viewers read here. $G1 is the flight's public_uuid.
+  "~^out/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$":
     source: publisher
     record: yes
 ```
+
+The ingest regex is generated from `STREAM_KEY_ALPHABET` and `STREAM_KEY_LENGTH` in
+`db_writer/constants.py` on the Python side, so a key MediaMTX would reject is a key
+that could never have been minted. The two must be edited together.
+
+There is **no catch-all path**: a path matching neither pattern is rejected by MediaMTX
+before authentication is consulted at all. The old fixed `drone` and `annot` paths are
+gone — they were shared by every tenant and readable by anyone who knew the name.
+
+`runOnAvailable`/`runOnUnavailable` are present but commented out. They point at the
+orchestrator, which does not exist yet, and pointing a hook at an absent service would
+fire a failing command on every flight.
 
 MediaMTX POSTs `{user, password, token, ip, action, path, protocol, id, query, userAgent}`
 on every connection attempt; any 2xx allows, anything else denies. New users work the
@@ -326,8 +341,36 @@ endpoint decides what a valid credential looks like, so a future ground-station 
 *can* fetch a short-lived token is a change to one Python function, not to media server
 configuration.
 
+#### The four legitimate combinations
+
+There are exactly four, each with a different credential. Everything else is denied,
+including any action MediaMTX may add in future — unrecognised actions arrive closed.
+
+| Action | Path | Who | Credential |
+| --- | --- | --- | --- |
+| publish | `in/<stream_key>` | the drone | the path **is** the credential |
+| read | `in/<stream_key>` | the app container | publisher token for a flight opened on **that stream** |
+| publish | `out/<public_uuid>` | the app container | publisher token for **that flight** |
+| read | `out/<public_uuid>` | the viewer | viewer token for **that flight** |
+
+The two `out/` rows differ only by scope claim, which is what stops a viewer token from
+being a publisher token for the flight it is watching. The `read in/` row compares the
+token's flight against the *stream* the key names, so a live publisher token cannot open
+somebody else's raw drone feed.
+
+The denial reason is logged and never returned: a caller learning whether a stream key
+exists, or that a token was merely for the wrong flight, learns something about another
+tenant.
+
 **Consequence:** this endpoint is on the critical path for every publish and every read.
-It needs a short-TTL in-process cache on key lookups and more than one db-writer replica.
+It needs more than one db-writer replica. Caching is deliberately **absent** — a cache on
+an authorisation decision delays revocation, and revocability is the property stream keys
+are built on, since they never expire. That trade is not yet decided; see §9.
+
+**MediaMTX's HLS server redirects before it authenticates.** The first request answers 302
+to `?cookieCheck=1` and only the followed request reaches the auth hook. Any client — or
+test — that does not follow redirects and keep cookies sees 302 for everything and never
+learns whether it was authorised.
 
 **Auth and spawn are separate events.** The auth hook fires on every connection attempt,
 including aborted and retried ones. Spawning GPU containers from it would spawn them for
@@ -480,25 +523,40 @@ Externally reachable:
 Internal only — **must never be routed from outside**: ws-server's alert-write API port,
 db-writer, Redis, the recorder, and the orchestrator.
 
-> **[open]** `RTMPS_PORT = 8443` and `RTSPS_PORT = 441` in
-> `app/shared/processes/constants.py` are wrong (MediaMTX defaults are 1936 and 8322), and
-> 8443 collides with `HTTPS_PORT` and `WSS_PORT` in the same block.
+> - **[open]** `RTMPS_PORT = 8443` and `RTSPS_PORT = 441` in
+>   `app/shared/processes/constants.py` are wrong (MediaMTX defaults are 1936 and 8322),
+>   and 8443 collides with `HTTPS_PORT` and `WSS_PORT` in the same block. Neither
+>   constant is referenced anywhere yet, so this is latent rather than live.
+> - **[open]** MediaMTX v1.19 also opens **SRT on 8890** and **MoQ on 8892** by default.
+>   Neither is published in compose, so nothing is exposed today, and the auth hook
+>   covers them like any other protocol — but both should be disabled explicitly rather
+>   than left to default.
+> - **[note]** compose publishes ws-server's alert-write API on host `8001` and db-writer
+>   on `8002`, which this section says must never be routed from outside. That is the
+>   interim laptop-app deployment described in §7, not the target topology.
 
 ---
 
 ## 9. Outstanding work
 
 > Tests backing the claims below live in **`tests/comms/`**, with a README covering what
-> each one guards and how to run it. Two shell runners stand up the required containers
+> each one guards and how to run it. Three shell runners stand up the required containers
 > and clean up after themselves. The host interpreter has none of the dependencies, so
-> everything runs in throwaway containers.
-
+> everything runs in throwaway containers — except `run_mediamtx_auth.sh`, which needs
+> `ffmpeg` and `curl` on the host to drive real publishes and reads.
 
 ### Built and tested
 
 - ws-server per-flight isolation, Redis fan-out across replicas, and viewer JWT
-  validation. Verified by 10 tenancy tests and 2 cross-replica tests, including
+  validation. Verified by 11 tenancy tests and 2 cross-replica tests, including
   confirmation that a second tenant's viewer receives nothing.
+- **MediaMTX authorization on both publish and read.** db-writer's `/auth/mediamtx`
+  endpoint, the regex paths, and the removal of the shared `drone`/`annot` paths.
+  Verified by 40 assertions on the decision itself and 16 end-to-end against a real
+  MediaMTX with real RTMP publishes and HLS reads, two tenants throughout: a live key
+  publishes, an unknown or revoked one does not, an authorised viewer receives the HLS
+  manifest of a live stream, and a second tenant's *valid* viewer token is refused on
+  the same path.
 - **Per-flight publisher tokens on both write paths.** db-writer's alert, stream-url and
   session-close endpoints now require one, as does ws-server's alert endpoint. Verified
   by 17 tests across both implementations: scope separation both ways, cross-flight
@@ -518,27 +576,34 @@ db-writer, Redis, the recorder, and the orchestrator.
 Distinct from the section below: these are live weaknesses on this branch right now, not
 work that has yet to start.
 
-- **The annotated video stream has no read authorization.** MediaMTX serves `annot` to
-  anyone who asks; the viewer JWT gates only the WebSocket alert feed. Alerts are
-  protected, the video they describe is not.
+- **The app tier still targets the retired paths.** It reads `drone` and publishes to
+  `annot`, neither of which exists any more, and it has no way to learn the stream key
+  or reach `in/<key>` until the orchestrator injects them. The hub is correct and
+  tested; the local end-to-end run does not connect until the app is rewired. This is
+  the first half of the orchestrator step, not a separate task.
+- **Mosquitto is still `allow_anonymous true`.** Telemetry is now the only unauthenticated
+  channel in the system.
 
 ### Built but not yet wired to anything
 
 The schema and its accessors exist and are tested; **no service consumes them yet**, so
 they change nothing about how the system currently behaves.
 
-- `streams` table, `flights.stream_id`, `flights.public_uuid`, `flights.output_url`
-- `generate_stream_key()` — 16 chars of Crockford base32, `secrets`-backed
-- `UserDirectory.resolve_stream_key` / `create_stream` / `list_streams` /
-  `revoke_stream` / `rotate_stream_key`, with cross-user access refused
+- `flights.output_url`
+- `UserDirectory.create_stream` / `list_streams` / `revoke_stream` / `rotate_stream_key`,
+  with cross-user access refused — these are the portal's operations, and there is no
+  portal
 - `db_writer/rebuild_schema.py` — destructive drop/create plus optional seeding
+
+`streams`, `stream_key`, `flights.stream_id`, `flights.public_uuid`,
+`generate_stream_key()` and `resolve_stream_key` are no longer in this list: the
+MediaMTX auth hook is their first real consumer.
 
 ### Designed, not built
 
-- db-writer `/auth/mediamtx` endpoint
-- MediaMTX regex paths and HTTP auth
 - Mosquitto ACLs and dynamic credentials
-- Orchestrator (spawn/teardown on stream lifecycle)
+- Orchestrator (spawn/teardown on stream lifecycle), and with it the app tier's move to
+  `in/<key>` and `out/<public_uuid>`
 - Removal of end-user credentials from the app container
 
 ### Open
@@ -547,6 +612,12 @@ they change nothing about how the system currently behaves.
 - Recorder per-tenant upload prefixes
 - TLS certificate issue and renewal
 - Fix `RTMPS_PORT` / `RTSPS_PORT`
-- Auth-endpoint caching and db-writer replica count
+- **Auth-endpoint caching and db-writer replica count.** Every publish and every read
+  now costs one indexed lookup here. A short-TTL cache is the obvious fix and the wrong
+  one to reach for blindly: it delays revocation of a credential that has no expiry.
+  Replicas first, cache only if measurement demands it.
+- **Nothing records that a flight ended.** `flights` has no end column and
+  `DELETE /session/{id}` only logs, so §6 step 8's "flight closed" has nowhere to write.
+  The orchestrator will want this.
 - `/viewer/token` returns "latest flight", which is ambiguous once one user has two
   concurrent flights

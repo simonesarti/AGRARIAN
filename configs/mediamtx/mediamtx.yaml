@@ -1,14 +1,14 @@
 rtsp: yes
 rtspAddress: :8554
-protocols: [tcp, udp]
+rtspTransports: [tcp, udp]
 
 rtmp: yes
 rtmpAddress: :1935
 
 webrtc: yes
 webrtcAddress: :8889
-webrtcICEServers:
-  - stun:stun.l.google.com:19302
+webrtcICEServers2:
+  - url: stun:stun.l.google.com:19302
 
 hls: yes
 hlsAddress: :8888
@@ -17,10 +17,66 @@ readTimeout: 10s
 writeTimeout: 10s
 writeQueueSize: 1024
 
+# ── Authentication ────────────────────────────────────────────────────────────
+# Every publish and every read is POSTed to db-writer, which answers 2xx to allow
+# and 401 to deny.
+#
+# The alternative, authInternalUsers, is a static list in this file: it cannot
+# express "user 101 signed up while 100 people were streaming" without a config
+# change and a reload. Asking a question instead of holding a roster means a new
+# user works the instant their database row exists.
+#
+# Choosing this over MediaMTX's built-in JWT method (authJWTJWKS) keeps the
+# credential form open. A drone controller cannot fetch a token — the operator
+# types a short key by hand — while a browser can present a JWT. One endpoint in
+# Python can accept both; authJWTJWKS could only accept the second.
+authMethod: http
+authHTTPAddress: http://db-writer:8000/auth/mediamtx
+
+# The default exclusions. api/metrics/pprof are not exposed outside the cluster
+# network, so gating them here would put db-writer on the path of every scrape for
+# no isolation benefit.
+authHTTPExclude:
+  - action: api
+  - action: metrics
+  - action: pprof
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+# Regex paths, not a fixed list — one entry serves every tenant. There is no
+# catch-all: a path matching neither pattern is rejected by MediaMTX before
+# authentication is even consulted.
 paths:
-  drone:
+
+  # Ingest. $G1 is the stream key, which doubles as the path — the operator types
+  # rtmps://ingest.<host>:1936/in/<key> into the controller and has nowhere to put
+  # a second credential.
+  #
+  # Safe only because no viewer ever touches this path: viewers read out/<uuid>,
+  # which is unrelated to the key. Unify the two and every viewer learns a live
+  # ingest credential.
+  #
+  # Alphabet is Crockford base32 and must stay in step with STREAM_KEY_ALPHABET in
+  # db_writer/constants.py — note the absent i, l, o and u.
+  "~^in/([0-9abcdefghjkmnpqrstvwxyz]{16})$":
     source: publisher
-  annot:
+
+    # TODO(orchestrator): spawn and tear down the GPU container for this flight.
+    # Deliberately not wired yet — the orchestrator does not exist, and pointing
+    # these at a service that is not there would fire a failing hook on every
+    # single flight. They belong on availability rather than on the auth hook,
+    # which also fires for aborted and retried connections that never stream.
+    #
+    # runOnAvailable: >
+    #   wget -q -O /dev/null --post-data="key=$G1"
+    #   http://orchestrator:8000/stream-online
+    # runOnUnavailable: >
+    #   wget -q -O /dev/null --post-data="key=$G1"
+    #   http://orchestrator:8000/stream-offline
+
+  # Annotated output. $G1 is the flight's public_uuid — random rather than derived
+  # from flight_id, because the sequential primary key would make every tenant's
+  # video path enumerable.
+  "~^out/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$":
     source: publisher
     record: yes
     recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
@@ -31,3 +87,8 @@ paths:
     # Notify the recorder sidecar when a segment is complete so it can upload it.
     # $MTX_SEGMENT_PATH is set by MediaMTX at hook runtime.
     runOnRecordSegmentComplete: wget -q -O /dev/null --post-data="path=$MTX_SEGMENT_PATH" http://recorder:8000/on-segment-complete
+
+  # The previous 'drone' and 'annot' paths are gone. They were fixed names shared by
+  # every tenant and readable by anyone who knew them, which is the read-authorisation
+  # gap this change closes. The app tier still publishes to them and is rewired in the
+  # orchestrator step; until then the local end-to-end run will not connect.

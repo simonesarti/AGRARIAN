@@ -132,8 +132,9 @@ class AppSettings(BaseSettings):
     # ------------------------------------------------------------------ #
 
     # URL of the ws-server sidecar HTTP API (e.g. http://ws-server:8000).
+    # No token setting here: the app receives a per-flight publisher token from
+    # db-writer when the flight opens, so there is no pre-shared secret to configure.
     ws_server_url: str
-    # Shared bearer token authorising this app to publish alerts to ws-server.
 
     # ------------------------------------------------------------------ #
     # DATABASE

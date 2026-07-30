@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from auth import AuthError, mint_publisher_token, mint_viewer_token, verify_publisher
 from db_manager import AlertWriter, UserDirectory
+from media_auth import Denied, authorize, credential_from
 
 
 logging.basicConfig(
@@ -85,6 +86,27 @@ class StartSessionRequest(BaseModel):
 
 class StreamUrlRequest(BaseModel):
     url: str
+
+class MediaMTXAuthRequest(BaseModel):
+    """
+    What MediaMTX POSTs on every connection attempt.
+
+    Every field is optional with an empty default: which ones are populated depends
+    on the protocol, and a missing one must read as "no credential supplied" rather
+    than fail validation — a 422 would deny, but it would deny with the wrong reason
+    and be far harder to diagnose than an explicit 401.
+    """
+    action: str = ""
+    path: str = ""
+    user: str = ""
+    password: str = ""
+    token: str = ""
+    query: str = ""
+    protocol: str = ""
+    ip: str = ""
+    id: str = ""
+    userAgent: str = ""     # noqa: N815 — MediaMTX sends this key verbatim
+
 
 class AlertRequest(BaseModel):
     frame_id: int
@@ -185,6 +207,48 @@ def save_alert(
     if not queued:
         raise HTTPException(status_code=503, detail="Alert queue full — DB may be unavailable")
     return {"queued": True}
+
+
+@app.post("/auth/mediamtx")
+def mediamtx_auth(req: MediaMTXAuthRequest):
+    """
+    Authorise one MediaMTX connection attempt. 200 allows, 401 denies.
+
+    This replaces MediaMTX's static authInternalUsers roster, which cannot express
+    "user 101 signed up while 100 people were streaming". MediaMTX now asks a
+    question instead of holding a list, so a new user works the instant their row
+    exists — no restart, no reload.
+
+    Choosing HTTP auth over MediaMTX's built-in JWT method is what keeps the
+    credential form open: what counts as valid is decided here, in Python, so a
+    future ground station that can fetch a short-lived token is a change to this
+    function rather than to media server configuration.
+
+    The denial reason is logged and never returned. A caller learning whether a
+    stream key exists, or whether a token was merely for the wrong flight, would be
+    learning something about another tenant.
+
+    NOTE: every publish and every read passes through here, so this endpoint is on
+    the critical path for the whole media plane. It does one indexed lookup and no
+    write. Caching is deliberately absent — a cache on an authorisation decision
+    delays revocation, and revocability is the property stream keys are built on.
+    """
+    credential = credential_from(req.user, req.password, req.token, req.query)
+
+    try:
+        authorize(req.action, req.path, credential, _directory)
+    except Denied as e:
+        logger.warning(
+            f"MediaMTX auth denied: action={req.action!r} path={req.path!r} "
+            f"protocol={req.protocol!r} ip={req.ip!r}: {e}"
+        )
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    logger.info(
+        f"MediaMTX auth allowed: action={req.action!r} path={req.path!r} "
+        f"protocol={req.protocol!r} ip={req.ip!r}"
+    )
+    return {"ok": True}
 
 
 @app.post("/viewer/token")

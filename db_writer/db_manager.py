@@ -407,6 +407,36 @@ class UserDirectory:
             logger.info(f"Flight {flight_id} output URL set to: {url}")
             return True
 
+    def resolve_public_uuid(self, public_uuid: str) -> Optional[int]:
+        """
+        Resolve an output path's UUID to its flight_id, or None if unknown.
+
+        This is the read side of the MediaMTX auth hook: viewers are handed a token
+        naming a flight_id, but the path they open names a public_uuid, so one of the
+        two has to be translated before they can be compared.
+
+        Like resolve_stream_key this is the authorisation decision itself, so an
+        unknown UUID returns nothing rather than reporting why.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            flight = session.query(Flight).filter_by(public_uuid=public_uuid).first()
+            return flight.flight_id if flight else None
+
+    def flight_stream_id(self, flight_id: int) -> Optional[int]:
+        """
+        The stream a flight was opened on, or None if the flight is unknown.
+
+        Used to authorise an app container reading the ingest path: its token names a
+        flight, the path names a stream key, and the two must belong together — a
+        publisher token for flight 7 must not open the raw feed of somebody else's
+        drone just because flight 7 happens to be in the air.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            flight = session.get(Flight, flight_id)
+            return flight.stream_id if flight else None
+
     def latest_flight_id(self, user_id: int) -> Optional[int]:
         """
         Most recently started flight for this user, or None if they have none.

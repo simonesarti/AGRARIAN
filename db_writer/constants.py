@@ -38,3 +38,18 @@ PUBLISHER_TOKEN_TTL_S = 24 * 60 * 60       # 24 h
 
 STREAM_KEY_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz"
 STREAM_KEY_LENGTH = 16
+
+# ── MediaMTX auth hook ────────────────────────────────────────────────────────
+# MediaMTX POSTs every connection attempt to /auth/mediamtx and obeys the status
+# code: 2xx allows, anything else denies. These are the action values it sends.
+#
+# 'api', 'metrics' and 'pprof' are deliberately absent: they are excluded in
+# mediamtx.yml via authHTTPExclude, and anything not listed here is denied, so a
+# future MediaMTX action arrives closed rather than open.
+
+MEDIAMTX_ACTION_PUBLISH = "publish"
+
+# 'playback' serves recorded segments through the playback server. It is gated
+# exactly like a live read — same path, same viewer token — so that enabling the
+# playback server later cannot quietly expose recordings.
+MEDIAMTX_READ_ACTIONS = ("read", "playback")
