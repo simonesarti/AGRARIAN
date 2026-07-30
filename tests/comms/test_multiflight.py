@@ -1,6 +1,7 @@
 """Multiple flights sharing one process-wide queue, interleaved across replicas."""
-import json, sys, urllib.request, urllib.error
+import json, os, sys, urllib.request, urllib.error
 R = ["http://dbw-1:8000", "http://dbw-2:8000"]
+STREAM_KEY = os.environ["STREAM_KEY"]
 
 def post(url, body, token=None):
     h = {"Content-Type": "application/json"}
@@ -12,10 +13,11 @@ def post(url, body, token=None):
     except urllib.error.HTTPError as e:
         return e.code, {}
 
-# Two more flights for the same user (sole active stream -> both allowed)
+# Two more flights on the same stream (a drone landing and taking off again would
+# open a second flight on the same key) -> both allowed
 flights = []
 for i in range(2):
-    st, b = post(f"{R[i % 2]}/session/start", {"email": "pilot@test.io", "password": "pw123"})
+    st, b = post(f"{R[i % 2]}/flight/open", {"stream_key": STREAM_KEY})
     assert st == 200, st
     flights.append((b["flight_id"], b["publisher_token"]))
 print("opened flights:", [f for f, _ in flights])

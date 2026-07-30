@@ -187,10 +187,11 @@ that matters: flight 2's viewer must receive **nothing**.
 There is no coverage for Mosquitto ACLs or TLS — neither exists yet. See
 `CLOUD_ARCHITECTURE.md` §9 for current status.
 
-Nothing checks the **app tier** against any of this. The app still reads `drone` and
-publishes to `annot`, neither of which exists any more, and it does not yet consume the
-`FLIGHT_ID` / `PUBLISHER_TOKEN` / stream paths the orchestrator injects. Every test here
-uses a stub in its place.
+Nothing here drives the **real app tier**. It now consumes `FLIGHT_ID` / `PUBLISHER_TOKEN`
+and the `in/<key>` / `out/<public_uuid>` paths the orchestrator injects instead of calling
+`/session/start`, but every test in this directory uses a stub image in its place — no
+test has yet spawned the real GPU container and driven it through a real ingest read and
+annotated-output publish end to end.
 
 The **recording upload path** has still never run — the hook that triggers it could not
 execute until the `-ffmpeg` image tag landed, so nothing downstream of it is exercised.

@@ -65,7 +65,8 @@ flight_id (PK)
 stream_id (FK → streams.stream_id)   # Owner reached via streams.user_id
 public_uuid  # Random; names the annotated output path (out/<public_uuid>)
 start_time
-output_url   # Annotated output URL, set once the video writer starts
+end_time     # Non-null once the orchestrator tore the flight down
+output_path  # Media-server path of the annotated output, set when the flight opens
 
 ------
 alerts
@@ -183,10 +184,16 @@ class Flight(Base):
     # NULL means "still in the air" — which is also what it means for a flight whose
     # orchestrator died before it could close, so this is not a liveness signal.
     end_time = Column(DateTime, nullable=True)
-    # The ANNOTATED OUTPUT URL, never the ingest one. Ingest URLs embed the stream key,
-    # so storing one here would scatter live credentials through flight history and
-    # leave dead ones behind after every rotation.
-    output_url = Column(String, nullable=True)
+    # Media-server PATH of the annotated output — `out/<public_uuid>` — and never the
+    # ingest path, which embeds the stream key and would scatter live credentials
+    # through flight history, leaving dead ones behind after every rotation.
+    #
+    # A path rather than a full URL, and not only for brevity. The app's own output URL
+    # carries its publisher token in the query string, so storing what the app
+    # publishes to would write a live credential into a row the portal reads. And the
+    # host a viewer should dial is not the host the app publishes to: the portal
+    # composes the viewer URL from this path and the public media hostname it knows.
+    output_path = Column(String, nullable=True)
 
     stream = relationship("Stream", back_populates="flights")
     alerts = relationship("Alert", back_populates="flight", cascade="all, delete-orphan")
@@ -219,6 +226,16 @@ class Alert(Base):
     def __repr__(self):
         return (f"<Alert(id={self.alert_id}, flight_id={self.flight_id}, "
                 f"msg='{self.alert_msg}...', frame={self.frame_id})>")
+
+
+def ingest_path(stream_key: str) -> str:
+    """The media-server path a drone publishes to. The key IS the credential here."""
+    return f"in/{stream_key}"
+
+
+def output_path_for(public_uuid: str) -> str:
+    """The media-server path the app publishes the annotated video to."""
+    return f"out/{public_uuid}"
 
 
 class UserDirectory:
@@ -343,58 +360,6 @@ class UserDirectory:
 
     # ── Flights ───────────────────────────────────────────────────────────────
 
-    def start_flight(self, email: str, password: str,
-                     stream_id: Optional[int] = None) -> dict:
-        """
-        Authenticate the user and open a flight, returning its identifiers.
-
-        Deliberately returns plain data and keeps no handle: the flight lives in the
-        database, not in this process. That is what lets a later alert for the same
-        flight be served by a different db-writer replica.
-
-        Raises ValueError on bad credentials or an unusable stream.
-        """
-        SessionFactory = sessionmaker(bind=self._engine)
-        with SessionFactory() as session:
-            user = session.query(User).filter_by(email=email).first()
-            if not user or not user.verify_password(password):
-                raise ValueError("Authentication failed: Invalid credentials.")
-
-            if stream_id is None:
-                # Interim path: the app opens flights with user credentials and has no
-                # stream in hand. The orchestrator always knows the stream, because the
-                # stream key is what identified the flight, and this branch then goes.
-                active = [st for st in user.streams if st.revoked_at is None]
-                if len(active) != 1:
-                    raise ValueError(
-                        f"Cannot infer stream: user has {len(active)} active streams. "
-                        "Pass stream_id explicitly."
-                    )
-                stream = active[0]
-            else:
-                # Never let a caller attach a flight to someone else's stream.
-                stream = session.query(Stream).filter_by(
-                    stream_id=stream_id, user_id=user.user_id).first()
-                if stream is None:
-                    raise ValueError(f"Stream {stream_id} does not belong to this user")
-                if stream.revoked_at is not None:
-                    raise ValueError(f"Stream {stream_id} is retired")
-
-            flight = Flight(stream_id=stream.stream_id)
-            session.add(flight)
-            session.commit()
-
-            logger.info(
-                f"Flight opened: flight_id={flight.flight_id}, "
-                f"stream_id={stream.stream_id}, user_id={user.user_id}"
-            )
-            return {
-                "flight_id": flight.flight_id,
-                "public_uuid": flight.public_uuid,
-                "stream_id": stream.stream_id,
-                "user_id": user.user_id,
-            }
-
     def open_flight_for_key(self, stream_key: str) -> Optional[dict]:
         """
         Open a flight on the stream this key identifies, or None if it is unusable.
@@ -415,7 +380,11 @@ class UserDirectory:
                 return None
 
             flight = Flight(stream_id=stream.stream_id)
+            # public_uuid is a column default, so it is not populated until the insert
+            # is flushed — the output path cannot be derived before this point.
             session.add(flight)
+            session.flush()
+            flight.output_path = output_path_for(flight.public_uuid)
             session.commit()
 
             logger.info(
@@ -427,6 +396,11 @@ class UserDirectory:
                 "public_uuid": flight.public_uuid,
                 "stream_id": stream.stream_id,
                 "user_id": stream.user_id,
+                # The two paths the app is told to use. Derived here, next to the column
+                # that stores one of them, so the naming scheme lives in one place and
+                # neither the orchestrator nor the app has to know it.
+                "ingest_path": ingest_path(stream_key),
+                "output_path": flight.output_path,
             }
 
     def close_flight(self, flight_id: int) -> bool:
@@ -446,22 +420,6 @@ class UserDirectory:
                 flight.end_time = datetime.now(timezone.utc)
                 session.commit()
                 logger.info(f"Flight closed: flight_id={flight_id}")
-            return True
-
-    def set_output_url(self, flight_id: int, url: str) -> bool:
-        """
-        Record where the annotated output went. Never pass an ingest URL here —
-        those embed the stream key, which must not land in flight history.
-        """
-        SessionFactory = sessionmaker(bind=self._engine)
-        with SessionFactory() as session:
-            flight = session.get(Flight, flight_id)
-            if flight is None:
-                logger.error(f"Flight {flight_id} not found; cannot set output URL.")
-                return False
-            flight.output_url = url
-            session.commit()
-            logger.info(f"Flight {flight_id} output URL set to: {url}")
             return True
 
     def resolve_public_uuid(self, public_uuid: str) -> Optional[int]:

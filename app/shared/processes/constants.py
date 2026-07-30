@@ -84,14 +84,23 @@ DRONE_SENSOR_HEIGHT_PIXELS = 3956  # standard Effective 20MP for 4/3 CMOS sensor
 
 ALL_INTERFACES = "0.0.0.0"
 
+# Default hostname of the media server and telemetry broker. The app is a CLIENT of
+# both, so it needs somewhere to dial: 0.0.0.0 was never a reachable address and only
+# ever worked because every deployment overrode it. These are the compose service
+# names, which are also the Kubernetes service names.
+MEDIA_SERVER_HOST = "mediamtx"
+TELEMETRY_BROKER_HOST = "mosquitto"
+
 HTTP_PORT = 80
 HTTPS_PORT = 8443
 MQTT_PORT = 1883
 MQTTS_PORT = 8883
 RTMP_PORT = 1935
-RTMPS_PORT = 8443
+# MediaMTX's own defaults for the encrypted listeners. Previously 8443 and 441, which
+# collide with HTTPS and are not what any MediaMTX listens on.
+RTMPS_PORT = 1936
 RTSP_PORT = 8554
-RTSPS_PORT = 441
+RTSPS_PORT = 8322
 WEBRTC_PORT = 8889
 WS_PORT = 80
 WSS_PORT = 8443
@@ -112,14 +121,14 @@ MAX_SIZE_NOTIFICATIONS_STREAM=3
 
 # ------------------------ VIDEO READING ----------
 
-# VIDEO_STREAM_URL = "rtmp://<server>[:port]/<app>/<stream_key>"
-# VIDEO_STREAM_URL = "rtmps://<server>[:port]/<app>/<stream_key>"
-# VIDEO_STREAM_URL = "rtsp://[user[:password]@]host[:port]/path"
-# VIDEO_STREAM_URL = "rtsps://[user[:password]@]host[:port]/path"
+# Composed as PROTOCOL://HOST:PORT/PATH?token=<publisher token> — see stream_urls.py.
+# PATH is `in/<stream_key>`, injected as VIDEO_STREAM_READER_STREAM_KEY by the
+# orchestrator when the flight opens. There is deliberately no default: the old one
+# ("drone") names a path that no longer exists in mediamtx.yaml, so a missing value
+# would silently connect to nothing instead of failing at startup.
 
-VIDEO_STREAM_READER_HOST = ALL_INTERFACES
+VIDEO_STREAM_READER_HOST = MEDIA_SERVER_HOST
 VIDEO_STREAM_READER_PORT = RTSP_PORT
-VIDEO_STREAM_READER_STREAM_KEY = "drone"
 
 VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S = 5.0
 VIDEO_STREAM_READER_RECONNECT_DELAY = 5.0
@@ -136,7 +145,7 @@ VIDEO_STREAM_READER_ORIGINAL_SHAPE = (1920, 1080)   # (W,H) expected original re
 
 # -------------------------- TELEMETRY READER --------------------------
 
-TELEMETRY_LISTENER_HOST = ALL_INTERFACES
+TELEMETRY_LISTENER_HOST = TELEMETRY_BROKER_HOST
 TELEMETRY_LISTENER_PORT = MQTT_PORT
 
 # QoS 0 (At most once): no acknowledgment from the receiver
@@ -229,9 +238,12 @@ DB_MANAGER_THREAD_CLOSE_TIMEOUT = 5.0                   # 5.0 s
 # -------------------------------------------------------------------
 # ------------------------- OUT VIDEO STREAM  --------------------------
 
-VIDEO_OUT_STREAM_HOST = ALL_INTERFACES
+# PATH is `out/<public_uuid>`, injected as VIDEO_OUT_STREAM_STREAM_KEY by the
+# orchestrator. No default, for the same reason as the ingest path above: the old
+# "annot" no longer exists.
+
+VIDEO_OUT_STREAM_HOST = MEDIA_SERVER_HOST
 VIDEO_OUT_STREAM_PORT = RTMP_PORT
-VIDEO_OUT_STREAM_STREAM_KEY = "annot"
 
 VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT = 0.5               # 0.5 s
 VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT = 8.0              # 8.0 s

@@ -5,6 +5,7 @@ from time import time, sleep
 from queue import Queue, Empty, Full
 import numpy as np
 
+from app.shared.processes.stream_urls import redact_stream_url
 from app.shared.processes.constants import (
     FPS,
     MAX_SIZE_VIDEO_STREAM,
@@ -281,7 +282,9 @@ class VideoStreamManager(FFmpegSink):
         self.mediaserver_url = mediaserver_url
 
     def _target_repr(self) -> str:
-        return self.mediaserver_url
+        # Redacted: the URL carries the flight's publisher token in its query string,
+        # and _target_repr() exists to be logged.
+        return redact_stream_url(self.mediaserver_url)
 
     def get_ffmpeg_command(self):
         # libx264 ingest for Full HD 30fps RTMP. Kept on CPU (subprocess keeps up

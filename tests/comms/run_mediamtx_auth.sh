@@ -104,17 +104,28 @@ done
 
 jsonget() { python3 -c "import sys,json;print(json.load(sys.stdin).get('$1',''))"; }
 
-open_flight() {  # open_flight <email> <password>
-  curl -s -X POST "$API/session/start" -H 'Content-Type: application/json' \
+open_flight() {  # open_flight <stream_key>  -- what the orchestrator calls
+  curl -s -X POST "$API/flight/open" -H 'Content-Type: application/json' \
+    -d "{\"stream_key\":\"$1\"}"
+}
+
+viewer_token() {  # viewer_token <email> <password>  -- what the portal calls
+  curl -s -X POST "$API/viewer/token" -H 'Content-Type: application/json' \
     -d "{\"email\":\"$1\",\"password\":\"$2\"}"
 }
 
-A=$(open_flight alice@test.io pw123)
-B=$(open_flight bob@test.io pw456)
-UUID_A=$(echo "$A" | jsonget public_uuid); VIEW_A=$(echo "$A" | jsonget viewer_token); PUB_A=$(echo "$A" | jsonget publisher_token)
-UUID_B=$(echo "$B" | jsonget public_uuid); VIEW_B=$(echo "$B" | jsonget viewer_token)
+A=$(open_flight "$KEY_A")
+B=$(open_flight "$KEY_B")
+UUID_A=$(echo "$A" | jsonget public_uuid); PUB_A=$(echo "$A" | jsonget publisher_token)
+UUID_B=$(echo "$B" | jsonget public_uuid)
 [ -n "$UUID_A" ] && [ -n "$UUID_B" ] || { echo "could not open flights: $A / $B"; exit 1; }
 echo "    alice flight uuid=$UUID_A   bob flight uuid=$UUID_B"
+
+VA=$(viewer_token alice@test.io pw123)
+VB=$(viewer_token bob@test.io pw456)
+VIEW_A=$(echo "$VA" | jsonget viewer_token)
+VIEW_B=$(echo "$VB" | jsonget viewer_token)
+[ -n "$VIEW_A" ] && [ -n "$VIEW_B" ] || { echo "could not issue viewer tokens: $VA / $VB"; exit 1; }
 
 # MediaMTX's HLS server answers the first request with a 302 to ?cookieCheck=1 and
 # only authenticates the followed request, so -L and a cookie jar are required.

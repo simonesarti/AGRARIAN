@@ -240,11 +240,10 @@ def main():
         alerts_max_consecutive_failures=ALERTS_MAX_CONSECUTIVE_FAILURES,
         queue_get_timeout=ALERTS_QUEUE_GET_TIMEOUT,
         log_file_path=str(output_dir / f"{session_ts}.log"),
+        flight_id=s.flight_id,
+        publisher_token=s.publisher_token.get_secret_value(),
         ws_server_url=s.ws_server_url,
         db_writer_url=s.db_writer_url,
-        database_username=s.db_username,
-        database_password=s.db_password.get_secret_value(),
-        video_stream_url=s.video_out_stream_url,
     )
 
     video_producer_config = VideoProducerProcessConfig(

@@ -39,9 +39,12 @@ ENVV=(-e DB_SERVICE=postgresql -e DB_HOST=dbw-pg -e DB_PORT=5432 -e DB_NAME=test
       -e SESSION_JWT_SECRET="$SECRET")
 
 echo "==> seeding schema, one user, one stream"
-docker run --rm --network "$NET" "${ENVV[@]}" "$IMAGE" \
+SEED=$(docker run --rm --network "$NET" "${ENVV[@]}" "$IMAGE" \
   sh -c "echo yes | python rebuild_schema.py --drop --seed-user pilot@test.io --seed-password pw123" \
-  2>&1 | tail -5
+  2>&1)
+echo "$SEED" | tail -5
+STREAM_KEY=$(echo "$SEED" | sed -n 's/.*stream key : \([a-z0-9]*\).*/\1/p')
+[ -n "$STREAM_KEY" ] || { echo "seeding failed:"; echo "$SEED"; exit 1; }
 
 echo "==> starting two replicas"
 for n in 1 2; do
@@ -51,7 +54,8 @@ sleep 5
 
 run_test() {
   docker rm -f dbw-test >/dev/null 2>&1 || true
-  docker run --rm --network "$NET" -v "$REPO/tests/comms:/tests:ro" -w /tests \
+  docker run --rm --network "$NET" -e STREAM_KEY="$STREAM_KEY" \
+    -v "$REPO/tests/comms:/tests:ro" -w /tests \
     python:3.11-slim python "$1"
 }
 

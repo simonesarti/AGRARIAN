@@ -30,11 +30,10 @@ DRONE_SENSOR_HEIGHT_MM,
     TELEMETRY_LISTENER_QOS_LEVEL,
     VIDEO_OUT_STREAM_HOST,
     VIDEO_OUT_STREAM_PORT,
-    VIDEO_OUT_STREAM_STREAM_KEY,
     VIDEO_STREAM_READER_HOST,
     VIDEO_STREAM_READER_PORT,
-    VIDEO_STREAM_READER_STREAM_KEY,
 )
+from app.shared.processes.stream_urls import build_stream_url, redact_stream_url
 
 
 class AppSettings(BaseSettings):
@@ -50,6 +49,22 @@ class AppSettings(BaseSettings):
 
     Internal tuning constants (queue sizes, timeouts, retry counts) live in
     constants.py and are not configurable via environment variables.
+
+    ---
+
+    The environment has two halves, and telling them apart is the point of the
+    section headings below.
+
+    **Deployment settings** an operator sets once (model thresholds, drone optics,
+    service hostnames). These are configured on the orchestrator and forwarded to
+    every flight container unchanged.
+
+    **Flight identity** — FLIGHT_ID, PUBLISHER_TOKEN and the two stream paths —
+    injected per container by the orchestrator when a drone goes live. An operator
+    never sets these, and per-flight values override anything in the base
+    environment, so a stray VIDEO_OUT_STREAM_STREAM_KEY cannot redirect a tenant's
+    annotated video. There is no email or password anywhere in here: this container
+    processes untrusted video and holds no reusable account credential.
     """
 
     model_config = SettingsConfigDict(
@@ -58,6 +73,19 @@ class AppSettings(BaseSettings):
         case_sensitive=False,
         env_ignore_empty=True,
     )
+
+    # ------------------------------------------------------------------ #
+    # FLIGHT IDENTITY  —  injected by the orchestrator, never operator-set
+    # ------------------------------------------------------------------ #
+
+    # The flight every alert and every frame produced by this container belongs to.
+    flight_id: int = Field(ge=1)
+
+    # The one credential this container holds. Minted by db-writer for this flight
+    # alone and returned exactly once, so a leak buys nothing but this flight. It
+    # authorises three things and nothing else: reading the drone's ingest path,
+    # publishing the annotated output, and writing alerts for this flight_id.
+    publisher_token: SecretStr
 
     # ------------------------------------------------------------------ #
     # GENERAL
@@ -106,9 +134,14 @@ class AppSettings(BaseSettings):
     video_stream_reader_protocol:              Literal["rtsp", "rtmp", "rtmps", "rtsps"] = "rtsp"
     video_stream_reader_host:                  str           = VIDEO_STREAM_READER_HOST
     video_stream_reader_port:                  int           = Field(default=VIDEO_STREAM_READER_PORT, ge=1, le=65535)
-    video_stream_reader_stream_key:            str           = VIDEO_STREAM_READER_STREAM_KEY
-    video_stream_reader_username: Optional[str]       = None
-    video_stream_reader_password: Optional[SecretStr] = None
+    # The media-server path to read, e.g. `in/<stream_key>`. Injected per flight; no
+    # default, because a wrong default here means silently reading nothing.
+    #
+    # There is no username/password pair any more. The drone's ingest path is not
+    # protected by a pre-shared credential the operator configures — it is protected
+    # by the publisher token above, which names this flight. That also means rotating
+    # a stream key or revoking a stream takes effect without reconfiguring anything.
+    video_stream_reader_stream_key:            str
 
     # ------------------------------------------------------------------ #
     # TELEMETRY / MQTT
@@ -117,6 +150,10 @@ class AppSettings(BaseSettings):
     telemetry_listener_protocol:              Literal["mqtt", "mqtts"] = "mqtt"
     telemetry_listener_host:                  str              = TELEMETRY_LISTENER_HOST
     telemetry_listener_port:                  int              = Field(default=TELEMETRY_LISTENER_PORT, ge=1, le=65535)
+    # Broker credentials, if the broker asks for any. Independent of the protocol:
+    # authentication and transport encryption are separate decisions, and this used to
+    # conflate them — credentials were discarded outright on plain MQTT, which made
+    # authenticating to Mosquitto impossible without also turning on TLS.
     telemetry_listener_username: Optional[str]       = None
     telemetry_listener_password: Optional[SecretStr] = None
     telemetry_listener_qos_level: Literal[0, 1, 2] = TELEMETRY_LISTENER_QOS_LEVEL
@@ -132,8 +169,8 @@ class AppSettings(BaseSettings):
     # ------------------------------------------------------------------ #
 
     # URL of the ws-server sidecar HTTP API (e.g. http://ws-server:8000).
-    # No token setting here: the app receives a per-flight publisher token from
-    # db-writer when the flight opens, so there is no pre-shared secret to configure.
+    # Authorised with the per-flight publisher token, so there is no pre-shared
+    # secret to configure here.
     ws_server_url: str
 
     # ------------------------------------------------------------------ #
@@ -141,10 +178,11 @@ class AppSettings(BaseSettings):
     # ------------------------------------------------------------------ #
 
     # URL of the db-writer sidecar HTTP API (e.g. http://db-writer:8000).
-    # The sidecar holds the privileged DB credentials; only end-user identity goes here.
+    # The sidecar holds the privileged DB credentials. Nothing identifying an end user
+    # goes here: the app used to send DB_USERNAME/DB_PASSWORD to /session/start to
+    # open its own flight, which put a reusable account credential inside this
+    # container. The orchestrator opens the flight now and injects the result.
     db_writer_url: str
-    db_username:    str                 = ""
-    db_password:    SecretStr           = ""
 
     # ------------------------------------------------------------------ #
     # VIDEO STREAM OUTPUT (RTMP → media server)
@@ -153,9 +191,9 @@ class AppSettings(BaseSettings):
     video_out_stream_protocol:               Literal["rtmp", "rtmps"] = "rtmp"
     video_out_stream_host:                   str           = VIDEO_OUT_STREAM_HOST
     video_out_stream_port:                   int           = Field(default=VIDEO_OUT_STREAM_PORT, ge=1, le=65535)
-    video_out_stream_stream_key:             str           = VIDEO_OUT_STREAM_STREAM_KEY
-    video_out_stream_username: Optional[str]       = None
-    video_out_stream_password: Optional[SecretStr] = None
+    # The media-server path to publish to, e.g. `out/<public_uuid>`. Injected per
+    # flight. Authorised by the publisher token, like the ingest path above.
+    video_out_stream_stream_key:             str
 
     # ================================================================== #
     # FIELD VALIDATORS
@@ -218,70 +256,57 @@ class AppSettings(BaseSettings):
                 f"pixel={pix:.4f}. Verify DRONE_SENSOR_*_MM and DRONE_SENSOR_*_PIXELS."
             )
 
-        # --- video stream reader ---
-        if self.video_stream_reader_protocol in ("rtmps", "rtsps"):
-            if not (self.video_stream_reader_username and self.video_stream_reader_password):
-                raise ValueError(
-                    f"{self.video_stream_reader_protocol.upper()} requires "
-                    "VIDEO_STREAM_READER_USERNAME and VIDEO_STREAM_READER_PASSWORD."
-                )
-        else:
-            # Credentials are not used for non-secure protocols
-            self.video_stream_reader_username = None
-            self.video_stream_reader_password = None
-
-        # --- telemetry / MQTT ---
-        if self.telemetry_listener_protocol == "mqtts":
-            if not (self.telemetry_listener_username and self.telemetry_listener_password):
-                raise ValueError(
-                    "MQTTS requires TELEMETRY_LISTENER_USERNAME and TELEMETRY_LISTENER_PASSWORD."
-                )
-        else:
-            self.telemetry_listener_username = None
-            self.telemetry_listener_password = None
-
-        # --- video stream output ---
-        if self.video_out_stream_protocol == "rtmps":
-            if not (self.video_out_stream_username and self.video_out_stream_password):
-                raise ValueError(
-                    "RTMPS requires VIDEO_OUT_STREAM_USERNAME and VIDEO_OUT_STREAM_PASSWORD."
-                )
-        else:
-            self.video_out_stream_username = None
-            self.video_out_stream_password = None
+        # --- stream paths ---
+        # Reading and writing the same path would make the pipeline publish into its
+        # own input. MediaMTX would accept it (both are authorised by the same token)
+        # and the result is a feedback loop that looks like a decoder fault.
+        if self.video_stream_reader_stream_key.strip("/") == self.video_out_stream_stream_key.strip("/"):
+            raise ValueError(
+                "VIDEO_STREAM_READER_STREAM_KEY and VIDEO_OUT_STREAM_STREAM_KEY are the "
+                f"same path ('{self.video_stream_reader_stream_key}'). The pipeline would "
+                "publish its annotated output into its own input."
+            )
 
         return self
 
     # ================================================================== #
-    # COMPUTED FIELDS  (derived from other fields, never read from env)
+    # STREAM URLS
     # ================================================================== #
+    # Deliberately NOT computed_field: these carry the publisher token, and a
+    # computed_field would place it in model_dump() output for anything that ever
+    # serialises the settings. The *_url_redacted variants are the loggable ones,
+    # and those are computed fields precisely so a dump prefers them.
 
-    @computed_field
     @property
     def video_stream_reader_url(self) -> str:
-        """RTSP/RTMP URL for the drone video stream input."""
-        proto    = self.video_stream_reader_protocol
-        host_key = (
-            f"{self.video_stream_reader_host}"
-            f":{self.video_stream_reader_port}"
-            f"/{self.video_stream_reader_stream_key}"
+        """RTSP/RTMP URL for the drone video stream input. CONTAINS A CREDENTIAL."""
+        return build_stream_url(
+            self.video_stream_reader_protocol,
+            self.video_stream_reader_host,
+            self.video_stream_reader_port,
+            self.video_stream_reader_stream_key,
+            self.publisher_token.get_secret_value(),
         )
-        if proto in ("rtmps", "rtsps"):
-            assert self.video_stream_reader_password is not None  # enforced by model_validator
-            return f"{proto}://{self.video_stream_reader_username}:{self.video_stream_reader_password.get_secret_value()}@{host_key}"
-        return f"{proto}://{host_key}"
+
+    @property
+    def video_out_stream_url(self) -> str:
+        """RTMP URL for the annotated output (FFmpeg → media server). CONTAINS A CREDENTIAL."""
+        return build_stream_url(
+            self.video_out_stream_protocol,
+            self.video_out_stream_host,
+            self.video_out_stream_port,
+            self.video_out_stream_stream_key,
+            self.publisher_token.get_secret_value(),
+        )
 
     @computed_field
     @property
-    def video_out_stream_url(self) -> str:
-        """RTMP URL for the annotated video output stream (FFmpeg → media server)."""
-        proto    = self.video_out_stream_protocol
-        host_key = (
-            f"{self.video_out_stream_host}"
-            f":{self.video_out_stream_port}"
-            f"/{self.video_out_stream_stream_key}"
-        )
-        if proto == "rtmps":
-            assert self.video_out_stream_password is not None  # enforced by model_validator
-            return f"{proto}://{self.video_out_stream_username}:{self.video_out_stream_password.get_secret_value()}@{host_key}"
-        return f"{proto}://{host_key}"
+    def video_stream_reader_url_redacted(self) -> str:
+        """Safe to log: same URL with the token replaced."""
+        return redact_stream_url(self.video_stream_reader_url)
+
+    @computed_field
+    @property
+    def video_out_stream_url_redacted(self) -> str:
+        """Safe to log: same URL with the token replaced."""
+        return redact_stream_url(self.video_out_stream_url)

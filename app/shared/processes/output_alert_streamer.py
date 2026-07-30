@@ -4,7 +4,6 @@ from queue import Empty as QueueEmptyException
 import json
 import cv2
 import numpy as np
-from typing import Optional
 import base64
 from datetime import datetime as dtt
 import logging
@@ -49,19 +48,21 @@ class NotificationsStreamWriterConfig(BaseModel):
     # ------- File logger --------
     log_file_path: str = "alerts.log"
 
+    # ------- Flight identity --------
+    # Which flight these alerts belong to, and the credential that authorises writing
+    # them. Both injected by the orchestrator; the same pair authorises the ws-server
+    # and db-writer paths below.
+    flight_id: PositiveInt
+    publisher_token: str = Field(min_length=1)
+
     # ------- WebSocket server sidecar --------
     # URL of the ws-server sidecar HTTP API (e.g. http://ws-server:8000).
     ws_server_url: str
     # ------- Database writer sidecar --------
     # URL of the db-writer sidecar HTTP API (e.g. http://db-writer:8000).
-    # The sidecar holds the privileged DB credentials; the app supplies only
-    # the end-user identity (database_username / database_password).
+    # The sidecar holds the privileged DB credentials. The app supplies no end-user
+    # identity at all — see DbWriterClient.
     db_writer_url: str
-    database_username: str = ""
-    database_password: str = ""
-    # Video stream URL written to the flights table so the UI can fetch it from the DB.
-    # Should match the media_server_url passed to VideoProducerProcess.
-    video_stream_url: Optional[str] = None
 
 
 
@@ -79,12 +80,9 @@ class NotificationsStreamWriter(mp.Process):
     delivers it via any enabled combination of: log file, WebSocket broadcast, and
     SQL database.
 
-    If video_stream_url is set in config and the database is enabled, the URL is
-    written to the current flight record once at startup so the UI can retrieve it.
-
-    At least one output channel (file, WebSocket, database) must be successfully
-    initialised at startup; if none can be started the error_event is set and the
-    process shuts down.
+    Every alert is scoped to config.flight_id and authorised by config.publisher_token,
+    both injected by the orchestrator. All three channels must initialise at startup;
+    if any cannot, the error_event is set and the process shuts down.
 
     Termination:
     - error_event, set by this or any other process, is the only stop signal: the
@@ -119,25 +117,21 @@ class NotificationsStreamWriter(mp.Process):
         # Initialize log file manager (required — exception propagates to run())
         self.log_file = open(self.config.log_file_path, 'a', buffering=1, encoding='utf-8')
 
-        # Open the flight session. This is the identity step for the whole alert
-        # path: it authenticates the end user and yields both the flight_id that
-        # scopes DB rows and WebSocket delivery, and the publisher token that
-        # authorises writing to that flight. Failure is fatal (exception propagates
-        # to run()) — without them there is no way to say which viewers an alert
-        # belongs to, and no credential to write it. Later per-alert DB write
-        # failures stay non-fatal.
+        # Bind both write paths to this flight. No network round trip and nothing to
+        # authenticate: the flight was opened by the orchestrator before this
+        # container existed, and the token it injected is the whole authorisation.
+        #
+        # Both binds are required — a ValueError propagates to run() and is fatal.
+        # Without a flight_id there is no way to say which viewers an alert belongs
+        # to, and without the token no way to write it. Later per-alert failures
+        # stay non-fatal.
         self.db_client = DbWriterClient(self.config.db_writer_url)
-        self.db_client.initialize(self.config.database_username, self.config.database_password)
-        if self.config.video_stream_url:
-            self.db_client.set_stream_url(self.config.video_stream_url)
+        self.db_client.bind_flight(self.config.flight_id, self.config.publisher_token)
 
-        # Initialize WebSocket server client (required — exception propagates to run())
-        # Same token as the DB path: it names this flight and authorises no other.
+        # Same flight, same token: db-writer and ws-server both accept it, and it
+        # authorises this flight and no other.
         self.ws_client = WsServerClient(self.config.ws_server_url)
-        self.ws_client.bind_flight(
-            self.db_client.flight_id,
-            self.db_client.publisher_token,
-        )
+        self.ws_client.bind_flight(self.config.flight_id, self.config.publisher_token)
 
     def _compress_frame(self, frame: np.ndarray) -> tuple[str, bytes]:
         """Compress frame to JPEG, returning (base64 string for WS, raw bytes for DB)."""
@@ -264,6 +258,7 @@ class NotificationsStreamWriter(mp.Process):
         consecutive_failures = 0
 
         logger.info("NotificationsStreamWriter process starting.")
+        logger.info(f"  Flight        : {self.config.flight_id}")
         logger.info(f"  WebSocket     : {self.config.ws_server_url}")
         logger.info(f"  Database      : {self.config.db_writer_url}")
         logger.info(f"  Log file      : {self.config.log_file_path}")
@@ -351,24 +346,28 @@ if __name__ == "__main__":
     import argparse
     import itertools
 
+    # The flight and its token are what the orchestrator would inject. Obtain them the
+    # way the orchestrator does — POST a live stream key to db-writer's /flight/open —
+    # and pass them in here.
     parser = argparse.ArgumentParser(description="Send simulated alerts to ws-server and/or db-writer")
-    parser.add_argument("--ws-url",      default="http://localhost:8001", help="ws-server HTTP API base URL")
-    parser.add_argument("--db-url",      default=None,                    help="db-writer HTTP API base URL (omit to skip DB)")
-    parser.add_argument("--db-username", default="",                      help="app user email for db-writer authentication")
-    parser.add_argument("--db-password", default="",                      help="app user password for db-writer authentication")
-    parser.add_argument("--interval",    type=float, default=2.0,         help="Seconds between alerts")
+    parser.add_argument("--ws-url",   default="http://localhost:8001", help="ws-server HTTP API base URL")
+    parser.add_argument("--db-url",   default=None,                    help="db-writer HTTP API base URL (omit to skip DB)")
+    parser.add_argument("--flight-id", type=int, required=True,        help="flight_id from /flight/open")
+    parser.add_argument("--token",    required=True,                   help="publisher token from /flight/open")
+    parser.add_argument("--interval", type=float, default=2.0,         help="Seconds between alerts")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger("smoke")
 
     ws_client = WsServerClient(args.ws_url)
+    ws_client.bind_flight(args.flight_id, args.token)
     log.info(f"WebSocket target : {args.ws_url}")
 
     db_client = None
     if args.db_url:
         db_client = DbWriterClient(args.db_url)
-        db_client.initialize(args.db_username, args.db_password)
+        db_client.bind_flight(args.flight_id, args.token)
         log.info(f"DB target        : {args.db_url}  (flight_id={db_client.flight_id})")
     else:
         log.info("DB target        : disabled (pass --db-url to enable)")
@@ -443,4 +442,4 @@ if __name__ == "__main__":
     finally:
         if db_client:
             db_client.close()
-            log.info("DB session closed.")
+            log.info("DB credential dropped (the flight stays open — the orchestrator closes it).")

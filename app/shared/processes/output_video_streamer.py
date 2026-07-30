@@ -44,6 +44,8 @@ class VideoProducerProcessConfig(BaseModel):
     queue_timeout: PositiveFloat = PIPELINE_QUEUE_TIMEOUT
 
     # ------- RTMP stream → media server (MediaMTX records on its side) --------
+    # Carries the flight's publisher token in its query string. VideoStreamManager
+    # redacts it before logging; do not log this field directly.
     media_server_url: str
     stream_manager_queue_max_size: PositiveInt = MAX_SIZE_VIDEO_STREAM
     stream_manager_ffmpeg_startup_timeout: PositiveFloat = VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT
@@ -211,7 +213,8 @@ if __name__ == "__main__":
     DURATION_S    = 30                # how long to run
 
     # Set to an RTMP URL to benchmark with streaming, or None to test disk-write only.
-    RTMP_URL = "rtmp://172.17.0.2:1935/annot"  # e.g. "rtmp://localhost:1935/live/bench"
+    # A real output path is `out/<public_uuid>` and needs the flight's publisher token.
+    RTMP_URL = "rtmp://mediamtx:1935/out/<public_uuid>?token=<publisher_token>"
 
     # error_event is the only shutdown path: set after DURATION_S.
     TRIGGER_ERROR       = True

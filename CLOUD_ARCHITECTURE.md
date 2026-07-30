@@ -215,8 +215,9 @@ the identifier, carries authority.** No identifier in this system is ever a cred
 ### Publisher tokens **[built]**
 
 An app container presents a **per-flight JWT**, minted by db-writer when the flight opens
-and returned once from `/session/start`. The same token is accepted by db-writer and
-ws-server, so there is one credential and one mechanism rather than two.
+and returned once from `/flight/open`, the endpoint the orchestrator calls with the
+stream key MediaMTX gave it. The same token is accepted by db-writer and ws-server, so
+there is one credential and one mechanism rather than two.
 
 Every write endpoint compares the `flight_id` in the URL against the claim, so a token
 issued for flight 7 cannot be replayed against flight 8. This replaced a single
@@ -241,7 +242,7 @@ letting anyone with read access inject alerts into it.
 
 | Component | Instances | Tenancy mechanism | State |
 | --- | --- | --- | --- |
-| **GPU app** | **One per active flight** | Sole occupant — no internal tenancy needed | container **[built]**, lifecycle **[designed]**, paths **not yet rewired** |
+| **GPU app** | **One per active flight** | Sole occupant — no internal tenancy needed | container **[built]**, lifecycle **[built]**, paths rewired but **untested end-to-end** |
 | MediaMTX | Shared, replicated on load | Regex paths + HTTP auth hook | **[built]** |
 | Mosquitto | Shared, replicated on load | Per-stream credentials + topic ACLs | **[designed]** |
 | ws-server | Shared, replicated on load | Per-flight JWT (view + publish scopes); Redis pub/sub fan-out | **[built]** |
@@ -429,7 +430,7 @@ the schema would say which one was authoritative.
 | --- | --- | --- |
 | `users` | `user_id` PK, `email`, `password` (bcrypt) | **[built]** |
 | `streams` | `stream_id` PK, `user_id` FK, `stream_key` unique, `label`, `revoked_at` | **[built]** |
-| `flights` | `flight_id` PK, `stream_id` FK (NOT NULL), `public_uuid` unique, `output_url`, `end_time` | **[built]** |
+| `flights` | `flight_id` PK, `stream_id` FK (NOT NULL), `public_uuid` unique, `output_path`, `end_time` | **[built]** |
 | `alerts` | `alert_id` PK, `flight_id` FK, JPEG, dimensions, timestamps | **[built]** |
 
 `flight` is the tenancy unit throughout — it scopes alert rows, WebSocket delivery, Redis
@@ -441,9 +442,14 @@ revoke plus hide — the row, its flights and their alerts all survive, and the 
 resolving immediately. Rows are never hard-deleted; the `streams → flights` cascade
 exists only for full account erasure.
 
-`output_url` records where the **annotated output** went. Never the ingest URL: those
-embed the stream key, so storing one would scatter live credentials through flight
-history and leave dead ones behind after every rotation.
+`output_path` records the media-server **path** of the annotated output (`out/<public_uuid>`),
+set the moment the flight opens. A path rather than a full URL, and never the ingest one:
+a URL would carry the app's own publisher token in its query string, writing a live
+credential into a row the portal reads, and the ingest path embeds the stream key, which
+would scatter live credentials through flight history and leave dead ones behind after
+every rotation. The host a viewer dials is not the host the app publishes to, so the
+portal composes the viewer-facing URL from this path and the public media hostname it
+knows.
 
 `public_uuid` backs the `out/<uuid>` output path in §4. It must be random rather than
 derived from `flight_id`: the sequential PK would make every tenant's output path
@@ -465,7 +471,8 @@ existing ones.
 
 ## 6. Flight lifecycle
 
-Steps 3–5 and 8 are **[built]**; 1–2 wait on the portal, and 6 waits on the app tier.
+Steps 3–5 and 8 are **[built]**; 1–2 wait on the portal. Step 6 is rewired in code but
+untested end-to-end — see §9.
 
 1. User registers on the portal → row in `users`. **[open]**
 2. User adds a stream → row in `streams` with a generated `stream_key`, shown once. The
@@ -478,7 +485,8 @@ Steps 3–5 and 8 are **[built]**; 1–2 wait on the portal, and 6 waits on the 
    token, then spawns the container with `flight_id`, ingest path, output path and token
    injected as environment.
 6. App reads `in/<key>`, publishes annotated video to `out/<public_uuid>`, POSTs alerts to
-   ws-server and db-writer. **[the app does not yet read these paths — see §9]**
+   ws-server and db-writer. **[rewired in code, never yet run against a real GPU
+   container — see §9]**
 7. Viewer opens the portal, receives a JWT scoped to that flight, and presents it for the
    WebRTC/HLS read and the WebSocket connection alike. MediaMTX validates it through the
    same auth endpoint with `action: "read"`.
@@ -606,8 +614,8 @@ db-writer, Redis, the recorder, and the orchestrator.
   publishes, an unknown or revoked one does not, an authorised viewer receives the HLS
   manifest of a live stream, and a second tenant's *valid* viewer token is refused on
   the same path.
-- **Per-flight publisher tokens on both write paths.** db-writer's alert, stream-url and
-  session-close endpoints now require one, as does ws-server's alert endpoint. Verified
+- **Per-flight publisher tokens on both write paths.** db-writer's alert and
+  flight-close endpoints now require one, as does ws-server's alert endpoint. Verified
   by 17 tests across both implementations: scope separation both ways, cross-flight
   replay, forged signatures, expiry, malformed and scopeless tokens.
 - **Flight lifecycle end to end** (§6). The orchestrator, its Docker backend, db-writer's
@@ -624,21 +632,30 @@ db-writer, Redis, the recorder, and the orchestrator.
   no replay afterwards.
 - **db-writer replica safety.** The per-flight `DatabaseManager` dict was replaced by a
   process-wide `AlertWriter` and stateless endpoints. Verified against two live replicas
-  and a real PostgreSQL instance: a flight opened on replica 1 accepted alerts,
-  stream-url and close on replica 2, all rows reached the database, and 40 interleaved
-  alerts across two concurrent flights and both replicas persisted with no loss and no
-  cross-contamination. Auth held across replicas throughout.
+  and a real PostgreSQL instance: a flight opened on replica 1 (via `/flight/open`, the
+  same call the orchestrator makes) accepted an alert and a close on replica 2, all rows
+  reached the database, and 40 interleaved alerts across two concurrent flights and both
+  replicas persisted with no loss and no cross-contamination. Auth held across replicas
+  throughout.
 
 ### Known gaps in code that exists today
 
 Distinct from the section below: these are live weaknesses on this branch right now, not
 work that has yet to start.
 
-- **The app tier still targets the retired paths.** It reads `drone` and publishes to
-  `annot`, neither of which exists any more, and it has no way to learn the stream key
-  or reach `in/<key>` until the orchestrator injects them. The hub is correct and
-  tested; the local end-to-end run does not connect until the app is rewired. This is
-  the first half of the orchestrator step, not a separate task.
+- **The app tier's rewiring to `in/<key>` / `out/<public_uuid>` has never run end to end.**
+  `AppSettings` now takes `FLIGHT_ID`/`PUBLISHER_TOKEN` and the two orchestrator-injected
+  paths instead of calling `/session/start` with an email and password, and the token
+  travels in the stream URL's query string rather than RTSP/RTMP userinfo (userinfo was
+  tried first and fails — MediaMTX challenges the client, ffmpeg answers with a digest,
+  and the auth hook never sees the JWT at all; `stream_urls.py` carries both the URL
+  builder and its `redact_stream_url()` counterpart so no code path can log one without
+  the other). This closes the obstacle that blocked it: `AppSettings` used to null out
+  stream credentials unless the protocol was `rtmps`/`rtsps`, leaving nowhere to put a
+  token on plain RTSP. The rewiring is consistent with the orchestrator's env contract
+  (`test_orchestrator.py` pins the exact variable names) but `run_orchestrator.sh` spawns
+  a stub image, not the real app, so no test has yet driven a real GPU container through
+  a real `in/<key>` read and `out/<public_uuid>` publish.
 - **Mosquitto is still `allow_anonymous true`.** Telemetry is now the only unauthenticated
   channel in the system.
 - **Recordings have never been uploaded.** `runOnRecordSegmentComplete` has pointed at
@@ -657,7 +674,6 @@ work that has yet to start.
 The schema and its accessors exist and are tested; **no service consumes them yet**, so
 they change nothing about how the system currently behaves.
 
-- `flights.output_url`
 - `UserDirectory.create_stream` / `list_streams` / `revoke_stream` / `rotate_stream_key`,
   with cross-user access refused — these are the portal's operations, and there is no
   portal
@@ -665,17 +681,13 @@ they change nothing about how the system currently behaves.
 
 `streams`, `stream_key`, `flights.stream_id`, `flights.public_uuid`,
 `generate_stream_key()` and `resolve_stream_key` are no longer in this list: the
-MediaMTX auth hook is their first real consumer.
+MediaMTX auth hook is their first real consumer. `flights.output_path` also drops off
+this list — it is set inside `open_flight_for_key` the moment a flight opens, and
+`/flight/open` returns it directly to the orchestrator.
 
 ### Designed, not built
 
 - Mosquitto ACLs and dynamic credentials
-- **The app tier's move to `in/<key>` and `out/<public_uuid>`.** The orchestrator already
-  injects `FLIGHT_ID`, `PUBLISHER_TOKEN` and both paths; the app has to consume them
-  instead of calling `/session/start` with an email and password. One real obstacle:
-  `AppSettings` discards stream credentials unless the protocol is `rtmps`/`rtsps`
-  (`app_settings.py`), so on plain RTSP there is currently nowhere to put the publisher
-  token the ingest read now requires.
 - Kubernetes `FlightRuntime` backend (create Job, delete Job)
 
 ### Open
@@ -688,8 +700,5 @@ MediaMTX auth hook is their first real consumer.
   now costs one indexed lookup here. A short-TTL cache is the obvious fix and the wrong
   one to reach for blindly: it delays revocation of a credential that has no expiry.
   Replicas first, cache only if measurement demands it.
-- **Nothing records that a flight ended.** `flights` has no end column and
-  `DELETE /session/{id}` only logs, so §6 step 8's "flight closed" has nowhere to write.
-  The orchestrator will want this.
 - `/viewer/token` returns "latest flight", which is ambiguous once one user has two
   concurrent flights

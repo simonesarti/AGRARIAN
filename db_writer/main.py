@@ -84,9 +84,6 @@ class StartSessionRequest(BaseModel):
     email: str
     password: str
 
-class StreamUrlRequest(BaseModel):
-    url: str
-
 class OpenFlightRequest(BaseModel):
     stream_key: str
 
@@ -142,50 +139,6 @@ def health():
         "alert_queue_depth": _writer.queue_depth,
         "alerts_dropped": _writer.dropped,
     }
-
-
-@app.post("/session/start")
-def start_session(req: StartSessionRequest):
-    """
-    Verify user identity against the users table and open a new flight record.
-
-    Returns the flight_id the app must attach to subsequent requests, the viewer
-    token the UI presents to ws-server, and the publisher token authorising writes
-    to this flight. Both tokens are returned once, here, and neither is re-derivable
-    from the flight_id alone.
-
-    Nothing is retained in this process: the flight is a database row, so a later
-    alert for it can be served by any replica.
-    """
-    try:
-        flight = _directory.start_flight(req.email, req.password)
-    except ValueError as e:
-        raise HTTPException(status_code=401, detail=str(e))
-    except Exception as e:
-        logger.error(f"Unexpected error during session start: {e}")
-        raise HTTPException(status_code=500, detail="Failed to start session")
-
-    logger.info(f"Session started: flight_id={flight['flight_id']}, user={req.email}")
-    return {
-        "flight_id": flight["flight_id"],
-        "public_uuid": flight["public_uuid"],
-        "viewer_token": mint_viewer_token(flight["flight_id"], flight["user_id"]),
-        # Handed to the app container so it can write alerts to this flight and no
-        # other. Returned once, here — it is not re-derivable from the flight_id.
-        "publisher_token": mint_publisher_token(flight["flight_id"]),
-    }
-
-
-@app.post("/session/{flight_id}/stream-url")
-def set_stream_url(
-    flight_id: int,
-    req: StreamUrlRequest,
-    authorization: Optional[str] = Header(default=None),
-):
-    _require_publisher(authorization, flight_id)
-    if not _directory.set_output_url(flight_id, req.url):
-        raise HTTPException(status_code=404, detail=f"Flight {flight_id} not found")
-    return {"ok": True}
 
 
 @app.post("/session/{flight_id}/alert")
@@ -339,24 +292,6 @@ def issue_viewer_token(req: StartSessionRequest):
         "flight_id": flight_id,
         "viewer_token": mint_viewer_token(flight_id, user_id),
     }
-
-
-@app.delete("/session/{flight_id}")
-def close_session(flight_id: int, authorization: Optional[str] = Header(default=None)):
-    """
-    Mark a flight finished.
-
-    There is nothing per-flight to tear down any more — no manager, no connection,
-    no thread — so this only records the event. It is kept because the app calls it,
-    and because the orchestrator will want a place to hook flight completion.
-    Idempotent by construction.
-
-    Queued alerts are unaffected: they belong to the process-wide writer and are
-    drained regardless of whether the flight has been closed.
-    """
-    _require_publisher(authorization, flight_id)
-    logger.info(f"Session closed: flight_id={flight_id}")
-    return {"ok": True}
 
 
 if __name__ == "__main__":

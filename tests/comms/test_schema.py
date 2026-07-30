@@ -54,8 +54,8 @@ def main():
     flight_cols = [c["name"] for c in insp.get_columns("flights")]
     check("flights carries NO user_id (linear ownership)", "user_id" not in flight_cols,
           str(flight_cols))
-    check("flights carries stream_id + public_uuid + output_url",
-          {"stream_id", "public_uuid", "output_url"} <= set(flight_cols))
+    check("flights carries stream_id + public_uuid + output_path",
+          {"stream_id", "public_uuid", "output_path"} <= set(flight_cols))
 
     with S() as s:
         s.add(m.User(email="a@b.c", password=m.User.hash_password("pw")))

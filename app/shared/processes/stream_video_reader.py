@@ -10,6 +10,7 @@ from pydantic import BaseModel, PositiveFloat, PositiveInt, field_validator
 from app.shared.processes.frame_buffer import FrameBuffer
 from app.shared.processes.messages import FrameSlotMetadata
 from app.shared.processes.signals import reset_child_signal_handlers
+from app.shared.processes.stream_urls import redact_stream_url
 from app.shared.processes.constants import (
     VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S,
     VIDEO_STREAM_READER_RECONNECT_DELAY,
@@ -40,6 +41,8 @@ if not logger.handlers:
 class StreamVideoReaderConfig(BaseModel):
     """Configuration for StreamVideoReader."""
 
+    # Carries the flight's publisher token in its query string, so it must never be
+    # logged directly — pass it through redact_stream_url() first.
     video_stream_url: str
 
     # Connection
@@ -177,7 +180,7 @@ class StreamVideoReader(mp.Process):
                     if cap is None or not cap.isOpened():
                         raise ConnectionError(
                             f"VideoCapture is either not open or not functional "
-                            f"for {self.config.video_stream_url}"
+                            f"for {redact_stream_url(self.config.video_stream_url)}"
                         )
                     logger.info("VideoCapture Object setup complete and stream is open")
                     consecutive_connection_failures = 0
@@ -187,7 +190,8 @@ class StreamVideoReader(mp.Process):
                     total_connection_failures += 1
                     consecutive_connection_failures += 1
                     logger.warning(
-                        f"Unable to setup videocapture for {self.config.video_stream_url}: {e}. "
+                        f"Unable to setup videocapture for "
+                        f"{redact_stream_url(self.config.video_stream_url)}: {e}. "
                         f"Video source not available yet — retrying in "
                         f"{self.config.connect_retry_delay_s} seconds. "
                         f"N. Consecutive connection failures: {consecutive_connection_failures}. "
@@ -369,7 +373,9 @@ if __name__ == "__main__":
     import threading
     from time import time
 
-    VIDEO_STREAM_URL = "rtsp://0.0.0.0:8554/drone"
+    # A real ingest path is `in/<stream_key>` and needs the flight's publisher token
+    # in the query string. Point this at whatever RTSP source you have to hand.
+    VIDEO_STREAM_URL = "rtsp://mediamtx:8554/in/<stream_key>?token=<publisher_token>"
     FRAME_SHAPE = (720, 1280, 3)   # (H, W, C) — numpy convention
     N_SLOTS = 3
     META_QUEUE_SIZE = 3
