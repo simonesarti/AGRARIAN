@@ -83,8 +83,9 @@ class AppSettings(BaseSettings):
 
     # The one credential this container holds. Minted by db-writer for this flight
     # alone and returned exactly once, so a leak buys nothing but this flight. It
-    # authorises three things and nothing else: reading the drone's ingest path,
-    # publishing the annotated output, and writing alerts for this flight_id.
+    # authorises four things and nothing else: reading the drone's ingest path,
+    # publishing the annotated output, writing alerts for this flight_id, and
+    # subscribing to this flight's telemetry topics.
     publisher_token: SecretStr
 
     # ------------------------------------------------------------------ #
@@ -150,12 +151,15 @@ class AppSettings(BaseSettings):
     telemetry_listener_protocol:              Literal["mqtt", "mqtts"] = "mqtt"
     telemetry_listener_host:                  str              = TELEMETRY_LISTENER_HOST
     telemetry_listener_port:                  int              = Field(default=TELEMETRY_LISTENER_PORT, ge=1, le=65535)
-    # Broker credentials, if the broker asks for any. Independent of the protocol:
-    # authentication and transport encryption are separate decisions, and this used to
-    # conflate them — credentials were discarded outright on plain MQTT, which made
-    # authenticating to Mosquitto impossible without also turning on TLS.
-    telemetry_listener_username: Optional[str]       = None
-    telemetry_listener_password: Optional[SecretStr] = None
+    # There is no separate username/password pair. Mosquitto's ACL plugin
+    # authorises this container with the publisher token above, the same
+    # credential that already authorises the video ingest read and the
+    # annotated-output publish — this is a third thing it authorises, not a new
+    # credential. The stream this flight was opened on, e.g. `<stream_key>`.
+    # Injected per flight; no default, for the same reason
+    # video_stream_reader_stream_key has none: a wrong default here means
+    # silently subscribing to nothing, or — worse — to somebody else's topic.
+    telemetry_listener_stream_key:            str
     telemetry_listener_qos_level: Literal[0, 1, 2] = TELEMETRY_LISTENER_QOS_LEVEL
 
     # ------------------------------------------------------------------ #

@@ -97,17 +97,19 @@ opened = {
     "flight_id": 7, "public_uuid": "u7", "publisher_token": "tok",
     "ingest_path": "in/key", "output_path": "out/u7",
 }
-env = build_flight_env(opened, {"DB_WRITER_URL": "http://db-writer:8000", "MODE": "danger"})
+env = build_flight_env(
+    opened, {"DB_WRITER_URL": "http://db-writer:8000", "MODE": "danger"}, "key")
 
 check("flight_id injected", env["FLIGHT_ID"] == "7")
 check("publisher token injected", env["PUBLISHER_TOKEN"] == "tok")
 check("reader path injected", env["VIDEO_STREAM_READER_STREAM_KEY"] == "in/key")
 check("output path injected", env["VIDEO_OUT_STREAM_STREAM_KEY"] == "out/u7")
+check("telemetry topic prefix injected", env["TELEMETRY_LISTENER_STREAM_KEY"] == "key")
 check("operator settings forwarded", env["MODE"] == "danger")
 check("NO end-user credentials in the container env",
       not any(k in env for k in ("DB_USERNAME", "DB_PASSWORD")))
 
-hijack = build_flight_env(opened, {"VIDEO_OUT_STREAM_STREAM_KEY": "out/somebody-else"})
+hijack = build_flight_env(opened, {"VIDEO_OUT_STREAM_STREAM_KEY": "out/somebody-else"}, "key")
 check("per-flight output path overrides a stray base value",
       hijack["VIDEO_OUT_STREAM_STREAM_KEY"] == "out/u7")
 

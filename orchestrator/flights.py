@@ -38,7 +38,7 @@ class Flight:
     teardown: Optional[asyncio.Task] = field(default=None, repr=False)
 
 
-def build_flight_env(opened: dict, base_env: Dict[str, str]) -> Dict[str, str]:
+def build_flight_env(opened: dict, base_env: Dict[str, str], stream_key: str) -> Dict[str, str]:
     """
     The contract between the orchestrator and the app container.
 
@@ -59,6 +59,9 @@ def build_flight_env(opened: dict, base_env: Dict[str, str]) -> Dict[str, str]:
         # naming scheme is db-writer's to decide.
         "VIDEO_STREAM_READER_STREAM_KEY": opened["ingest_path"],
         "VIDEO_OUT_STREAM_STREAM_KEY": opened["output_path"],
+        # Namespaces this flight's telemetry topics (telemetry/<stream_key>/<field>)
+        # so two concurrently active flights never receive each other's telemetry.
+        "TELEMETRY_LISTENER_STREAM_KEY": stream_key,
     }
 
 
@@ -128,7 +131,7 @@ class FlightOrchestrator:
                 logger.warning(f"No flight opened for stream {stream_key[:6]}… — key unusable")
                 return None
 
-            env = build_flight_env(opened, self._base_env)
+            env = build_flight_env(opened, self._base_env, stream_key)
 
             try:
                 handle = await asyncio.to_thread(

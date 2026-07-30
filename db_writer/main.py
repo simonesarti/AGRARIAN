@@ -25,6 +25,9 @@ from pydantic import BaseModel
 from auth import AuthError, mint_publisher_token, mint_viewer_token, verify_publisher
 from db_manager import AlertWriter, UserDirectory
 from media_auth import Denied, authorize, credential_from
+from mqtt_auth import Denied as MqttDenied
+from mqtt_auth import authorize as mqtt_authorize
+from mqtt_auth import identify as mqtt_identify
 
 
 logging.basicConfig(
@@ -107,6 +110,22 @@ class MediaMTXAuthRequest(BaseModel):
     ip: str = ""
     id: str = ""
     userAgent: str = ""     # noqa: N815 — MediaMTX sends this key verbatim
+
+
+class MqttAuthRequest(BaseModel):
+    """What mosquitto-go-auth POSTs to auth_opt_http_getuser_uri on every CONNECT."""
+    username: str = ""
+    password: str = ""
+    clientid: str = ""
+
+
+class MqttAclRequest(BaseModel):
+    """What mosquitto-go-auth POSTs to auth_opt_http_aclcheck_uri on every publish,
+    subscribe, and per-message read that follows a subscribe."""
+    username: str = ""
+    clientid: str = ""
+    topic: str = ""
+    acc: int = 0
 
 
 class RecordingRequest(BaseModel):
@@ -292,6 +311,36 @@ def mediamtx_auth(req: MediaMTXAuthRequest):
         f"MediaMTX auth allowed: action={req.action!r} path={req.path!r} "
         f"protocol={req.protocol!r} ip={req.ip!r}"
     )
+    return {"ok": True}
+
+
+@app.post("/auth/mqtt/user")
+def mqtt_auth_user(req: MqttAuthRequest):
+    """
+    Authorise one Mosquitto CONNECT. 200 allows, 401 denies.
+
+    The counterpart to /auth/mediamtx for the telemetry plane, called by the
+    mosquitto-go-auth plugin's HTTP backend instead of MediaMTX's built-in hook.
+    Only proves the credential is live; which topics it may touch is decided per
+    attempt in /auth/mqtt/acl below.
+    """
+    if not mqtt_identify(req.username, _directory):
+        logger.warning("Mosquitto auth denied: unknown or revoked credential")
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return {"ok": True}
+
+
+@app.post("/auth/mqtt/acl")
+def mqtt_auth_acl(req: MqttAclRequest):
+    """
+    Authorise one Mosquitto publish, subscribe, or per-message read. 200 allows,
+    401 denies. See mqtt_auth.py for the four legitimate combinations.
+    """
+    try:
+        mqtt_authorize(req.username, req.topic, req.acc, _directory)
+    except MqttDenied as e:
+        logger.warning(f"Mosquitto ACL denied: topic={req.topic!r} acc={req.acc}: {e}")
+        raise HTTPException(status_code=401, detail="unauthorized")
     return {"ok": True}
 
 

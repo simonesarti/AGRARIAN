@@ -244,7 +244,7 @@ letting anyone with read access inject alerts into it.
 | --- | --- | --- | --- |
 | **GPU app** | **One per active flight** | Sole occupant — no internal tenancy needed | container **[built]**, lifecycle **[built]**, paths **[verified]** for `health_monitoring`; `danger_detection` needs a TensorRT engine |
 | MediaMTX | Shared, replicated on load | Regex paths + HTTP auth hook | **[built]** |
-| Mosquitto | Shared, replicated on load | Per-stream credentials + topic ACLs | **[designed]** |
+| Mosquitto | Shared, replicated on load | Per-stream credentials + topic ACLs | **[built]** |
 | ws-server | Shared, replicated on load | Per-flight JWT (view + publish scopes); Redis pub/sub fan-out | **[built]** |
 | db-writer | Shared, replicated on load | Stateless per request; bcrypt user auth | **[built]** |
 | Redis | Shared | Channel per flight (`flight:{id}`) | **[built]** |
@@ -398,17 +398,27 @@ once fired until this was found. The `-ffmpeg` tag is Alpine based and supplies 
 The same constraint rules out shell syntax in any hook: no pipes, no `&&`, no redirects.
 `-O /dev/null` is an argument, which is why it works.
 
-### Mosquitto **[designed]**
+### Mosquitto **[built]**
 
-Currently `allow_anonymous true` with no ACLs — every client can read every topic. MQTT has
-native username/password fields, so the typeability problem does not arise; the stream
-key serves as the password.
+Was `allow_anonymous true` with no ACLs, and every telemetry topic flat
+(`telemetry/latitude`) with no per-flight scoping at all — so two concurrently active
+flights would each receive the other's telemetry on the shared broker, independent of
+the missing authentication.
 
-The harder half is that Mosquitto's `password_file` is a static list with exactly the same
-user-101 defect as `authInternalUsers`, and Mosquitto has no equivalent of MediaMTX's HTTP
-auth hook built in. Options are `mosquitto-go-auth` with an HTTP backend (mirrors the
-MediaMTX design) or the dynamic-security plugin. **Expect this to be the component that
-constrains the design.**
+Fixed with `mosquitto-go-auth`'s HTTP backend rather than the dynamic-security plugin:
+the latter's credential/ACL store is a JSON file the broker owns, a second store that
+would need pushing and keeping in sync with the `streams` table on every add/rotate/
+revoke — the same static-list defect `authInternalUsers` had. The HTTP backend instead
+mirrors the MediaMTX design exactly: db-writer is asked live on every CONNECT and every
+PUBLISH/SUBSCRIBE (`db_writer/mqtt_auth.py`, `/auth/mqtt/user` + `/auth/mqtt/acl`), so
+the streams table stays the single source of truth and revocation needs no reload.
+
+Topics are namespaced `telemetry/<stream_key>/<field>` so the ACL check can actually
+separate tenants — the drone's stream key is the publish credential (the topic's own key
+IS the credential, like `in/<stream_key>` on the video plane), and the app container
+reuses its existing publisher token to subscribe, the same token already authorising the
+video ingest read, the annotated-output publish, and writing alerts. See §9 for what was
+verified and the caveat that the upstream plugin project is now archived.
 
 ---
 
@@ -660,6 +670,27 @@ db-writer, Redis, the recorder, and the orchestrator.
   only existing as an anonymous file under a UUID nobody can join to a flight. 8/8
   assertions, including the file actually present on the shared volume. Azure/AWS
   backends remain unverified — no credentials are configured to test against them.
+- **Mosquitto authorisation and per-flight telemetry isolation.** Previously
+  `allow_anonymous true` with no ACLs, and every telemetry topic flat
+  (`telemetry/latitude`) regardless of which drone or flight it belonged to — so two
+  concurrently active flights would each receive the other's GPS and gimbal data on
+  the shared broker. Topics are now namespaced per stream
+  (`telemetry/<stream_key>/<field>`), and a new `mosquitto-go-auth` HTTP backend
+  (`db_writer/mqtt_auth.py`, `/auth/mqtt/user` + `/auth/mqtt/acl`) mirrors
+  `/auth/mediamtx` exactly: the drone's stream key is the publish credential, and the
+  app container reuses its existing publisher token to subscribe — a fourth thing
+  that one token now authorises, not a new credential. Requires the
+  `iegomez/mosquitto-go-auth` image in place of stock `eclipse-mosquitto`, since the
+  plugin does not ship in the stock image. Verified by 27 assertions on the decision
+  itself (`test_mqtt_auth.py`) and 9 end-to-end against a real broker
+  (`run_mqtt_auth.sh`): CONNECT refused for an unknown/revoked key or garbage
+  credential, SUBSCRIBE denied for another tenant's topic, PUBLISH denied for another
+  tenant's key (checked via the broker's own log line — MQTT gives no client-side
+  signal for a denied QoS-0 publish, the same trap as ffmpeg's exit code against
+  MediaMTX), and a subscribed app genuinely receiving the exact value its own drone
+  published. The upstream plugin project is archived (no longer maintained) as of
+  mid-2025; it still works and is pinned to a specific image tag, but has no
+  security-patch path if a CVE surfaces.
 
 Distinct from the section below: these are live weaknesses on this branch right now, not
 work that has yet to start.
@@ -669,8 +700,6 @@ work that has yet to start.
   fallback), and none exists yet — only `.onnx`/`.pt` checkpoints are on disk. Building
   and verifying that engine is the remaining piece of driving the real app tier fully
   end to end.
-- **Mosquitto is still `allow_anonymous true`.** Telemetry is now the only unauthenticated
-  channel in the system.
 - **The orchestrator holds the Docker socket.** Anything that can reach its port can
   start containers on the host. Its port is internal-only, but this is the strongest
   argument for the Kubernetes backend, where the equivalent is a scoped service account.
@@ -696,7 +725,6 @@ this list — it is set inside `open_flight_for_key` the moment a flight opens, 
 
 ### Designed, not built
 
-- Mosquitto ACLs and dynamic credentials
 - Kubernetes `FlightRuntime` backend (create Job, delete Job)
 
 ### Open

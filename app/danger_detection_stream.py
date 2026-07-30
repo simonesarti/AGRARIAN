@@ -161,8 +161,11 @@ def main():
         mqtt_protocol=s.telemetry_listener_protocol,
         mqtt_broker_host=s.telemetry_listener_host,
         mqtt_broker_port=s.telemetry_listener_port,
-        mqtt_username=s.telemetry_listener_username,
-        mqtt_password=s.telemetry_listener_password.get_secret_value() if s.telemetry_listener_password else None,
+        # The one credential this container holds, reused rather than a second
+        # secret: Mosquitto's ACL plugin authorises it against this exact stream.
+        mqtt_username=s.publisher_token.get_secret_value(),
+        mqtt_password=s.publisher_token.get_secret_value(),
+        mqtt_topic_prefix=s.telemetry_listener_stream_key,
         mqtt_qos_level=s.telemetry_listener_qos_level,
         mqtt_max_msg_wait_s=TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT,
         mqtt_reconnect_delay_s=TELEMETRY_LISTENER_RECONNECT_DELAY,

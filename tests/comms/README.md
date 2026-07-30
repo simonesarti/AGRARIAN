@@ -17,6 +17,7 @@ try to run these directly with `python3`.
 | `test_schema.py` | nothing | one-liner below |
 | `test_tokens.py` | nothing | one-liner below |
 | `test_mediamtx_auth.py` | nothing | one-liner below |
+| `test_mqtt_auth.py` | nothing | one-liner below |
 | `test_orchestrator.py` | nothing | one-liner below |
 | `test_replication.py` | Postgres + 2 db-writer replicas | `./run_db_replication.sh` |
 | `test_multiflight.py` | same | `./run_db_replication.sh` |
@@ -26,6 +27,7 @@ try to run these directly with `python3`.
 | `run_orchestrator.sh` | the above + Docker socket, host `ffmpeg` | `./run_orchestrator.sh` |
 | `run_orchestrator_real_app.sh` | the above + a GPU, `nvidia-container-toolkit`, `checkpoints/*.pt` | `./run_orchestrator_real_app.sh` |
 | `run_recording_upload.sh` | MediaMTX + recorder + db-writer + Postgres, host `ffmpeg` | `./run_recording_upload.sh` |
+| `run_mqtt_auth.sh` | mosquitto-go-auth + db-writer + Postgres | `./run_mqtt_auth.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
 
@@ -50,6 +52,14 @@ The MediaMTX authorisation decision, with no database and no media server:
 docker run --rm -v "$PWD/db_writer:/w" -v "$PWD/tests/comms:/tests:ro" \
   -w /tmp -e DB_WRITER_DIR=/w python:3.11-slim \
   sh -c "pip install -q pyjwt; python /tests/test_mediamtx_auth.py"
+```
+
+The Mosquitto authorisation decision, with no database and no broker:
+
+```bash
+docker run --rm -v "$PWD/db_writer:/w" -v "$PWD/tests/comms:/tests:ro" \
+  -w /tmp -e DB_WRITER_DIR=/w python:3.11-slim \
+  sh -c "pip install -q pyjwt; python /tests/test_mqtt_auth.py"
 ```
 
 Schema behaviour and stream management, against SQLite in memory — the fastest signal
@@ -81,6 +91,7 @@ token signed with a 17-character wrong secret, not a real key. Expected.
 ./run_orchestrator.sh        # 21 assertions, real containers spawned and torn down
 ./run_orchestrator_real_app.sh  # 7 assertions, the real GPU app, not the stub
 ./run_recording_upload.sh    # 8 assertions, real segment upload + DB traceability
+./run_mqtt_auth.sh           # 9 assertions, real mosquitto-go-auth broker
 ```
 
 `run_mediamtx_auth.sh` needs `ffmpeg` and `curl` **on the host** and binds host ports
@@ -202,6 +213,30 @@ back to its `flight_id` and lands in the `recordings` table via the new `POST /r
 endpoint, rather than only existing as a file under a UUID with no way to join it back to
 a flight.
 
+**`test_mqtt_auth.py`** — the Mosquitto analogue of `test_mediamtx_auth.py`, checked
+against the same style of stub directory. The drone's stream key is the write
+credential (mirrors publishing to `in/<stream_key>`: the topic's own key IS the
+credential), and the app container's publisher token is the read/subscribe
+credential — the same token already authorising the video ingest read, the
+annotated-output publish, and alert writes. Includes the anchoring cases (topic
+prefix/suffix smuggling, uppercase keys), scope confusion in both directions
+(a viewer token cannot subscribe, a drone key cannot subscribe), and the case
+that makes ACLs meaningful at all: a live, valid publisher token for flight 1
+still cannot touch flight 2's topic, because the topic's stream-key segment,
+not just the credential, is checked.
+
+**`run_mqtt_auth.sh`** — the part the file above cannot check: that Mosquitto's
+`mosquitto-go-auth` plugin is actually consulting db-writer and obeying it, over a
+real broker with real `mosquitto_pub`/`mosquitto_sub`. MQTT does not give one
+uniform "denied" signal, so three different ones are used: a refused CONNECT exits
+5; a denied SUBSCRIBE returns exit 0 but prints "All subscription requests were
+denied" (the exit code is as useless here as ffmpeg's against MediaMTX); a denied
+PUBLISH at QoS 0 gives the client no signal at all, so the broker's own
+`error code: 401` log line is counted before/after, the same technique
+`run_mediamtx_auth.sh` uses for MediaMTX's log line. The strongest check doesn't
+rely on any of those: a subscribed app container genuinely receives the exact
+value its own drone published, on the exact topic scoped to their shared flight.
+
 **`test_tenancy.py`** — the original leak. ws-server used to broadcast every alert,
 including its JPEG and GPS position, to every connected client. Assertion 6 is the one
 that matters: flight 2's viewer must receive **nothing**.
@@ -210,8 +245,9 @@ that matters: flight 2's viewer must receive **nothing**.
 
 ## Gaps
 
-There is no coverage for Mosquitto ACLs or TLS — neither exists yet. See
-`CLOUD_ARCHITECTURE.md` §9 for current status.
+Mosquitto authorisation is covered (`test_mqtt_auth.py`, `run_mqtt_auth.sh`); MQTTS/TLS
+is not — the listener block in `configs/mosquitto/mosquitto.conf` is commented out and
+unexercised. See `CLOUD_ARCHITECTURE.md` §9 for current status.
 
 `run_orchestrator_real_app.sh` drives the real GPU app tier through the orchestrator in
 `health_monitoring` mode — ingest read, pipeline, and annotated-output publish are all

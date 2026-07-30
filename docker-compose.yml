@@ -84,14 +84,21 @@ services:
 
   # ── MQTT broker ───────────────────────────────────────────────────────────────
   mosquitto:
-    image: eclipse-mosquitto:2
+    # eclipse-mosquitto does not ship the go-auth plugin mosquitto.conf now
+    # requires (auth_plugin /mosquitto/go-auth.so). This image is the stock
+    # broker plus that plugin prebuilt in; its config lives at
+    # /etc/mosquitto/mosquitto.conf, not /mosquitto/config/ like the stock image.
+    image: iegomez/mosquitto-go-auth:2.1.0-mosquitto_2.0.15
     restart: unless-stopped
     networks: [comms-net]
+    depends_on:
+      db-writer:
+        condition: service_healthy
     ports:
       - "1883:1883"     # MQTT  — drone publishes, app subscribes
       #- "8883:8883"    # MQTTS — uncomment together with the listener block in mosquitto.conf
     volumes:
-      - ./configs/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./configs/mosquitto/mosquitto.conf:/etc/mosquitto/mosquitto.conf:ro
       - mosquitto-data:/mosquitto/data
       - mosquitto-log:/mosquitto/log
       #- ./certificates/mosquitto:/mosquitto/certs:ro   # required for MQTTS

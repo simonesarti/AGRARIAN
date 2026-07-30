@@ -162,19 +162,14 @@ TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT = 1.0
 TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES = 100
 
 
-TELEMETRY_LISTENER_TOPICS_TO_SUBSCRIBE = [
-    "telemetry/latitude",
-    "telemetry/longitude",
-    "telemetry/rel_alt",
-    "telemetry/gb_yaw",
-]
+# Topics are namespaced per flight as telemetry/<stream_key>/<field> — never bare
+# telemetry/<field> — so that two concurrently active flights never receive each
+# other's telemetry on the shared Mosquitto broker. <stream_key> is filled in at
+# runtime from TELEMETRY_LISTENER_STREAM_KEY (see FrameTelemetryCombinerConfig),
+# the same value the orchestrator injects for the video ingest path.
+TELEMETRY_TOPIC_ROOT = "telemetry"
 
-TELEMETRY_LISTENER_TOPICS_TO_TELEMETRY_MAPPING = {
-    "telemetry/latitude": "latitude",
-    "telemetry/longitude": "longitude",
-    "telemetry/rel_alt": "rel_alt",
-    "telemetry/gb_yaw": "gb_yaw",
-}
+TELEMETRY_FIELDS = ["latitude", "longitude", "rel_alt", "gb_yaw"]
 
 TELEMETRY_LISTENER_TEMPLATE_TELEMETRY = {
     "latitude": 44.414622942776454,

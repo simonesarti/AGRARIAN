@@ -20,6 +20,7 @@ from app.shared.processes.constants import (
     FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
     FRAMETELCOMB_MAX_TIME_DIFF,
     PIPELINE_QUEUE_TIMEOUT,
+    TELEMETRY_FIELDS,
     TELEMETRY_LISTENER_HOST,
     TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES,
     TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT,
@@ -27,8 +28,7 @@ from app.shared.processes.constants import (
     TELEMETRY_LISTENER_QOS_LEVEL,
     TELEMETRY_LISTENER_RECONNECT_DELAY,
     TELEMETRY_LISTENER_TEMPLATE_TELEMETRY,
-    TELEMETRY_LISTENER_TOPICS_TO_SUBSCRIBE,
-    TELEMETRY_LISTENER_TOPICS_TO_TELEMETRY_MAPPING,
+    TELEMETRY_TOPIC_ROOT,
 )
 from app.shared.processes.frame_buffer import FrameBuffer
 from app.shared.processes.messages import CombinedSlotMetadata, FrameSlotMetadata, TelemetryQueueObject
@@ -56,12 +56,24 @@ class FrameTelemetryCombinerConfig(BaseModel):
     mqtt_broker_port: int = Field(default=TELEMETRY_LISTENER_PORT, ge=1, le=65535)
     mqtt_username: Optional[str] = None
     mqtt_password: Optional[str] = None
+    # Namespaces every topic as telemetry/<mqtt_topic_prefix>/<field>. This is the
+    # stream_key the flight was opened on — Mosquitto's ACL plugin denies anything
+    # that does not match, so a wrong prefix here fails closed, not open.
+    mqtt_topic_prefix: str
     mqtt_qos_level: Literal[0, 1, 2] = TELEMETRY_LISTENER_QOS_LEVEL
     mqtt_max_msg_wait_s: PositiveFloat = TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT
     mqtt_reconnect_delay_s: PositiveFloat = TELEMETRY_LISTENER_RECONNECT_DELAY
     mqtt_ca_certs_path: Optional[str] = None          # required for MQTTS
     mqtt_cert_validation: Optional[int] = ssl.CERT_REQUIRED
     mqtt_max_incoming_messages: PositiveInt = TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES
+
+    @property
+    def topics_to_subscribe(self) -> list[str]:
+        return [f"{TELEMETRY_TOPIC_ROOT}/{self.mqtt_topic_prefix}/{f}" for f in TELEMETRY_FIELDS]
+
+    @property
+    def topics_to_telemetry_mapping(self) -> dict[str, str]:
+        return {f"{TELEMETRY_TOPIC_ROOT}/{self.mqtt_topic_prefix}/{f}": f for f in TELEMETRY_FIELDS}
 
     # Telemetry–frame timestamp matching
     telemetry_buffer_max_size: PositiveInt = FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE
@@ -194,7 +206,7 @@ class FrameTelemetryCombiner(mp.Process):
             try:
                 # 1. Decode and update rolling telemetry state
                 payload = message.payload.decode()
-                telemetry_key = TELEMETRY_LISTENER_TOPICS_TO_TELEMETRY_MAPPING.get(topic)
+                telemetry_key = self.config.topics_to_telemetry_mapping.get(topic)
                 if not telemetry_key:
                     logger.warning(f"MQTT message from unexpected topic '{topic}'. Skipped.")
                     continue  # Ignore unmapped topics
@@ -243,7 +255,7 @@ class FrameTelemetryCombiner(mp.Process):
                     logger.info("MQTT: connected. Subscribing to topics ...")
 
                     # Subscribe to all topics
-                    for topic in TELEMETRY_LISTENER_TOPICS_TO_SUBSCRIBE:
+                    for topic in self.config.topics_to_subscribe:
                         await client.subscribe(topic=topic, qos=self.config.mqtt_qos_level)
                         logger.info(
                             f"MQTT: subscribed to '{topic}' (QoS {self.config.mqtt_qos_level})"
@@ -522,10 +534,16 @@ if __name__ == "__main__":
     _parser.add_argument("--mqtt-host", default="127.0.0.1", help="MQTT broker host")
     _parser.add_argument("--mqtt-port", type=int, default=TELEMETRY_LISTENER_PORT, help="MQTT broker port")
     _parser.add_argument(
+        "--topic-prefix", default="test", help="stream_key segment of telemetry/<prefix>/<field>",
+    )
+    _parser.add_argument(
         "--listen", action="store_true",
         help="MQTT-only connectivity test: subscribe and print raw telemetry messages (no frame machinery)",
     )
     _args = _parser.parse_args()
+
+    _topics = [f"{TELEMETRY_TOPIC_ROOT}/{_args.topic_prefix}/{f}" for f in TELEMETRY_FIELDS]
+    _topic_mapping = {t: f for t, f in zip(_topics, TELEMETRY_FIELDS)}
 
     if _args.listen:
 
@@ -537,14 +555,14 @@ if __name__ == "__main__":
             while True:
                 try:
                     async with Client(hostname=_args.mqtt_host, port=_args.mqtt_port) as client:
-                        for topic in TELEMETRY_LISTENER_TOPICS_TO_SUBSCRIBE:
+                        for topic in _topics:
                             await client.subscribe(topic=topic, qos=TELEMETRY_LISTENER_QOS_LEVEL)
                         print(
-                            f"Subscribed to {TELEMETRY_LISTENER_TOPICS_TO_SUBSCRIBE}\n"
+                            f"Subscribed to {_topics}\n"
                             "Waiting for messages — Ctrl+C to stop ...\n"
                         )
                         async for message in client.messages:
-                            key = TELEMETRY_LISTENER_TOPICS_TO_TELEMETRY_MAPPING.get(
+                            key = _topic_mapping.get(
                                 message.topic.value, message.topic.value
                             )
                             print(f"{key:12s} = {message.payload.decode()}")
@@ -588,6 +606,7 @@ if __name__ == "__main__":
         config = FrameTelemetryCombinerConfig(
             mqtt_broker_host=_args.mqtt_host,
             mqtt_broker_port=_args.mqtt_port,
+            mqtt_topic_prefix=_args.topic_prefix,
             mqtt_cert_validation=None,  # no TLS in test
         )
 
