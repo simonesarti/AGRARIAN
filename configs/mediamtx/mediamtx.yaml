@@ -1,3 +1,17 @@
+# ── Image requirement ─────────────────────────────────────────────────────────
+# This config REQUIRES the `-ffmpeg` image tag (see docker-compose.yml).
+#
+# The default `bluenviron/mediamtx` image contains exactly three files — the
+# binary, this config and a licence — with no shell and no wget. MediaMTX execs
+# runOn* commands directly rather than through a shell, so on that image every
+# hook below dies with:
+#
+#   runOnAvailable command exited: exec: "wget": executable file not found in $PATH
+#
+# which MediaMTX logs at INF and otherwise ignores. The `-ffmpeg` tag is Alpine
+# based and provides busybox wget, which sends the form-encoded body these
+# endpoints expect. The tag is chosen for the shell, not for ffmpeg.
+
 rtsp: yes
 rtspAddress: :8554
 rtspTransports: [tcp, udp]
@@ -60,18 +74,14 @@ paths:
   "~^in/([0-9abcdefghjkmnpqrstvwxyz]{16})$":
     source: publisher
 
-    # TODO(orchestrator): spawn and tear down the GPU container for this flight.
-    # Deliberately not wired yet — the orchestrator does not exist, and pointing
-    # these at a service that is not there would fire a failing hook on every
-    # single flight. They belong on availability rather than on the auth hook,
-    # which also fires for aborted and retried connections that never stream.
+    # Spawn and tear down the GPU container for this flight. These belong on
+    # availability rather than on the auth hook: the auth hook also fires for
+    # aborted and retried connections that never carry a single frame, and
+    # spawning from it would start GPU containers for drones that never stream.
     #
-    # runOnAvailable: >
-    #   wget -q -O /dev/null --post-data="key=$G1"
-    #   http://orchestrator:8000/stream-online
-    # runOnUnavailable: >
-    #   wget -q -O /dev/null --post-data="key=$G1"
-    #   http://orchestrator:8000/stream-offline
+    # $G1 is the stream key. wget comes from the image — see the note below.
+    runOnAvailable: wget -q -O /dev/null --post-data="key=$G1" http://orchestrator:8000/stream-online
+    runOnUnavailable: wget -q -O /dev/null --post-data="key=$G1" http://orchestrator:8000/stream-offline
 
   # Annotated output. $G1 is the flight's public_uuid — random rather than derived
   # from flight_id, because the sequential primary key would make every tenant's

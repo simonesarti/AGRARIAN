@@ -87,6 +87,10 @@ class StartSessionRequest(BaseModel):
 class StreamUrlRequest(BaseModel):
     url: str
 
+class OpenFlightRequest(BaseModel):
+    stream_key: str
+
+
 class MediaMTXAuthRequest(BaseModel):
     """
     What MediaMTX POSTs on every connection attempt.
@@ -207,6 +211,64 @@ def save_alert(
     if not queued:
         raise HTTPException(status_code=503, detail="Alert queue full — DB may be unavailable")
     return {"queued": True}
+
+
+@app.post("/flight/open")
+def open_flight(req: OpenFlightRequest):
+    """
+    Open a flight for a stream key. Called by the orchestrator, never by an app.
+
+    This is what removes end-user credentials from the GPU tier. Previously the app
+    container called /session/start with the operator's email and password, which put
+    a reusable account credential inside a container that processes untrusted video.
+    Now the orchestrator — which learned the key from MediaMTX going live — opens the
+    flight and injects only the result.
+
+    Returns the publisher token once. It is not re-derivable from the flight_id, and
+    nothing stores it.
+
+    INTERNAL ONLY. Possession of a live stream key is the whole authorisation, which
+    is the same authority the key already carries at MediaMTX; but this port must
+    never be routed from outside the cluster network regardless.
+    """
+    flight = _directory.open_flight_for_key(req.stream_key)
+    if flight is None:
+        # Deliberately vague: this endpoint must not become a way to test whether a
+        # given stream key exists.
+        logger.warning("Refused flight open for an unknown or revoked stream key")
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    logger.info(
+        f"Flight opened for orchestrator: flight_id={flight['flight_id']} "
+        f"stream_id={flight['stream_id']}"
+    )
+    return {
+        "flight_id": flight["flight_id"],
+        "public_uuid": flight["public_uuid"],
+        "stream_id": flight["stream_id"],
+        "user_id": flight["user_id"],
+        # The paths the app must read from and publish to. Derived here so the
+        # orchestrator does not have to know the naming scheme, and so a change to it
+        # is a change in one place.
+        "ingest_path": f"in/{req.stream_key}",
+        "output_path": f"out/{flight['public_uuid']}",
+        "publisher_token": mint_publisher_token(flight["flight_id"]),
+    }
+
+
+@app.post("/flight/{flight_id}/close")
+def close_flight(flight_id: int, authorization: Optional[str] = Header(default=None)):
+    """
+    Stamp a flight as finished. Idempotent.
+
+    Requires the flight's own publisher token, so the orchestrator must still hold the
+    credential it was given when the flight opened — a stale or cross-flight token
+    cannot close somebody else's flight.
+    """
+    _require_publisher(authorization, flight_id)
+    if not _directory.close_flight(flight_id):
+        raise HTTPException(status_code=404, detail=f"Flight {flight_id} not found")
+    return {"ok": True}
 
 
 @app.post("/auth/mediamtx")

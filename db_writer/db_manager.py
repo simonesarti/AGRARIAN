@@ -179,6 +179,10 @@ class Flight(Base):
     public_uuid = Column(String(36), nullable=False, unique=True, index=True,
                          default=lambda: str(uuid.uuid4()))
     start_time = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    # Set when the publisher disconnects and the orchestrator tears the flight down.
+    # NULL means "still in the air" — which is also what it means for a flight whose
+    # orchestrator died before it could close, so this is not a liveness signal.
+    end_time = Column(DateTime, nullable=True)
     # The ANNOTATED OUTPUT URL, never the ingest one. Ingest URLs embed the stream key,
     # so storing one here would scatter live credentials through flight history and
     # leave dead ones behind after every rotation.
@@ -390,6 +394,59 @@ class UserDirectory:
                 "stream_id": stream.stream_id,
                 "user_id": user.user_id,
             }
+
+    def open_flight_for_key(self, stream_key: str) -> Optional[dict]:
+        """
+        Open a flight on the stream this key identifies, or None if it is unusable.
+
+        The orchestrator's entry point, and the reason the app no longer needs end-user
+        credentials: a publisher proved possession of the key to MediaMTX, so the key —
+        not an email and password carried inside a GPU container — is what opens the
+        flight.
+
+        Returns None rather than raising for an unknown or revoked key: MediaMTX has
+        already accepted the publisher by this point, so this is a race (revoked between
+        connect and go-live), not an error worth a stack trace.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            stream = session.query(Stream).filter_by(stream_key=stream_key).first()
+            if stream is None or stream.revoked_at is not None:
+                return None
+
+            flight = Flight(stream_id=stream.stream_id)
+            session.add(flight)
+            session.commit()
+
+            logger.info(
+                f"Flight opened by key: flight_id={flight.flight_id}, "
+                f"stream_id={stream.stream_id}, user_id={stream.user_id}"
+            )
+            return {
+                "flight_id": flight.flight_id,
+                "public_uuid": flight.public_uuid,
+                "stream_id": stream.stream_id,
+                "user_id": stream.user_id,
+            }
+
+    def close_flight(self, flight_id: int) -> bool:
+        """
+        Stamp a flight as finished. False if there is no such flight.
+
+        Idempotent, and deliberately does not overwrite an existing end_time: a stream
+        that drops and reconnects can deliver a late teardown for a flight that already
+        closed, and the first timestamp is the true one.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            flight = session.get(Flight, flight_id)
+            if flight is None:
+                return False
+            if flight.end_time is None:
+                flight.end_time = datetime.now(timezone.utc)
+                session.commit()
+                logger.info(f"Flight closed: flight_id={flight_id}")
+            return True
 
     def set_output_url(self, flight_id: int, url: str) -> bool:
         """

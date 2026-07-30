@@ -53,12 +53,23 @@ services:
 
   # ── Video server ──────────────────────────────────────────────────────────────
   mediamtx:
-    image: bluenviron/mediamtx:latest
+    # The `-ffmpeg` tag is required, and NOT for ffmpeg. The default image ships the
+    # binary and nothing else — no shell, no wget — and MediaMTX execs runOn* hooks
+    # directly, so on that image every hook in mediamtx.yaml fails with
+    # `exec: "wget": executable file not found in $PATH`. That is logged at INF and
+    # otherwise silent: the recorder is never told a segment finished, and the
+    # orchestrator is never told a stream went live. This tag is Alpine based and
+    # provides busybox wget.
+    image: bluenviron/mediamtx:latest-ffmpeg
     restart: unless-stopped
     networks: [comms-net]
     depends_on:
       recorder:
         condition: service_healthy
+      db-writer:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
     ports:
       - "8554:8554"       # RTSP  — drone publishes + app pulls raw stream
       - "1935:1935"       # RTMP  — app pushes annotated stream
@@ -128,6 +139,46 @@ services:
       # Shared with db-writer, which mints the tokens this validates. No publisher
       # secret here: app containers present a per-flight token db-writer issued them.
       SESSION_JWT_SECRET: ${SESSION_JWT_SECRET:?set SESSION_JWT_SECRET in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # ── Flight orchestrator ───────────────────────────────────────────────────────
+  # One GPU container per active flight, created when a stream goes live and destroyed
+  # when it stops. MediaMTX drives it through runOnAvailable / runOnUnavailable.
+  #
+  # NOT exposed to the host, and it must never be: it holds the Docker socket, so
+  # anything that can reach it can start containers on this machine.
+  orchestrator:
+    build:
+      context: orchestrator
+    restart: unless-stopped
+    networks: [comms-net]
+    depends_on:
+      db-writer:
+        condition: service_healthy
+    volumes:
+      # The Docker backend's whole privilege. Swapped for a service account when the
+      # Kubernetes backend lands.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      APP_IMAGE:         ${APP_IMAGE:?set APP_IMAGE in .env — the GPU app image to run per flight}
+      DB_WRITER_URL:     http://db-writer:8000
+      APP_NETWORK:       comms-net
+      APP_GPUS:          ${APP_GPUS:-all}
+      APP_SHM_SIZE:      ${APP_SHM_SIZE:-256m}
+      RECONNECT_GRACE_S: ${RECONNECT_GRACE_S:-30}
+
+      # Everything below is forwarded to each flight container with the APP_ENV_
+      # prefix stripped. The orchestrator does not interpret any of it; per-flight
+      # values (flight id, token, stream paths) always win over these.
+      APP_ENV_DB_WRITER_URL:              http://db-writer:8000
+      APP_ENV_WS_SERVER_URL:              http://ws-server:8000
+      APP_ENV_VIDEO_STREAM_READER_HOST:   mediamtx
+      APP_ENV_VIDEO_OUT_STREAM_HOST:      mediamtx
+      APP_ENV_TELEMETRY_LISTENER_HOST:    mosquitto
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 5s

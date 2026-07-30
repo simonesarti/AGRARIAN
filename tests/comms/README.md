@@ -17,11 +17,13 @@ try to run these directly with `python3`.
 | `test_schema.py` | nothing | one-liner below |
 | `test_tokens.py` | nothing | one-liner below |
 | `test_mediamtx_auth.py` | nothing | one-liner below |
+| `test_orchestrator.py` | nothing | one-liner below |
 | `test_replication.py` | Postgres + 2 db-writer replicas | `./run_db_replication.sh` |
 | `test_multiflight.py` | same | `./run_db_replication.sh` |
 | `test_redis_reconnect.py` | Redis + 2 ws-server replicas | `./run_redis_failure.sh` |
 | `test_redis_outage.py` | same | `./run_redis_failure.sh` |
 | `run_mediamtx_auth.sh` | MediaMTX + db-writer + Postgres, host `ffmpeg` | `./run_mediamtx_auth.sh` |
+| `run_orchestrator.sh` | the above + Docker socket, host `ffmpeg` | `./run_orchestrator.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
 
@@ -32,6 +34,13 @@ including on failure.
 ---
 
 ## No stack required
+
+Flight lifecycle event logic, with no Docker daemon and no media server:
+
+```bash
+docker run --rm -v "$PWD/orchestrator:/o:ro" -v "$PWD/tests/comms:/tests:ro" \
+  -w /tmp -e ORCHESTRATOR_DIR=/o python:3.11-slim python /tests/test_orchestrator.py
+```
 
 The MediaMTX authorisation decision, with no database and no media server:
 
@@ -67,6 +76,7 @@ token signed with a 17-character wrong secret, not a real key. Expected.
 ./run_db_replication.sh      # 7 + 20×2 assertions, real PostgreSQL
 ./run_redis_failure.sh       # 3 + 7 assertions, Redis restarted mid-test
 ./run_mediamtx_auth.sh       # 16 assertions, real MediaMTX + ffmpeg publishes
+./run_orchestrator.sh        # 21 assertions, real containers spawned and torn down
 ```
 
 `run_mediamtx_auth.sh` needs `ffmpeg` and `curl` **on the host** and binds host ports
@@ -148,6 +158,24 @@ time round:
 It also aborts if MediaMTX fails to start, because a MediaMTX that never came up
 denies everything — which reads as a wall of passing deny-assertions.
 
+**`test_orchestrator.py`** — the event sequences MediaMTX actually produces, which is
+where the bugs are: duplicate online and offline hooks, an offline immediately followed
+by an online (a radio glitch, not a landing), a reconnect after the grace window, a key
+revoked mid-flight, a container that fails to start, and shutdown while a teardown is
+pending. Also pins the orchestrator→container env contract, including that **no**
+`DB_USERNAME`/`DB_PASSWORD` reaches a flight container and that a stray base-env value
+cannot redirect a tenant's annotated video.
+
+**`run_orchestrator.sh`** — the same lifecycle with real MediaMTX hooks, a real Docker
+daemon and real PostgreSQL. The "GPU app" is a stub image that sleeps: what is under
+test is the orchestration, which is precisely what `FlightRuntime` makes testable
+without a GPU.
+
+One trap: the stub **traps SIGTERM**. A bare `sleep` as PID 1 ignores signals it has no
+handler for, so `docker stop` blocks for the full 20 s stop timeout on every teardown —
+which looks exactly like a hung orchestrator and cost a debugging round the first time.
+The real app installs SIGTERM/SIGINT handlers, so the stub matches it.
+
 **`test_tenancy.py`** — the original leak. ws-server used to broadcast every alert,
 including its JPEG and GPS position, to every connected client. Assertion 6 is the one
 that matters: flight 2's viewer must receive **nothing**.
@@ -156,9 +184,13 @@ that matters: flight 2's viewer must receive **nothing**.
 
 ## Gaps
 
-There is no coverage for Mosquitto ACLs, the orchestrator, or TLS — none of those exist
-yet. See `CLOUD_ARCHITECTURE.md` §9 for current status.
+There is no coverage for Mosquitto ACLs or TLS — neither exists yet. See
+`CLOUD_ARCHITECTURE.md` §9 for current status.
 
-MediaMTX auth is covered, but only for the paths the *hub* serves. Nothing yet checks
-the app tier against them: the app still publishes to the retired `annot` path and
-reads `drone`, and is rewired in the orchestrator step.
+Nothing checks the **app tier** against any of this. The app still reads `drone` and
+publishes to `annot`, neither of which exists any more, and it does not yet consume the
+`FLIGHT_ID` / `PUBLISHER_TOKEN` / stream paths the orchestrator injects. Every test here
+uses a stub in its place.
+
+The **recording upload path** has still never run — the hook that triggers it could not
+execute until the `-ffmpeg` image tag landed, so nothing downstream of it is exercised.

@@ -1,0 +1,6 @@
+docker==7.1.0
+fastapi==0.115.12
+httpx==0.28.1
+# FastAPI's Form(...) needs this: MediaMTX's hooks post form-encoded bodies, not JSON.
+python-multipart==0.0.20
+uvicorn==0.34.2

@@ -128,9 +128,9 @@ topology and the security model agree.
 
 Managed Kubernetes also brings cert-manager, which closes the TLS item still open in §9.
 
-#### Build the orchestrator against an interface, not a cluster
+#### Build the orchestrator against an interface, not a cluster **[built]**
 
-The orchestrator should target a two-method abstraction:
+The orchestrator targets a two-method abstraction:
 
 ```python
 class FlightRuntime(Protocol):
@@ -138,16 +138,16 @@ class FlightRuntime(Protocol):
     def stop(self, handle: str) -> None: ...
 ```
 
-Implement the **Docker backend first** — roughly 100 lines against the Docker API, runnable
-on a laptop. That unblocks the whole flight lifecycle (stream live → hook → container →
-alerts → stream stops → container gone) with no cloud account involved. The Kubernetes
-backend (create Job, delete Job) is a comparable amount of code and lands at deployment
-time.
+The **Docker backend** is built and tested — `DockerFlightRuntime`, runnable on a laptop
+against `/var/run/docker.sock`. It unblocked the whole flight lifecycle (stream live →
+hook → container → stream stops → container gone) with no cloud account involved. The
+Kubernetes backend (create Job, delete Job) is a comparable amount of code and lands at
+deployment time.
 
-This is not indecision. The orchestrator's hard part is lifecycle logic — resolving the
-stream key, creating the flight, injecting tokens, handling a stream that drops and
-reconnects — and none of it is platform-specific. Coupling that work to a cluster that does
-not exist yet would block it behind an infrastructure decision.
+This was not indecision, and the split held up: the orchestrator's hard part turned out
+to be exactly the lifecycle logic — reconnects, duplicate hooks, failed starts — none of
+which is platform-specific, and all of which is tested against a fake runtime with no
+container daemon in sight.
 
 ---
 
@@ -248,7 +248,7 @@ letting anyone with read access inject alerts into it.
 | db-writer | Shared, replicated on load | Stateless per request; bcrypt user auth | **[built]** |
 | Redis | Shared | Channel per flight (`flight:{id}`) | **[built]** |
 | Recorder | Shared | Per-tenant upload prefix | **[open]** |
-| Orchestrator | Shared | Spawns/stops app containers | **[designed]** |
+| Orchestrator | Shared | Spawns/stops app containers | **[built]** |
 | Portal | Shared | Session cookie → user | **[open]** |
 
 A single MediaMTX serves every drone publishing and every viewer watching; a single
@@ -376,6 +376,27 @@ learns whether it was authorised.
 including aborted and retried ones. Spawning GPU containers from it would spawn them for
 drones that never stream. The spawn belongs on `runOnAvailable`.
 
+#### The image tag is load-bearing **[built]**
+
+The stack must run **`bluenviron/mediamtx:latest-ffmpeg`**, and not for ffmpeg.
+
+The default image contains three files — the binary, a config and a licence. No shell,
+no `wget`. MediaMTX execs `runOn*` commands directly rather than through a shell, so on
+that image every hook fails with:
+
+```text
+runOnAvailable command exited: exec: "wget": executable file not found in $PATH
+```
+
+MediaMTX logs that at INF and carries on. **This is why recordings were never uploaded:**
+`runOnRecordSegmentComplete` has been pointing at the recorder sidecar since it was
+written and has never once fired. The `-ffmpeg` tag is Alpine based and supplies busybox
+`wget`, which posts `application/x-www-form-urlencoded` — the encoding the orchestrator's
+`Form(...)` endpoints expect.
+
+The same constraint rules out shell syntax in any hook: no pipes, no `&&`, no redirects.
+`-O /dev/null` is an argument, which is why it works.
+
 ### Mosquitto **[designed]**
 
 Currently `allow_anonymous true` with no ACLs — every client can read every topic. MQTT has
@@ -408,7 +429,7 @@ the schema would say which one was authoritative.
 | --- | --- | --- |
 | `users` | `user_id` PK, `email`, `password` (bcrypt) | **[built]** |
 | `streams` | `stream_id` PK, `user_id` FK, `stream_key` unique, `label`, `revoked_at` | **[built]** |
-| `flights` | `flight_id` PK, `stream_id` FK (NOT NULL), `public_uuid` unique, `output_url` | **[built]** |
+| `flights` | `flight_id` PK, `stream_id` FK (NOT NULL), `public_uuid` unique, `output_url`, `end_time` | **[built]** |
 | `alerts` | `alert_id` PK, `flight_id` FK, JPEG, dimensions, timestamps | **[built]** |
 
 `flight` is the tenancy unit throughout — it scopes alert rows, WebSocket delivery, Redis
@@ -428,6 +449,12 @@ history and leave dead ones behind after every rotation.
 derived from `flight_id`: the sequential PK would make every tenant's output path
 enumerable, and read authorization is the only thing standing in front of it.
 
+`end_time` is stamped when the orchestrator tears the flight down, and never overwritten
+once set — a stream that drops and reconnects can deliver a late teardown for a flight
+that already closed, and the first timestamp is the true one. NULL means "still in the
+air", which is also what it means for a flight whose orchestrator died before it could
+close, so it is **not** a liveness signal.
+
 **Rebuilding:** `db_writer/rebuild_schema.py --drop` drops and recreates everything,
 optionally seeding a user and one stream slot. It is destructive by design and was
 written while the database held only test data; once there is real data in it, changes
@@ -436,29 +463,51 @@ existing ones.
 
 ---
 
-## 6. Flight lifecycle **[designed]**
+## 6. Flight lifecycle
 
-1. User registers on the portal → row in `users`.
+Steps 3–5 and 8 are **[built]**; 1–2 wait on the portal, and 6 waits on the app tier.
+
+1. User registers on the portal → row in `users`. **[open]**
 2. User adds a stream → row in `streams` with a generated `stream_key`, shown once. The
-   portal offers rotate and retire.
+   portal offers rotate and retire. **[open]**
 3. Operator types `rtmps://ingest.<host>:1936/in/<key>` into the controller.
 4. Publisher connects. MediaMTX POSTs `{action: "publish", path: "in/<key>"}` to db-writer,
    which resolves the key and checks `revoked_at IS NULL` → 200.
-5. Stream goes live. `runOnAvailable` fires with `$G1` = the key. The orchestrator resolves
-   key → stream → user, **creates the flight row**, and spawns the GPU container with
-   `flight_id`, ingest path, output path and publisher token injected as environment.
-6. App reads `in/<key>`, publishes annotated video to `out/<flight_uuid>`, POSTs alerts to
-   ws-server and db-writer.
+5. Stream goes live. `runOnAvailable` fires with `$G1` = the key. The orchestrator calls
+   db-writer's `/flight/open`, which **creates the flight row** and mints a publisher
+   token, then spawns the container with `flight_id`, ingest path, output path and token
+   injected as environment.
+6. App reads `in/<key>`, publishes annotated video to `out/<public_uuid>`, POSTs alerts to
+   ws-server and db-writer. **[the app does not yet read these paths — see §9]**
 7. Viewer opens the portal, receives a JWT scoped to that flight, and presents it for the
    WebRTC/HLS read and the WebSocket connection alike. MediaMTX validates it through the
    same auth endpoint with `action: "read"`.
-8. Publisher disconnects. `runOnUnavailable` → container stopped, flight closed, final
-   recording segment flushed and uploaded.
+8. Publisher disconnects. `runOnUnavailable` → container stopped, `end_time` stamped.
 
-**The app container never sees end-user credentials.** In the current code it calls
-`/session/start` with the user's email and password — placing end-user credentials inside a
-GPU container. Under this flow the orchestrator creates the flight and injects the result,
-which also removes the "DB session start failed → abort the run" coupling.
+**The app container never sees end-user credentials.** It used to call `/session/start`
+with the user's email and password, putting a reusable account credential inside a
+container that processes untrusted video. The orchestrator now opens the flight and
+injects only the result — which also removes the "DB session start failed → abort the
+run" coupling, since the app no longer authenticates anyone.
+
+### A dropped stream is not usually a finished flight **[built]**
+
+MediaMTX fires `runOnUnavailable` the instant a publisher disconnects, and it reports a
+momentary radio glitch exactly the way it reports a landing. Tearing down immediately
+would mean a cold GPU start — model weights reloaded from disk — for a blip.
+
+Teardown is therefore deferred by `RECONNECT_GRACE_S` (default 30 s) and cancelled if the
+same key comes back. Reconnecting inside the window keeps the same flight, the same
+container and the same `flight_id`; reconnecting after it is a new flight, which is the
+honest description of what happened.
+
+Both hooks can fire more than once and can interleave, so every operation on one stream
+key serialises behind its own lock — per key, not global, so two tenants taking off at
+the same moment do not queue behind each other's container start. Both entry points are
+idempotent.
+
+If the container fails to start, the flight row is closed immediately rather than left
+looking live forever.
 
 ---
 
@@ -561,6 +610,15 @@ db-writer, Redis, the recorder, and the orchestrator.
   session-close endpoints now require one, as does ws-server's alert endpoint. Verified
   by 17 tests across both implementations: scope separation both ways, cross-flight
   replay, forged signatures, expiry, malformed and scopeless tokens.
+- **Flight lifecycle end to end** (§6). The orchestrator, its Docker backend, db-writer's
+  `/flight/open` and `/flight/{id}/close`, and MediaMTX's availability hooks. Verified by
+  39 assertions on the event logic against fakes — duplicate hooks, reconnect inside and
+  outside the grace window, revoked keys, a container that fails to start, shutdown with
+  a teardown pending — and 21 end-to-end with real MediaMTX hooks, a real Docker daemon
+  and real PostgreSQL: ffmpeg starts publishing and a container appears carrying the
+  flight's paths and token and **no** end-user credentials; the publisher drops and
+  returns and the same container survives; it lands and the container is gone with
+  `end_time` stamped; a revoked key spawns nothing.
 - **Redis reconnect and outage recovery** (§4). 3/3 on fast restart, 7/7 on a sustained
   outage: automatic resubscribe, viewer never reconnects, publishes fail loudly while down,
   no replay afterwards.
@@ -583,6 +641,16 @@ work that has yet to start.
   the first half of the orchestrator step, not a separate task.
 - **Mosquitto is still `allow_anonymous true`.** Telemetry is now the only unauthenticated
   channel in the system.
+- **Recordings have never been uploaded.** `runOnRecordSegmentComplete` has pointed at
+  the recorder sidecar since it was written, but the MediaMTX image had no `wget` for it
+  to run, so the hook failed silently on every segment. Fixed by the `-ffmpeg` image tag;
+  the upload path itself has still never executed and is therefore untested.
+- **The orchestrator holds the Docker socket.** Anything that can reach its port can
+  start containers on the host. Its port is internal-only, but this is the strongest
+  argument for the Kubernetes backend, where the equivalent is a scoped service account.
+- **Flight state is in orchestrator memory.** If it restarts, running containers are
+  orphaned and their flight rows stay open. Recovering by relabelling from
+  `agrarian.flight_id` is straightforward and not yet done.
 
 ### Built but not yet wired to anything
 
@@ -602,9 +670,13 @@ MediaMTX auth hook is their first real consumer.
 ### Designed, not built
 
 - Mosquitto ACLs and dynamic credentials
-- Orchestrator (spawn/teardown on stream lifecycle), and with it the app tier's move to
-  `in/<key>` and `out/<public_uuid>`
-- Removal of end-user credentials from the app container
+- **The app tier's move to `in/<key>` and `out/<public_uuid>`.** The orchestrator already
+  injects `FLIGHT_ID`, `PUBLISHER_TOKEN` and both paths; the app has to consume them
+  instead of calling `/session/start` with an email and password. One real obstacle:
+  `AppSettings` discards stream credentials unless the protocol is `rtmps`/`rtsps`
+  (`app_settings.py`), so on plain RTSP there is currently nowhere to put the publisher
+  token the ingest read now requires.
+- Kubernetes `FlightRuntime` backend (create Job, delete Job)
 
 ### Open
 

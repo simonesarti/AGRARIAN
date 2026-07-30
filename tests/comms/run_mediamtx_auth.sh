@@ -93,7 +93,7 @@ docker run -d --name db-writer --network "$NET" -p 18002:8000 "${ENVV[@]}" "$IMA
 docker run -d --name mtxa-mediamtx --network "$NET" \
   -p 11935:1935 -p 18888:8888 \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
-  bluenviron/mediamtx:latest >/dev/null \
+  bluenviron/mediamtx:latest-ffmpeg >/dev/null \
   || { echo "mediamtx failed to start (is a previous run still holding 11935/18888?)"; exit 1; }
 sleep 6
 
