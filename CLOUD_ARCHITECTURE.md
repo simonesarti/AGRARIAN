@@ -37,13 +37,34 @@ architecture and the one most likely to be misread.
 
 ### The communication hub — scales on load
 
-MediaMTX, Mosquitto, ws-server, db-writer, Redis and the recorder are **shared,
-multi-tenant services**. One deployment serves every user. Replicas are added when
-load demands it, not when a user signs up.
+MediaMTX, Mosquitto, ws-server, db-writer, Redis, the recorder and the portal are
+**shared, multi-tenant services**. One deployment serves every user. Replicas are added
+when load demands it, not when a user signs up.
 
 These are I/O-bound and cheap. Running a private copy per user would waste an order of
 magnitude of resource and multiply the operational surface (certificates, DNS entries,
 health checks, upgrades) by the user count.
+
+#### Data plane and control plane
+
+The hub divides again, and the split is worth naming because it decides what is worth
+being woken up for:
+
+```text
+data plane     in the path of every frame        MediaMTX, Mosquitto, ws-server,
+                                                 Redis, recorder
+control plane  in the path of decisions          db-writer, orchestrator, portal
+```
+
+**Nothing stops flying when the control plane is down.** Drones keep publishing,
+containers keep processing, recordings keep uploading, and a viewer already holding a
+token keeps watching. What breaks is signing up, adding a stream, opening or closing a
+flight, and issuing a *new* viewer token.
+
+db-writer is on both lists, and that is the whole reason its replica count is an open
+question (§9): `/auth/mediamtx` sits on the critical path of every publish and every
+read, while `/streams` does not. Sizing follows the auth endpoint; the portal's routes
+ride along on capacity that already had to exist.
 
 ### The application — scales by concurrent flight
 
@@ -77,14 +98,21 @@ explicitly, and every shared component needs a tenancy story. Section 4 is that 
   drone D ─┘      │  ws-server  (N replicas)   │───▶│ app: flight C    │ GPU
                   │  db-writer  (N replicas)   │───▶│ app: flight D    │ GPU
   viewers ───────▶│  Redis, recorder           │    └──────────────────┘
-                  └────────────────────────────┘      one per ACTIVE flight,
-                    replicas follow LOAD,              created when the stream
-                    never user count                   starts, destroyed when
-                                                       it stops
+                  │                            │
+  account  ──────▶│  portal     (N replicas)   │      one per ACTIVE flight,
+  holders         └────────────────────────────┘      created when the stream
+                      replicas follow LOAD,           starts, destroyed when
+                      never user count                it stops
 ```
 
 One MediaMTX handles all four publishers. One Mosquitto handles all four telemetry feeds.
 Only the GPU tier multiplies with flights.
+
+The portal sits in the hub rather than the app tier, and the reason is sharper than
+"it is I/O-bound". The app tier's entire economic argument is that it **scales to zero
+when nothing is flying** — but that is exactly when people register, add stream slots and
+rotate keys. A drone flies at 10am; the account was created at 11pm the night before.
+An app-tier portal would exist only while a drone was airborne, which inverts its purpose.
 
 ### Platform: Kubernetes **[designed]**
 
@@ -153,7 +181,7 @@ container daemon in sight.
 
 ## 3. Identity and credentials
 
-Three credential types, one per class of client. They differ because the constraints on
+Four credential types, one per class of client. They differ because the constraints on
 the party presenting them differ — this is deliberate, not inconsistency.
 
 | Channel | Credential | Lifetime | Why this form |
@@ -161,6 +189,12 @@ the party presenting them differ — this is deliberate, not inconsistency.
 | Publisher → MediaMTX | **Stream key** | Until revoked | Typed by hand into a controller before each flight; must be short |
 | Browser → WebRTC / HLS / WebSocket | **JWT** | Hours | Carried by software; length is free, expiry is free |
 | App container → hub | **Injected token** | Container lifetime | Never touched by a human |
+| Browser → portal | **Session token** | Hours | Stands in for a password across many clicks, so the password is presented once and never stored |
+
+The first three all answer a question about a **thing** — this drone may publish here,
+this container may write to flight 7, this browser tab may watch flight 7. None of them
+answers *"this person owns account 3"*, which is the only question the portal ever asks.
+That gap is why a fourth type exists rather than reusing the viewer token.
 
 ### Stream keys **[built]**
 
@@ -230,6 +264,44 @@ claim** (`view` / `publish`) that is checked on every path. That check is load-b
 without it a viewer token would be a valid publisher token for the flight being watched,
 letting anyone with read access inject alerts into it.
 
+### Session tokens **[designed]**
+
+The portal's credential, and the third value of the same `scope` claim: `session`. Where
+a viewer token says *"bearer may watch flight 7"*, a session token says *"bearer is user
+3"* — one field different, the same HS256 signature over the same `SESSION_JWT_SECRET`,
+validated offline by any replica exactly as viewer tokens already are. **No new
+infrastructure; one new scope value.**
+
+The password is presented once at login, exchanged for this token, and never seen again.
+That is not a stylistic preference. `/viewer/token` currently takes email and password
+in the body of every request, which is fine for a one-shot call and unusable for a
+portal, where a user clicks around for twenty minutes: the password would have to be
+kept somewhere for the whole session. §6 already tells this story about the app
+container — it used to carry the operator's email and password, and the fix was to inject
+a scoped token instead. Building the portal on the `/viewer/token` pattern would put the
+same reusable password back, this time in the one tier that faces the public internet.
+
+**The `user_id` must come from the token, never from the URL.**
+`UserDirectory.revoke_stream(stream_id, user_id)` already refuses cross-user access, but
+that check is only worth anything if `user_id` is trustworthy. Taken from a path
+parameter it is a guess; taken from a signed claim it is a fact. This is the same rule
+the viewer token follows: *no identifier in this system is ever a credential.*
+
+The two browser-held credentials get deliberately different exposure, because they are
+worth different amounts:
+
+| Token | Where it lives | Why |
+| --- | --- | --- |
+| **Session** | `httpOnly` cookie | Browser JavaScript cannot read it, so an XSS bug in the front-end cannot steal the credential that controls the whole account |
+| **Viewer** | readable by JS | It *must* be — JS puts it in a WebSocket query string and an `Authorization` header. Flight-scoped and hours-long, so it is designed to be exposed |
+
+### Registration is open **[designed]**
+
+Anyone may create an account. The consequence to keep in view: an account can mint stream
+keys, and a stream key is the thing that causes a GPU container to be created. Open
+registration therefore connects an anonymous signup to GPU spend, and the limit on that
+is **concurrent flights per user**, which nothing enforces yet — see §9.
+
 ---
 
 ## 4. Component tenancy
@@ -250,7 +322,7 @@ letting anyone with read access inject alerts into it.
 | Redis | Shared | Channel per flight (`flight:{id}`) | **[built]** |
 | Recorder | Shared | Segment → flight_id resolved via `recordings` table | upload **[built]**, per-tenant prefix **[open]** |
 | Orchestrator | Shared | Spawns/stops app containers | **[built]** |
-| Portal | Shared | Session cookie → user | **[open]** |
+| Portal | Shared, replicated on load | Session token → `user_id`, read from the claim not the URL | **[designed]** |
 
 A single MediaMTX serves every drone publishing and every viewer watching; a single
 Mosquitto carries every publisher's telemetry. They are separated by path regex, credentials
@@ -426,6 +498,57 @@ reuses its existing publisher token to subscribe, the same token already authori
 video ingest read, the annotated-output publish, and writing alerts. See §9 for what was
 verified and the caveat that the upstream plugin project is now archived.
 
+### Portal **[designed]**
+
+"The portal" is two things that land in different places, and conflating them is the
+easiest way to get this wrong:
+
+| Half | What it is | Where it goes |
+| --- | --- | --- |
+| **User API** — register, login, list/add/rotate/revoke streams, issue viewer token | HTTP over the `users` and `streams` tables | **db-writer.** New routes on an existing service, not a new one |
+| **Web front-end** — the pages a human clicks | HTML/JS, holds the session cookie | **A new hub service.** This is the only genuinely new deployment |
+
+The API half belongs in db-writer because db-writer already owns that schema.
+`UserDirectory.create_stream` / `list_streams` / `revoke_stream` / `rotate_stream_key`
+are already there and already refuse cross-user access; they have simply never had an
+HTTP route. A second service writing the same tables would give two authorities over one
+schema with nothing to say which is right — the objection §5 uses to keep `user_id` off
+the `flights` table, applied to services instead of columns.
+
+`create_user` does **not** exist in any form. The only code that has ever created a user
+is `rebuild_schema.py --seed-user`, which is the destructive rebuild script, so
+lifecycle step 1 has no backend at all today.
+
+#### The browser never reaches db-writer
+
+§8 requires db-writer to be unroutable from outside. The portal is what preserves that:
+
+```text
+browser ──HTTPS──▶ portal ──private network──▶ db-writer
+        session cookie          internal HTTP
+```
+
+The portal is the only new thing on the public internet; db-writer's exposure is
+unchanged. This is also what makes the `httpOnly` session cookie possible — a token the
+browser holds but cannot read is only useful if something server-side reads it, and that
+something is the portal.
+
+#### It must be stateless, for a reason already learned once
+
+The session lives in the signed cookie, **not in portal memory**. Any replica can then
+serve any request by validating a signature offline, exactly as ws-server validates
+viewer tokens (§3).
+
+The failure mode being avoided is one this system has already hit: in-memory sessions
+mean user 3's session exists on replica 1 and replica 2 has never heard of them — which
+is precisely the defect §4 describes in ws-server, "horizontal replicas cannot share an
+in-memory client set". That one needed Redis to fix. This one needs nothing, because a
+signed cookie carries its own state, and **it stays that way only if no server-side
+session store is ever introduced.**
+
+Load will be the lowest in the hub — clicks, not frames — so replicas are about not
+being a single point of failure rather than capacity.
+
 ---
 
 ## 5. Data model
@@ -491,9 +614,12 @@ Steps 3–6 and 8 are **[built]**; 1–2 wait on the portal. Step 6 is verified 
 `health_monitoring` mode; `danger_detection` mode still needs a TensorRT engine for the
 target GPU — see §9.
 
-1. User registers on the portal → row in `users`. **[open]**
+1. User registers on the portal → row in `users`, and logs in for a session token.
+   Registration is open to anyone. **[designed]** — needs `UserDirectory.create_user`,
+   which does not exist yet.
 2. User adds a stream → row in `streams` with a generated `stream_key`, shown once. The
-   portal offers rotate and retire. **[open]**
+   portal offers rotate and retire. **[designed]** — the `UserDirectory` methods exist
+   and are tested; nothing exposes them over HTTP.
 3. Operator types `rtmps://ingest.<host>:1936/in/<key>` into the controller.
 4. Publisher connects. MediaMTX POSTs `{action: "publish", path: "in/<key>"}` to db-writer,
    which resolves the key and checks `revoked_at IS NULL` → 200.
@@ -545,6 +671,8 @@ looking live forever.
 | Publisher → MediaMTX | Public internet | RTMPS/RTSPS; stream key; **plain RTMP retained only for drones without TLS support** |
 | Telemetry → Mosquitto | Public internet | MQTTS; per-stream credentials + topic ACLs; plain MQTT as the same narrow fallback |
 | Browser → hub | Public internet | HTTPS/WSS at the reverse proxy; per-flight JWT |
+| Browser → portal | Public internet | HTTPS; session token in an `httpOnly` cookie |
+| Portal → db-writer | Private | Internal HTTP; the browser never crosses this hop |
 | App ↔ hub | Cloud virtual network | Not separately encrypted — see below |
 | Hub → database | Private | Worker credentials, least privilege |
 
@@ -573,6 +701,12 @@ refuses to start rather than defaulting to something permissive. Generated with
 `openssl rand -hex 32`. `.env` is gitignored; `.env.example` documents every variable
 without values.
 
+**The portal does not get this secret.** It mints nothing and validates nothing: it holds
+the session cookie, forwards its value to db-writer, and lets db-writer answer 401 if the
+token is bad. That keeps the signing key of every credential in the system out of the one
+tier facing the public internet — worth the extra hop, since a portal that validated
+locally would have to hold the secret that also signs publisher tokens.
+
 There is **no pre-shared publisher secret**. App containers receive a token scoped to
 their own flight when the flight opens, so no long-lived credential is distributed to the
 GPU tier at all.
@@ -592,10 +726,15 @@ Externally reachable:
 | 8889 | WebRTC / WHEP signalling | Traefik |
 | 8189/udp | WebRTC media | End-to-end DTLS-SRTP — **must not be proxied** |
 | 1883 / 8883 | MQTT (fallback) / MQTTS | Mosquitto |
-| 443 | HTTPS + WSS | Traefik |
+| 443 | HTTPS + WSS — includes the portal | Traefik |
 
 Internal only — **must never be routed from outside**: ws-server's alert-write API port,
 db-writer, Redis, the recorder, and the orchestrator.
+
+The portal is the only *new* service on the public side, and it is what keeps db-writer
+off it: the browser talks to the portal, the portal talks to db-writer over the private
+network (§4). Routing db-writer's user-facing endpoints directly to the browser would be
+simpler by one hop and would break this line.
 
 > - **[built]** The port constants in `app/shared/processes/constants.py` are corrected.
 >   `RTMPS_PORT` and `RTSPS_PORT` now carry MediaMTX's actual defaults (1936, 8322)
@@ -772,7 +911,8 @@ they change nothing about how the system currently behaves.
 
 - `UserDirectory.create_stream` / `list_streams` / `revoke_stream` / `rotate_stream_key`,
   with cross-user access refused — these are the portal's operations, and there is no
-  portal
+  portal. They need no rewrite, only an HTTP route that passes `user_id` from a verified
+  session claim rather than from the request (§3).
 - `db_writer/rebuild_schema.py` — destructive drop/create plus optional seeding
 
 `streams`, `stream_key`, `flights.stream_id`, `flights.public_uuid`,
@@ -784,10 +924,25 @@ this list — it is set inside `open_flight_for_key` the moment a flight opens, 
 ### Designed, not built
 
 - Kubernetes `FlightRuntime` backend (create Job, delete Job)
+- **Portal** (§3 session tokens, §4 Portal). The shape is decided — a `session` scope on
+  the existing JWT mechanism, user-facing routes on db-writer, a stateless front-end
+  service holding an `httpOnly` cookie, and the browser never reaching db-writer
+  directly. In order:
+  1. `UserDirectory.create_user` — the `User` model already hashes with bcrypt
+  2. `POST /register`, `POST /login` on db-writer → session token
+  3. Stream CRUD routes taking `user_id` from the claim, wrapping methods that exist
+  4. `/viewer/token` accepts a session token instead of email and password
+  5. The front-end itself
+
+  Steps 1–4 are db-writer work and are what the front-end waits on.
 
 ### Open
 
-- Portal (registration, stream slot CRUD, key rotation, viewer token issuance)
+- **No cap on concurrent flights per user.** Registration is open (§3) and a stream key
+  is what causes a GPU container to exist, so an anonymous signup can currently reach
+  GPU spend with nothing between the two. Not urgent while the deployment is a single
+  laptop, and load-bearing the moment the Kubernetes GPU node pool in §2 can create
+  machines on demand.
 - Recorder per-tenant upload prefixes
 - TLS certificate issue and renewal
 - **Auth-endpoint caching and db-writer replica count.** Every publish and every read
