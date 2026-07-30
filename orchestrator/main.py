@@ -78,10 +78,14 @@ _orchestrator = FlightOrchestrator(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Runs before uvicorn starts accepting connections, so a stream-online/offline
+    # hook can never race the containers this reattaches to _flights.
+    await _orchestrator.recover()
     logger.info(
         f"orchestrator ready — image={_APP_IMAGE} network={_APP_NETWORK} "
         f"gpus={_APP_GPUS or 'none'} grace={_GRACE_S}s "
-        f"forwarded settings={sorted(_BASE_ENV)}"
+        f"forwarded settings={sorted(_BASE_ENV)} "
+        f"recovered flights={_orchestrator.active}"
     )
     yield
     # Every flight container is a child of this service's bookkeeping, not of the

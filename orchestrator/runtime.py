@@ -31,6 +31,17 @@ class FlightRuntime(Protocol):
         """Tear down whatever start() created. Must tolerate an already-gone handle."""
         ...
 
+    def list_managed(self) -> list:
+        """
+        Every container this runtime has ever started for a flight, running or not.
+
+        Used once at startup to recover bookkeeping a crash lost: the label and the
+        environment start() set are the only state that survives the orchestrator's
+        own process dying without a chance to run its shutdown hook. Each entry is
+        {"handle": str, "running": bool, "env": dict}.
+        """
+        ...
+
 
 class DockerFlightRuntime:
     """
@@ -117,6 +128,24 @@ class DockerFlightRuntime:
                 container.remove(force=True)
             except Exception as e:
                 logger.warning(f"Could not remove container {handle[:12]}: {e}")
+
+    def list_managed(self) -> list:
+        # sparse=False (the default) is load-bearing: it makes docker-py inspect
+        # each container, which is what puts Config.Env — the only place
+        # PUBLISHER_TOKEN and the stream paths survive a restart — into .attrs.
+        # The plain list API this filters does not include it.
+        containers = self._client.containers.list(all=True, filters={"label": "agrarian.flight_id"})
+        managed = []
+        for container in containers:
+            env = dict(
+                item.split("=", 1) for item in container.attrs["Config"]["Env"] if "=" in item
+            )
+            managed.append({
+                "handle": container.id,
+                "running": container.status == "running",
+                "env": env,
+            })
+        return managed
 
     def _remove_if_present(self, name: str) -> None:
         import docker.errors

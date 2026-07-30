@@ -226,3 +226,60 @@ class FlightOrchestrator:
                 flight.teardown.cancel()
                 flight.teardown = None
             await self._teardown(stream_key, flight)
+
+    # ── Recovery ──────────────────────────────────────────────────────────────
+
+    async def recover(self) -> None:
+        """
+        Rebuild `_flights` from Docker after a restart. Called once at startup,
+        before the HTTP server accepts requests, so no online/offline hook can
+        race it.
+
+        Flight state normally lives only in this process's memory, and shutdown()
+        above is what closes it out cleanly — but that only runs on a graceful
+        stop. Anything that skips it (a crash, an OOM kill, `docker kill`, the
+        host rebooting) leaves containers running with nothing tracking them:
+        the next offline hook for that stream finds no flight and does nothing,
+        so the container runs forever and its flight row never gets an end_time.
+
+        The fix needs no database: PUBLISHER_TOKEN and the stream paths this
+        orchestrator itself injected at start() are still sitting in the
+        container's environment, which is the one piece of state a restart
+        cannot lose. A still-running container IS the flight still being
+        active; one that already exited is closed out here instead of by a
+        teardown that is never coming.
+        """
+        for entry in await asyncio.to_thread(self._runtime.list_managed):
+            env = entry["env"]
+            flight_id = env.get("FLIGHT_ID")
+            publisher_token = env.get("PUBLISHER_TOKEN")
+            ingest_path = env.get("VIDEO_STREAM_READER_STREAM_KEY", "")
+            output_path = env.get("VIDEO_OUT_STREAM_STREAM_KEY", "")
+            stream_key = ingest_path.split("/", 1)[-1] if "/" in ingest_path else ""
+            public_uuid = output_path.split("/", 1)[-1] if "/" in output_path else ""
+
+            if not (flight_id and publisher_token and stream_key and public_uuid):
+                logger.error(
+                    f"Container {entry['handle'][:12]} carries the agrarian.flight_id "
+                    "label but incomplete flight env; leaving it alone"
+                )
+                continue
+
+            if entry["running"]:
+                self._flights[stream_key] = Flight(
+                    flight_id=int(flight_id),
+                    public_uuid=public_uuid,
+                    handle=entry["handle"],
+                    publisher_token=publisher_token,
+                )
+                logger.info(
+                    f"Recovered flight {flight_id} for stream {stream_key[:6]}… "
+                    "(container was still running)"
+                )
+            else:
+                logger.info(
+                    f"Flight {flight_id}'s container exited while the orchestrator "
+                    "was down; closing it now"
+                )
+                await self._directory.close_flight(int(flight_id), publisher_token)
+                await asyncio.to_thread(self._runtime.stop, entry["handle"])

@@ -691,6 +691,28 @@ db-writer, Redis, the recorder, and the orchestrator.
   published. The upstream plugin project is archived (no longer maintained) as of
   mid-2025; it still works and is pinned to a specific image tag, but has no
   security-patch path if a CVE surfaces.
+- **Orchestrator restart recovery.** Flight state lived only in orchestrator memory;
+  a crash or a forced kill — anything that skips the graceful-shutdown hook, which is
+  what an OOM kill, `docker kill`, or the host rebooting all do — left running flight
+  containers orphaned (never torn down, using GPU forever) and their flight rows open
+  forever (no teardown was ever coming to close them). Recovery needs no database:
+  `PUBLISHER_TOKEN` and the stream paths the orchestrator itself injected at
+  container-start time are still sitting in the container's own environment, the one
+  piece of state a restart cannot lose, so `FlightOrchestrator.recover()` reads them
+  back via the `agrarian.flight_id` Docker label instead. It runs before the HTTP
+  server accepts its first request, so no online/offline hook can race it. A container
+  still running is reattached and behaves exactly like any other live flight from then
+  on; one that already exited while nothing was watching is closed out and removed by
+  recovery itself, since no offline hook will ever arrive for it. Verified by 9 new
+  assertions on `FlightOrchestrator.recover()` against a fake runtime (reattachment,
+  closing an already-exited container, skipping a container with incomplete env rather
+  than guessing, no duplicate spawn) and 13 end-to-end (`run_orchestrator_recovery.sh`):
+  two real flights running, the real orchestrator container `docker kill`ed (not
+  stopped — no graceful shutdown runs), one flight's container separately stopped
+  while the orchestrator is down, a fresh orchestrator started, and confirmation that
+  the still-running flight is tracked again with no duplicate container while the
+  exited one is closed in PostgreSQL and removed — then the recovered flight lands
+  normally afterwards, same as any flight the orchestrator opened itself.
 
 Distinct from the section below: these are live weaknesses on this branch right now, not
 work that has yet to start.
@@ -703,9 +725,6 @@ work that has yet to start.
 - **The orchestrator holds the Docker socket.** Anything that can reach its port can
   start containers on the host. Its port is internal-only, but this is the strongest
   argument for the Kubernetes backend, where the equivalent is a scoped service account.
-- **Flight state is in orchestrator memory.** If it restarts, running containers are
-  orphaned and their flight rows stay open. Recovering by relabelling from
-  `agrarian.flight_id` is straightforward and not yet done.
 
 ### Built but not yet wired to anything
 

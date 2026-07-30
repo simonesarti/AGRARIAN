@@ -36,12 +36,13 @@ DEAD_KEY = "dddddddddddddddd"
 
 
 class FakeRuntime:
-    def __init__(self, fail_on=None):
+    def __init__(self, fail_on=None, managed=None):
         self.started = []     # (flight_id, env)
         self.stopped = []     # handles
         self.running = set()
         self._fail_on = fail_on or set()
         self._n = 0
+        self._managed = managed or []
 
     def start(self, flight_id, env):
         if flight_id in self._fail_on:
@@ -55,6 +56,9 @@ class FakeRuntime:
     def stop(self, handle):
         self.stopped.append(handle)
         self.running.discard(handle)
+
+    def list_managed(self):
+        return self._managed
 
 
 class FakeDirectory:
@@ -85,8 +89,8 @@ class FakeDirectory:
         return True
 
 
-def make(grace=0.15, fail_on=None, base_env=None):
-    rt = FakeRuntime(fail_on=fail_on)
+def make(grace=0.15, fail_on=None, base_env=None, managed=None):
+    rt = FakeRuntime(fail_on=fail_on, managed=managed)
     d = FakeDirectory()
     return rt, d, FlightOrchestrator(rt, d, base_env or {}, grace)
 
@@ -225,6 +229,58 @@ async def scenarios():
     await o.shutdown()
     check("shutdown during a pending teardown still stops the container",
           len(rt.stopped) == 1 and len(rt.running) == 0)
+
+    # ── Recovery: bookkeeping lost to a crash, rebuilt from the containers ──────
+
+    def env_for(flight_id, stream_key, uuid, token):
+        return {
+            "FLIGHT_ID": str(flight_id), "PUBLISHER_TOKEN": token,
+            "VIDEO_STREAM_READER_STREAM_KEY": f"in/{stream_key}",
+            "VIDEO_OUT_STREAM_STREAM_KEY": f"out/{uuid}",
+        }
+
+    # A container still running is recovered as a live flight, keyed correctly.
+    managed = [{"handle": "h-1", "running": True,
+                "env": env_for(1, KEY_A, "uuid-1", "tok-1")}]
+    rt, d, o = make(managed=managed)
+    await o.recover()
+    check("a running container is recovered as an active flight", o.active == 1)
+    check("nothing was stopped or closed for a still-running recovery",
+          len(rt.stopped) == 0 and len(d.closed) == 0)
+
+    # The recovered flight behaves exactly like a freshly-opened one afterwards.
+    await o.stream_offline(KEY_A)
+    await asyncio.sleep(0.3)
+    check("a recovered flight tears down normally on the next offline hook",
+          rt.stopped == ["h-1"] and d.closed == [(1, "tok-1")] and o.active == 0)
+
+    # A container that exited while the orchestrator was down is closed out, not
+    # left with an open-ended flight row, and not tracked as active.
+    managed = [{"handle": "h-2", "running": False,
+                "env": env_for(2, KEY_B, "uuid-2", "tok-2")}]
+    rt, d, o = make(managed=managed)
+    await o.recover()
+    check("an exited container is NOT recovered as an active flight", o.active == 0)
+    check("an exited container's flight is closed", d.closed == [(2, "tok-2")])
+    check("an exited container is told to stop (cleanup/removal)", rt.stopped == ["h-2"])
+
+    # Incomplete env (e.g. a container this code never started) must not crash
+    # recovery or be guessed at — it is left alone rather than mishandled.
+    managed = [{"handle": "h-3", "running": True,
+                "env": {"FLIGHT_ID": "3"}}]  # no token, no stream paths
+    rt, d, o = make(managed=managed)
+    await o.recover()
+    check("incomplete env is skipped, not recovered", o.active == 0)
+    check("incomplete env is left alone, not stopped", rt.stopped == [])
+
+    # Multiple containers recover independently.
+    managed = [
+        {"handle": "h-4", "running": True, "env": env_for(4, KEY_A, "uuid-4", "tok-4")},
+        {"handle": "h-5", "running": True, "env": env_for(5, KEY_B, "uuid-5", "tok-5")},
+    ]
+    rt, d, o = make(managed=managed)
+    await o.recover()
+    check("two running containers both recover", o.active == 2)
 
 
 asyncio.run(scenarios())

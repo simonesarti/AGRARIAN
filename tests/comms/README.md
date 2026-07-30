@@ -28,6 +28,7 @@ try to run these directly with `python3`.
 | `run_orchestrator_real_app.sh` | the above + a GPU, `nvidia-container-toolkit`, `checkpoints/*.pt` | `./run_orchestrator_real_app.sh` |
 | `run_recording_upload.sh` | MediaMTX + recorder + db-writer + Postgres, host `ffmpeg` | `./run_recording_upload.sh` |
 | `run_mqtt_auth.sh` | mosquitto-go-auth + db-writer + Postgres | `./run_mqtt_auth.sh` |
+| `run_orchestrator_recovery.sh` | the same as `run_orchestrator.sh` | `./run_orchestrator_recovery.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
 
@@ -92,6 +93,7 @@ token signed with a 17-character wrong secret, not a real key. Expected.
 ./run_orchestrator_real_app.sh  # 7 assertions, the real GPU app, not the stub
 ./run_recording_upload.sh    # 8 assertions, real segment upload + DB traceability
 ./run_mqtt_auth.sh           # 9 assertions, real mosquitto-go-auth broker
+./run_orchestrator_recovery.sh  # 13 assertions, real crash + restart
 ```
 
 `run_mediamtx_auth.sh` needs `ffmpeg` and `curl` **on the host** and binds host ports
@@ -179,7 +181,12 @@ by an online (a radio glitch, not a landing), a reconnect after the grace window
 revoked mid-flight, a container that fails to start, and shutdown while a teardown is
 pending. Also pins the orchestrator→container env contract, including that **no**
 `DB_USERNAME`/`DB_PASSWORD` reaches a flight container and that a stray base-env value
-cannot redirect a tenant's annotated video.
+cannot redirect a tenant's annotated video. The same file also pins
+`FlightOrchestrator.recover()` against a fake runtime: a still-running container is
+reattached and behaves like any other live flight afterwards; one that already exited
+while nothing was watching is closed out in db-writer and told to stop (removal); a
+container carrying the `agrarian.flight_id` label but incomplete env is left alone
+rather than guessed at; nothing is ever spawned twice.
 
 **`run_orchestrator.sh`** — the same lifecycle with real MediaMTX hooks, a real Docker
 daemon and real PostgreSQL. The "GPU app" is a stub image that sleeps: what is under
@@ -190,6 +197,17 @@ One trap: the stub **traps SIGTERM**. A bare `sleep` as PID 1 ignores signals it
 handler for, so `docker stop` blocks for the full 20 s stop timeout on every teardown —
 which looks exactly like a hung orchestrator and cost a debugging round the first time.
 The real app installs SIGTERM/SIGINT handlers, so the stub matches it.
+
+**`run_orchestrator_recovery.sh`** — the part `test_orchestrator.py`'s fake runtime
+cannot check: that a real orchestrator process really can be killed (not stopped —
+`docker kill`, skipping the graceful-shutdown hook the same way an OOM kill or a host
+reboot would) and still lose nothing. Two real flights are live beforehand; one
+container is separately stopped while the orchestrator is down, simulating it exiting
+on its own with nobody watching. A fresh orchestrator is then started and shown to:
+track the still-running flight again with **no** duplicate container spawned, close
+the exited one out in PostgreSQL and remove it, and — the recovered flight isn't just
+present in a health-check, it still lands normally — tear it down cleanly once the
+drone actually disconnects, same as any flight the orchestrator opened itself.
 
 **`run_orchestrator_real_app.sh`** — the same lifecycle, but the container the
 orchestrator spawns is the actual GPU app image (`APP_MODE=health_monitoring`,
