@@ -242,7 +242,7 @@ letting anyone with read access inject alerts into it.
 
 | Component | Instances | Tenancy mechanism | State |
 | --- | --- | --- | --- |
-| **GPU app** | **One per active flight** | Sole occupant — no internal tenancy needed | container **[built]**, lifecycle **[built]**, paths rewired but **untested end-to-end** |
+| **GPU app** | **One per active flight** | Sole occupant — no internal tenancy needed | container **[built]**, lifecycle **[built]**, paths **[verified]** for `health_monitoring`; `danger_detection` needs a TensorRT engine |
 | MediaMTX | Shared, replicated on load | Regex paths + HTTP auth hook | **[built]** |
 | Mosquitto | Shared, replicated on load | Per-stream credentials + topic ACLs | **[designed]** |
 | ws-server | Shared, replicated on load | Per-flight JWT (view + publish scopes); Redis pub/sub fan-out | **[built]** |
@@ -471,8 +471,9 @@ existing ones.
 
 ## 6. Flight lifecycle
 
-Steps 3–5 and 8 are **[built]**; 1–2 wait on the portal. Step 6 is rewired in code but
-untested end-to-end — see §9.
+Steps 3–6 and 8 are **[built]**; 1–2 wait on the portal. Step 6 is verified for
+`health_monitoring` mode; `danger_detection` mode still needs a TensorRT engine for the
+target GPU — see §9.
 
 1. User registers on the portal → row in `users`. **[open]**
 2. User adds a stream → row in `streams` with a generated `stream_key`, shown once. The
@@ -485,8 +486,8 @@ untested end-to-end — see §9.
    token, then spawns the container with `flight_id`, ingest path, output path and token
    injected as environment.
 6. App reads `in/<key>`, publishes annotated video to `out/<public_uuid>`, POSTs alerts to
-   ws-server and db-writer. **[rewired in code, never yet run against a real GPU
-   container — see §9]**
+   ws-server and db-writer. **[verified for `health_monitoring` mode against a real GPU
+   container — see §9; `danger_detection` mode still needs a TensorRT engine]**
 7. Viewer opens the portal, receives a JWT scoped to that flight, and presents it for the
    WebRTC/HLS read and the WebSocket connection alike. MediaMTX validates it through the
    same auth endpoint with `action: "read"`.
@@ -637,25 +638,28 @@ db-writer, Redis, the recorder, and the orchestrator.
   reached the database, and 40 interleaved alerts across two concurrent flights and both
   replicas persisted with no loss and no cross-contamination. Auth held across replicas
   throughout.
+- **The real app tier, driven by the orchestrator, in `health_monitoring` mode.**
+  `run_orchestrator_real_app.sh` builds the actual GPU app image (not the sleeping stub)
+  and runs it with `--gpus all` behind the orchestrator: a live publish spawns it with
+  the injected `FLIGHT_ID`/`PUBLISHER_TOKEN`/paths, it reads `in/<key>`, runs the full
+  tracking → anomaly → interpolation → annotation pipeline on the GPU with zero
+  `CRITICAL` log lines, publishes annotated video to its own `out/<uuid>` (confirmed by
+  MediaMTX's own "is publishing to path" log line), and is torn down cleanly on landing
+  with the flight row closed. 7/7 assertions, real MediaMTX/db-writer/ws-server/Redis/
+  Postgres throughout. No alert was expected or produced: the input is an ffmpeg
+  `testsrc` pattern with no trajectories to flag. `danger_detection` mode remains
+  unverified — see the gap above.
 
 ### Known gaps in code that exists today
 
 Distinct from the section below: these are live weaknesses on this branch right now, not
 work that has yet to start.
 
-- **The app tier's rewiring to `in/<key>` / `out/<public_uuid>` has never run end to end.**
-  `AppSettings` now takes `FLIGHT_ID`/`PUBLISHER_TOKEN` and the two orchestrator-injected
-  paths instead of calling `/session/start` with an email and password, and the token
-  travels in the stream URL's query string rather than RTSP/RTMP userinfo (userinfo was
-  tried first and fails — MediaMTX challenges the client, ffmpeg answers with a digest,
-  and the auth hook never sees the JWT at all; `stream_urls.py` carries both the URL
-  builder and its `redact_stream_url()` counterpart so no code path can log one without
-  the other). This closes the obstacle that blocked it: `AppSettings` used to null out
-  stream credentials unless the protocol was `rtmps`/`rtsps`, leaving nowhere to put a
-  token on plain RTSP. The rewiring is consistent with the orchestrator's env contract
-  (`test_orchestrator.py` pins the exact variable names) but `run_orchestrator.sh` spawns
-  a stub image, not the real app, so no test has yet driven a real GPU container through
-  a real `in/<key>` read and `out/<public_uuid>` publish.
+- **`danger_detection` mode has never run end to end.** It requires a TensorRT `.engine`
+  file built for the target GPU (`segmentation.py` hardcodes `device="cuda"` with no CPU
+  fallback), and none exists yet — only `.onnx`/`.pt` checkpoints are on disk. Building
+  and verifying that engine is the remaining piece of driving the real app tier fully
+  end to end.
 - **Mosquitto is still `allow_anonymous true`.** Telemetry is now the only unauthenticated
   channel in the system.
 - **Recordings have never been uploaded.** `runOnRecordSegmentComplete` has pointed at

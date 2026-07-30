@@ -24,6 +24,7 @@ try to run these directly with `python3`.
 | `test_redis_outage.py` | same | `./run_redis_failure.sh` |
 | `run_mediamtx_auth.sh` | MediaMTX + db-writer + Postgres, host `ffmpeg` | `./run_mediamtx_auth.sh` |
 | `run_orchestrator.sh` | the above + Docker socket, host `ffmpeg` | `./run_orchestrator.sh` |
+| `run_orchestrator_real_app.sh` | the above + a GPU, `nvidia-container-toolkit`, `checkpoints/*.pt` | `./run_orchestrator_real_app.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
 
@@ -176,6 +177,16 @@ handler for, so `docker stop` blocks for the full 20 s stop timeout on every tea
 which looks exactly like a hung orchestrator and cost a debugging round the first time.
 The real app installs SIGTERM/SIGINT handlers, so the stub matches it.
 
+**`run_orchestrator_real_app.sh`** — the same lifecycle, but the container the
+orchestrator spawns is the actual GPU app image (`APP_MODE=health_monitoring`,
+`APP_GPUS=all`), with real ws-server, Redis, db-writer, MediaMTX and PostgreSQL behind
+it. Proves what no other test here can: that the app, given only the orchestrator's
+injected `FLIGHT_ID`/`PUBLISHER_TOKEN`/paths, actually reads `in/<key>`, runs its
+pipeline on the GPU, and publishes to `out/<public_uuid>`. Needs
+`nvidia-container-toolkit` and the `.pt` checkpoints already on disk (gitignored — see
+`checkpoints/.gitkeep`). `danger_detection` mode is not covered: it requires a
+TensorRT `.engine` built for the target GPU, which does not exist yet.
+
 **`test_tenancy.py`** — the original leak. ws-server used to broadcast every alert,
 including its JPEG and GPS position, to every connected client. Assertion 6 is the one
 that matters: flight 2's viewer must receive **nothing**.
@@ -187,11 +198,10 @@ that matters: flight 2's viewer must receive **nothing**.
 There is no coverage for Mosquitto ACLs or TLS — neither exists yet. See
 `CLOUD_ARCHITECTURE.md` §9 for current status.
 
-Nothing here drives the **real app tier**. It now consumes `FLIGHT_ID` / `PUBLISHER_TOKEN`
-and the `in/<key>` / `out/<public_uuid>` paths the orchestrator injects instead of calling
-`/session/start`, but every test in this directory uses a stub image in its place — no
-test has yet spawned the real GPU container and driven it through a real ingest read and
-annotated-output publish end to end.
+`run_orchestrator_real_app.sh` drives the real GPU app tier through the orchestrator in
+`health_monitoring` mode — ingest read, pipeline, and annotated-output publish are all
+verified. `danger_detection` mode is not: it needs a TensorRT `.engine` built for the
+target GPU, and none exists yet.
 
 The **recording upload path** has still never run — the hook that triggers it could not
 execute until the `-ffmpeg` image tag landed, so nothing downstream of it is exercised.
