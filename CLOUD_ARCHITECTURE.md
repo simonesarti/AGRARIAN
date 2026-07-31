@@ -558,12 +558,34 @@ HTTP route. A second service writing the same tables would give two authorities 
 schema with nothing to say which is right — the objection §5 uses to keep `user_id` off
 the `flights` table, applied to services instead of columns.
 
-The account half of that API now exists: `POST /register`, `POST /login` and `GET /me`
-on db-writer, with `UserDirectory.create_user` beneath them and `rebuild_schema.py
---seed-user` on the same path, so registration and seeding cannot diverge. What is still
-missing is the **stream** half — the CRUD routes over `create_stream` / `list_streams` /
-`revoke_stream` / `rotate_stream_key`, each taking `user_id` from the session claim via
-`_require_session` rather than from the request.
+That API now exists on db-writer: `POST /register`, `POST /login`, `GET /me`, and
+`GET/POST /streams` with `POST /streams/{id}/rotate` and `/revoke`. Every account-scoped
+route takes `user_id` from the session claim through `_require_session`, never from the
+URL or the body — which is what makes `UserDirectory`'s existing cross-user refusals
+worth anything, since they only hold if the `user_id` handed to them is a fact rather
+than a guess. A `stream_id` naming another user's slot is answered with the **same 404**
+as one that does not exist; `stream_id` is sequential, so distinguishing them would
+confirm the existence of a row the caller has no business knowing about.
+
+`/viewer/token` is the one route still taking an email and password (step 4).
+
+#### Adding a stream is the endpoint that spends money
+
+`POST /streams` is where an account becomes GPU capacity — a slot is what lets a
+container come into existence — and registration is open, so it is capped at
+`MAX_STREAMS_PER_USER` **active** slots per user. Retired slots do not count, because a
+retired slot cannot publish.
+
+Two things make that cap real rather than advisory:
+
+- **Rotation is capped too.** Rotating a retired slot revives it, which is how a user
+  brings one back — so without the same check, revoke → add → rotate would net one slot
+  over the limit on every repeat.
+- **The count is taken under a row lock on the owning user.** Unlike the duplicate-email
+  case there is no unique constraint to catch an overshoot afterwards, so with N replicas
+  a plain count-then-insert is advisory only. Verified rather than assumed: 20 simultaneous
+  adds across two replicas create exactly 10 slots, and with the lock removed the same
+  test creates 11.
 
 #### The browser never reaches db-writer
 
@@ -614,7 +636,7 @@ the schema would say which one was authoritative.
 | Table | Key columns | Notes |
 | --- | --- | --- |
 | `users` | `user_id` PK, `email`, `password` (bcrypt) | **[built]** |
-| `streams` | `stream_id` PK, `user_id` FK, `stream_key` unique, `label`, `revoked_at` | **[built]** |
+| `streams` | `stream_id` PK, `user_id` FK, `stream_key` unique, `label`, `revoked_at` | **[built]**, capped per user (§4) |
 | `flights` | `flight_id` PK, `stream_id` FK (NOT NULL), `public_uuid` unique, `output_path`, `end_time` | **[built]** |
 | `alerts` | `alert_id` PK, `flight_id` FK, JPEG, dimensions, timestamps | **[built]** |
 
@@ -663,9 +685,11 @@ target GPU — see §9.
 1. User registers on the portal → row in `users`, and logs in for a session token.
    Registration is open to anyone. **[built]** — `POST /register` and `POST /login`
    on db-writer; only the front-end calling them is missing.
-2. User adds a stream → row in `streams` with a generated `stream_key`, shown once. The
-   portal offers rotate and retire. **[designed]** — the `UserDirectory` methods exist
-   and are tested; nothing exposes them over HTTP.
+2. User adds a stream → row in `streams` with a generated `stream_key`. The portal
+   offers rotate and retire. **[built]** — `GET/POST /streams`, `/rotate`, `/revoke`
+   on db-writer, capped per user (§4); only the front-end calling them is missing.
+   The key is *not* shown once and then hidden: `list_streams` returns it every time,
+   because the operator has to retype the ingest URL before every flight.
 3. Operator types `rtmps://ingest.<host>:1936/in/<key>` into the controller.
 4. Publisher connects. MediaMTX POSTs `{action: "publish", path: "in/<key>"}` to db-writer,
    which resolves the key and checks `revoked_at IS NULL` → 200.
@@ -807,6 +831,18 @@ simpler by one hop and would break this line.
 
 ### Built and tested
 
+- **Stream slot CRUD — `GET/POST /streams`, `/rotate`, `/revoke`** (§4). The portal's
+  operations, finally reachable, each scoped by the session claim rather than by
+  anything in the request. Verified by 22 assertions in `test_schema.py` on the cap and
+  27 more end-to-end in `run_portal_auth.sh` (49 total there): every route 401s without
+  a token and with a garbage one; another tenant gets the **same 404** for a stream that
+  is not theirs as for one that does not exist, and their failed rotate leaves the
+  owner's key untouched; a rotated key is what the *other* replica then reports; revoke
+  hides the slot while `include_revoked=true` still shows it with `revoked_at` set and
+  nothing deleted. The cap is verified three ways — sequentially, against the
+  revoke → add → rotate revival bypass, and under **20 simultaneous adds across two
+  replicas**, which create exactly 10. That last one was confirmed non-vacuous by
+  removing the row lock and watching it create 11.
 - **Portal authentication — `/register`, `/login`, `/me`** (§3 session tokens). The
   third scope on the existing JWT mechanism, so no new infrastructure. Verified by 21
   assertions on the token itself (`test_session_tokens.py`) and 20 end-to-end over real
@@ -980,12 +1016,6 @@ work that has yet to start.
 The schema and its accessors exist and are tested; **no service consumes them yet**, so
 they change nothing about how the system currently behaves.
 
-- `UserDirectory.create_user` — registration works and is tested, but nothing reachable
-  over the network calls it. Only `rebuild_schema.py --seed-user` does.
-- `UserDirectory.create_stream` / `list_streams` / `revoke_stream` / `rotate_stream_key`,
-  with cross-user access refused — these are the portal's operations, and there is no
-  portal. They need no rewrite, only an HTTP route that passes `user_id` from a verified
-  session claim rather than from the request (§3).
 - `db_writer/rebuild_schema.py` — destructive drop/create plus optional seeding
 
 `streams`, `stream_key`, `flights.stream_id`, `flights.public_uuid`,
@@ -993,6 +1023,10 @@ they change nothing about how the system currently behaves.
 MediaMTX auth hook is their first real consumer. `flights.output_path` also drops off
 this list — it is set inside `open_flight_for_key` the moment a flight opens, and
 `/flight/open` returns it directly to the orchestrator.
+
+`UserDirectory.create_user` and the four stream-management methods have now dropped off
+too: the routes in §4 are their first real consumer, which is what made this section's
+list nearly empty. Everything here that mattered was portal work.
 
 ### Designed, not built
 
@@ -1003,13 +1037,12 @@ this list — it is set inside `open_flight_for_key` the moment a flight opens, 
   directly. In order:
   1. ~~`UserDirectory.create_user`~~ — **[built]**, see §3
   2. ~~`POST /register`, `POST /login` → session token~~ — **[built]**, plus `GET /me`
-  3. Stream CRUD routes taking `user_id` from the claim, wrapping methods that exist
+  3. ~~Stream CRUD routes taking `user_id` from the claim~~ — **[built]**, see §4
   4. `/viewer/token` accepts a session token instead of email and password
   5. The front-end itself
 
-  Steps 1–4 are db-writer work and are what the front-end waits on. `_require_session`
-  in `db_writer/main.py` is the helper steps 3 and 4 both use; `GET /me` is currently
-  its only consumer and exists mostly to give the portal an "am I still logged in?".
+  Step 4 is the last of the db-writer work the front-end waits on. `_require_session`
+  in `db_writer/main.py` is the helper every account-scoped route uses.
 
 ### Open
 
@@ -1025,11 +1058,12 @@ this list — it is set inside `open_flight_for_key` the moment a flight opens, 
   without proving the registrant controls it, so an account can be created against
   somebody else's address. Little is at stake while nothing is emailed — no password
   reset exists either — and both land together when one is needed.
-- **No cap on concurrent flights per user.** Registration is open (§3) and a stream key
-  is what causes a GPU container to exist, so an anonymous signup can currently reach
-  GPU spend with nothing between the two. Not urgent while the deployment is a single
-  laptop, and load-bearing the moment the Kubernetes GPU node pool in §2 can create
-  machines on demand.
+- **A user may still fly their cap continuously.** `MAX_STREAMS_PER_USER` (§4) bounds
+  how many flights one account can run *at once*, which was the open hole when open
+  registration met `POST /streams`. What it does not bound is duration or total GPU
+  hours: ten slots flying all day is within the cap. Quota and billing are the answer,
+  and neither exists — this only becomes pressing once the Kubernetes node pool in §2
+  can create machines on demand.
 - Recorder per-tenant upload prefixes
 - TLS certificate issue and renewal
 - **Auth-endpoint caching and db-writer replica count.** Every publish and every read

@@ -53,6 +53,21 @@ MAX_PASSWORD_BYTES = 72
 # RFC 5321's maximum forward-path length.
 MAX_EMAIL_LENGTH = 254
 
+# ── Stream slots ──────────────────────────────────────────────────────────────
+# A stream is a concurrency slot, and a slot is what lets a GPU container come
+# into existence. With registration open (§3), this cap is the only thing between
+# an anonymous signup and unbounded GPU spend, so POST /streams must not be an
+# unbounded resource-creation endpoint.
+#
+# Counts ACTIVE slots only. A retired one cannot publish, so it is not a slot —
+# and a user who wants a retired slot back rotates its key rather than adding
+# another, which is why churn does not defeat the cap.
+MAX_STREAMS_PER_USER = 10
+
+# Matches the streams.label column, so an over-long label is a clear 400 rather
+# than a driver-dependent truncation or an opaque database error.
+MAX_STREAM_LABEL_LENGTH = 128
+
 # ── Drone stream keys ─────────────────────────────────────────────────────────
 # The operator types the ingest URL into the drone controller by hand before every
 # flight, so the key has to be short enough to transcribe without error. That rules

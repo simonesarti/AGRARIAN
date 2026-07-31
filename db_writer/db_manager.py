@@ -1,4 +1,5 @@
 import logging
+import os
 import queue
 import secrets
 import threading
@@ -19,12 +20,17 @@ from constants import (
     DB_MANAGER_THREAD_CLOSE_TIMEOUT,
     MAX_EMAIL_LENGTH,
     MAX_PASSWORD_BYTES,
+    MAX_STREAM_LABEL_LENGTH,
+    MAX_STREAMS_PER_USER,
     MIN_PASSWORD_LENGTH,
     STREAM_KEY_ALPHABET,
     STREAM_KEY_LENGTH,
 )
 
 logger = logging.getLogger("db_writer.manager")
+
+# Per-deployment tunable, same pattern as the token TTLs in auth.py.
+_MAX_STREAMS_PER_USER = int(os.environ.get("MAX_STREAMS_PER_USER", MAX_STREAMS_PER_USER))
 
 """
 DATABASE SCHEMA
@@ -135,6 +141,16 @@ class EmailAlreadyRegistered(ValueError):
     validation failures keep working unchanged, while the HTTP layer can still
     separate "this email exists" (409) from "this password is too short" (400)
     without matching on message text.
+    """
+
+
+class StreamLimitReached(ValueError):
+    """
+    Raised by create_stream when the user already holds the maximum active slots.
+
+    A ValueError subclass for the same reason as EmailAlreadyRegistered: the HTTP
+    layer answers 409 for "your account is full" and 400 for "that label is too
+    long" without reading the message.
     """
 
 
@@ -318,8 +334,8 @@ class UserDirectory:
     """
     Lookups and stream management against users/streams/flights.
 
-    Holds no per-flight state, so every method works on any replica. This serves the
-    UI, the MediaMTX auth hook, and flight creation.
+    Holds no per-flight state, so every method works on any replica. 
+    This serves the UI, the MediaMTX auth hook, and flight creation.
     """
 
     def __init__(self, database_url: str):
@@ -420,9 +436,42 @@ class UserDirectory:
             return {"stream_id": stream.stream_id, "user_id": stream.user_id, "label": stream.label}
 
     def create_stream(self, user_id: int, label: Optional[str] = None) -> dict:
-        """Add a stream slot and mint its ingest key. The key is returned once, here."""
+        """
+        Add a stream slot and mint its ingest key. The key is returned once, here.
+
+        Capped at MAX_STREAMS_PER_USER *active* slots. This is the endpoint that
+        turns an account into GPU capacity, and registration is open, so without a
+        cap POST /streams would be unbounded resource creation for anyone who can
+        sign up. Retired slots do not count — they cannot publish.
+
+        Raises StreamLimitReached at the cap, ValueError for a bad label.
+        """
+        if label is not None:
+            label = label.strip() or None
+            if label is not None and len(label) > MAX_STREAM_LABEL_LENGTH:
+                raise ValueError(f"Label must be at most {MAX_STREAM_LABEL_LENGTH} characters")
+
         SessionFactory = sessionmaker(bind=self._engine)
         with SessionFactory() as session:
+            # Lock the owning user row before counting. Without it two simultaneous
+            # requests on two replicas both read "9 active" and both insert, and the
+            # cap is advisory. Unlike the duplicate-email case there is no unique
+            # constraint to fall back on, so the lock is the only thing making the
+            # limit hold. SQLite has no row locks and ignores this, which is fine —
+            # the race needs two processes, and SQLite here only ever has one.
+            owner = session.query(User).filter_by(user_id=user_id).with_for_update().first()
+            if owner is None:
+                raise ValueError(f"User {user_id} not found")
+
+            active = (session.query(Stream)
+                      .filter_by(user_id=user_id)
+                      .filter(Stream.revoked_at.is_(None))
+                      .count())
+            if active >= _MAX_STREAMS_PER_USER:
+                raise StreamLimitReached(
+                    f"Already holding the maximum of {_MAX_STREAMS_PER_USER} active streams"
+                )
+
             stream = Stream(user_id=user_id, label=label, stream_key=generate_stream_key())
             session.add(stream)
             session.commit()
@@ -482,12 +531,34 @@ class UserDirectory:
         opposed to revoking it outright. Any flight currently in the air keeps
         streaming — MediaMTX only re-checks on connect — so it takes effect from the
         next flight.
+
+        Rotating a RETIRED slot revives it, which is how a user brings one back. That
+        makes this a second way to gain an active slot, so it is capped exactly like
+        create_stream — otherwise revoke, create, rotate would net one slot over the
+        limit every time it was repeated.
         """
         SessionFactory = sessionmaker(bind=self._engine)
         with SessionFactory() as session:
+            # Same lock as create_stream, for the same reason and against the same
+            # counter — the two operations have to serialise against each other, not
+            # just against themselves.
+            session.query(User).filter_by(user_id=user_id).with_for_update().first()
+
             stream = session.query(Stream).filter_by(stream_id=stream_id, user_id=user_id).first()
             if stream is None:
                 raise ValueError(f"Stream {stream_id} not found for this user")
+
+            if stream.revoked_at is not None:
+                active = (session.query(Stream)
+                          .filter_by(user_id=user_id)
+                          .filter(Stream.revoked_at.is_(None))
+                          .count())
+                if active >= _MAX_STREAMS_PER_USER:
+                    raise StreamLimitReached(
+                        f"Reviving this stream would exceed the maximum of "
+                        f"{_MAX_STREAMS_PER_USER} active streams"
+                    )
+
             stream.stream_key = generate_stream_key()
             stream.revoked_at = None
             session.commit()

@@ -267,6 +267,58 @@ def main():
 
     check("there is deliberately no delete_stream()", not hasattr(d, "delete_stream"))
 
+    # ── the per-user slot cap ────────────────────────────────────────────────
+    # A slot is what lets a GPU container exist and registration is open, so this
+    # is the only thing between an anonymous signup and unbounded GPU spend.
+    d2, S2 = build()
+    cap = m._MAX_STREAMS_PER_USER
+    capped = d2.create_user("capped@b.c", "correct horse")["user_id"]
+    slots = [d2.create_stream(capped, f"slot-{i}") for i in range(cap)]
+    check(f"a user may hold {cap} active slots", len(d2.list_streams(capped)) == cap)
+    check("the next one is refused",
+          raises(m.StreamLimitReached, d2.create_stream, capped, "one too many"))
+    check("StreamLimitReached is a ValueError",
+          issubclass(m.StreamLimitReached, ValueError))
+
+    # Retiring frees a slot, because a retired one cannot publish.
+    d2.revoke_stream(slots[0]["stream_id"], capped)
+    check("retiring one frees a slot", d2.create_stream(capped, "replacement")["stream_id"] > 0)
+
+    # THE BYPASS: rotation revives a retired slot, so revoke -> add -> rotate would
+    # net one slot over the cap on every repeat if rotation were not capped too.
+    check("reviving a retired slot by rotation is refused at the cap",
+          raises(m.StreamLimitReached, d2.rotate_stream_key, slots[0]["stream_id"], capped))
+    check("the bypass really would have exceeded the cap",
+          len(d2.list_streams(capped)) == cap)
+
+    # ...but rotating an ACTIVE slot at the cap is fine: it revives nothing.
+    before = d2.list_streams(capped)[0]["stream_key"]
+    after = d2.rotate_stream_key(slots[1]["stream_id"], capped)
+    check("rotating an active slot at the cap still works", after != before)
+    check("rotation did not change the number of active slots",
+          len(d2.list_streams(capped)) == cap)
+
+    # Below the cap, reviving is exactly how a user brings a slot back.
+    d2.revoke_stream(slots[2]["stream_id"], capped)
+    revived = d2.rotate_stream_key(slots[0]["stream_id"], capped)
+    check("below the cap, rotation revives a retired slot", len(revived) == m.STREAM_KEY_LENGTH)
+    check("the revived slot is active again",
+          slots[0]["stream_id"] in [s["stream_id"] for s in d2.list_streams(capped)])
+
+    # The cap is per user, not global.
+    other = d2.create_user("other@b.c", "correct horse")["user_id"]
+    check("another user is unaffected by the first's cap",
+          d2.create_stream(other, "theirs")["stream_id"] > 0)
+
+    # Labels are bounded by the column width, so an over-long one is a clean
+    # rejection rather than a truncation or a driver-specific error.
+    check("an over-long label is refused",
+          raises(ValueError, d2.create_stream, other, "x" * (m.MAX_STREAM_LABEL_LENGTH + 1)))
+    check("a label at exactly the limit is accepted",
+          d2.create_stream(other, "x" * m.MAX_STREAM_LABEL_LENGTH)["stream_id"] > 0)
+    check("a whitespace-only label becomes None",
+          d2.create_stream(other, "   ")["label"] is None)
+
     print("\n" + "=" * 60)
     print(f"{sum(results)}/{len(results)} passed")
     return 0 if all(results) else 1

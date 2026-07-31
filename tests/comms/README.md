@@ -98,7 +98,7 @@ docker run --rm -v "$PWD/db_writer:/dbw" -v "$PWD/tests/comms:/tests:ro" \
 ```bash
 ./run_db_replication.sh      # 7 + 20×2 assertions, real PostgreSQL
 ./run_redis_failure.sh       # 3 + 7 assertions, Redis restarted mid-test
-./run_portal_auth.sh         # 20 assertions, /register + /login across 2 replicas
+./run_portal_auth.sh         # 49 assertions, portal API across 2 replicas
 ./run_mediamtx_auth.sh       # 22 assertions, real MediaMTX + ffmpeg publishes
 ./run_orchestrator.sh        # 21 assertions, real containers spawned and torn down
 ./run_orchestrator_real_app.sh  # 7 assertions, the real GPU app, not the stub
@@ -159,13 +159,27 @@ claim at all**, so it cannot answer "which flight" even if a future caller forge
 check scope. Also forged signatures, expiry, `alg:none`, a missing or non-numeric
 subject, and five malformed `Authorization` headers.
 
-**`run_portal_auth.sh` / `test_portal_auth.py`** — the same endpoints over real HTTP
-against real PostgreSQL, with **two replicas**. The second replica is the point rather
-than padding: a token minted on replica 1 must be accepted by replica 2 with no shared
-session store, which is exactly what an in-memory session would break — the defect
-ws-server had with its in-memory client set. Also pins the status codes the portal will
-branch on (409 for a duplicate, 400 for a bad password or address, 401 for bad
-credentials) and that a failed login's body never says whether the account exists.
+**`run_portal_auth.sh` / `test_portal_auth.py`** — `/register`, `/login`, `/me` and the
+stream CRUD routes over real HTTP against real PostgreSQL, with **two replicas**. The
+second replica is the point rather than padding: a token minted on replica 1 must be
+accepted by replica 2 with no shared session store, which is exactly what an in-memory
+session would break — the defect ws-server had with its in-memory client set. Pins the
+status codes the portal will branch on (409 duplicate or at-cap, 400 malformed, 401 bad
+credentials, 404 not-yours) and that a failed login's body never says whether the
+account exists.
+
+For the stream routes it pins the tenancy rules the portal depends on: every route 401s
+without a token and with a garbage one, another tenant gets the **same 404** for a
+stream that is not theirs as for one that does not exist (`stream_id` is sequential, so
+telling them apart would confirm a row exists), and their failed rotate leaves the
+owner's key untouched.
+
+The slot cap is checked three ways, the last being the one that matters: sequentially,
+against the revoke → add → rotate revival bypass, and under **20 simultaneous adds
+across both replicas**, which must create exactly 10. That last assertion was confirmed
+non-vacuous by removing the row lock from `create_stream` and watching it create 11 —
+there is no unique constraint to catch an overshoot here the way there is for a
+duplicate email, so the lock is the only thing making the cap hold.
 
 Registration (`create_user`) is pinned here too, since it is open to the internet and
 every argument is untrusted: emails normalise on write *and* on read (PostgreSQL's

@@ -30,7 +30,12 @@ from auth import (
     user_id_from_session,
     verify_publisher,
 )
-from db_manager import AlertWriter, EmailAlreadyRegistered, UserDirectory
+from db_manager import (
+    AlertWriter,
+    EmailAlreadyRegistered,
+    StreamLimitReached,
+    UserDirectory,
+)
 from media_auth import Denied, authorize, credential_from
 from mqtt_auth import Denied as MqttDenied
 from mqtt_auth import authorize as mqtt_authorize
@@ -109,6 +114,10 @@ class CredentialsRequest(BaseModel):
     """Registration and login take the same pair, so they share one model."""
     email: str
     password: str
+
+
+class CreateStreamRequest(BaseModel):
+    label: Optional[str] = None
 
 
 class ViewerTokenRequest(BaseModel):
@@ -276,6 +285,117 @@ def whoami(authorization: Optional[str] = Header(default=None)):
     account-scoped endpoint added after this one will use the same way.
     """
     return {"user_id": _require_session(authorization)}
+
+
+# ------------------------------------------------------------------ #
+# Stream slots — the portal's CRUD, all scoped by the session claim
+# ------------------------------------------------------------------ #
+#
+# Every route here takes user_id from _require_session and NEVER from the URL or
+# body. UserDirectory already refuses cross-user access, but that check is only
+# worth something if the user_id it is handed is a fact rather than a guess. This
+# is why the session token exists at all.
+#
+# A stream_id naming another user's slot is answered with the same 404 as one that
+# does not exist. Distinguishing them would confirm the existence of a row the
+# caller has no business knowing about, and stream_ids are sequential.
+
+
+@app.get("/streams")
+def list_streams(
+    include_revoked: bool = False,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    The caller's own stream slots, retired ones hidden unless asked for.
+
+    Keys are included, deliberately. Unlike a password these are recoverable by
+    design — the operator has to retype the ingest URL into a controller before
+    every flight, so a key the portal cannot show again would be a key the user
+    has to rotate to use.
+    """
+    user_id = _require_session(authorization)
+    return {"streams": _directory.list_streams(user_id, include_revoked=include_revoked)}
+
+
+@app.post("/streams", status_code=201)
+def add_stream(
+    req: CreateStreamRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Add a concurrency slot and mint its ingest key.
+
+    This is the endpoint that turns an account into GPU capacity: a slot is what
+    lets a container come into existence. With registration open it is capped per
+    user, or anyone who can sign up could create unbounded slots — see
+    MAX_STREAMS_PER_USER.
+    """
+    user_id = _require_session(authorization)
+    try:
+        return _directory.create_stream(user_id, req.label)
+    except StreamLimitReached as e:
+        # Before ValueError — it is a subclass, so order matters here as it does
+        # in /register.
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error creating stream: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create stream")
+
+
+@app.post("/streams/{stream_id}/rotate")
+def rotate_stream(
+    stream_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Replace a slot's ingest key, killing the old one immediately.
+
+    The answer to a leaked key that keeps the slot usable, as opposed to retiring
+    it. A flight already in the air is unaffected — MediaMTX only re-checks on
+    connect — so it takes effect from the next one.
+
+    Rotating a RETIRED slot revives it. That is how a user brings one back, and it
+    is why this is capped like creation: without that, revoke → add → rotate would
+    net a slot over the limit on every repeat.
+    """
+    user_id = _require_session(authorization)
+    try:
+        stream_key = _directory.rotate_stream_key(stream_id, user_id)
+    except StreamLimitReached as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Stream not found")
+    except Exception as e:
+        logger.error(f"Unexpected error rotating stream {stream_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to rotate stream key")
+    return {"stream_id": stream_id, "stream_key": stream_key}
+
+
+@app.post("/streams/{stream_id}/revoke")
+def revoke_stream(
+    stream_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Retire a slot. This is what "remove" means in the portal.
+
+    Nothing is deleted: the row, its flights and their alerts all survive, and the
+    key stops resolving immediately. There is deliberately no delete_stream() to
+    expose — a Remove button implemented as a hard delete would destroy flight
+    history along with the slot.
+    """
+    user_id = _require_session(authorization)
+    try:
+        _directory.revoke_stream(stream_id, user_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Stream not found")
+    except Exception as e:
+        logger.error(f"Unexpected error revoking stream {stream_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to revoke stream")
+    return {"ok": True}
 
 
 @app.post("/session/{flight_id}/alert")
