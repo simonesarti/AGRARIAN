@@ -99,7 +99,6 @@ The stack is split across two independent deployments:
 
 | Service | Deployment | Role |
 | ------- | ---------- | ---- |
-| **traefik** | comms | Reverse proxy; TLS termination via Let's Encrypt; routes HLS, WebRTC, and WebSocket traffic |
 | **mediamtx** | comms | Video ingestion from drone (RTSP); re-publishes annotated stream (RTMP); records the annotated stream to the `recordings` volume |
 | **mosquitto** | comms | MQTT broker; receives drone telemetry consumed by the app |
 | **db-writer** | comms | Receives alert POST requests from the app and writes them to the partner-hosted database; decouples the app from DB write latency |
@@ -108,6 +107,13 @@ The stack is split across two independent deployments:
 | **orchestrator** | comms | Starts one app container per flight when a stream goes live and stops it when the publisher drops |
 | **portal** | comms | The account pages — sign-up, sign-in, stream slots and the live view. The only service on the public side that talks to db-writer |
 | **app** | standalone | Core GPU processing pipeline; consumes video and telemetry, produces annotated stream and structured alerts |
+
+> **No reverse proxy is deployed.** Every service above publishes its own port directly and
+> speaks plain HTTP, RTMP, RTSP and MQTT. The target is a cloud L4 load balancer with
+> Traefik behind it terminating HTTPS/WSS for the portal, HLS and WHEP, and cert-manager
+> issuing for all three terminators — see §7 and §8 of
+> [CLOUD_ARCHITECTURE.md](CLOUD_ARCHITECTURE.md). None of it exists yet, so run the stack
+> on a trusted network or a VPN.
 
 ### Recording
 
@@ -251,27 +257,35 @@ The app detects engine files at startup and switches to engine mode automaticall
 
 | Port | Protocol | Direction | Purpose |
 | ---- | -------- | --------- | ------- |
-| 80 | HTTP | inbound | Traefik (Let's Encrypt HTTP challenge; redirects to 443 in production) |
-| 443 | HTTPS/WSS | inbound | Traefik: HLS/WebRTC video playback + WSS alerts (production) |
-| 8080 | HTTP | inbound | Traefik dashboard (development only) |
 | 8554 | RTSP | inbound | MediaMTX: drone video publish + app raw stream pull |
 | 1935 | RTMP | inbound | MediaMTX: app annotated stream push |
-| 8889 | WebRTC | inbound | MediaMTX: viewer WebRTC playback |
+| 8888 | HTTP | inbound | MediaMTX: HLS playback |
+| 8889 | HTTP | inbound | MediaMTX: WebRTC/WHEP signalling |
+| 8189 | UDP | inbound | MediaMTX: WebRTC media (DTLS-SRTP, never proxied) |
 | 1883 | MQTT | inbound | Mosquitto: drone telemetry + app subscription |
-| `WS_PORT` | WS | inbound | WebSocket alert stream (direct, without Traefik) |
+| 8003 | HTTP | inbound | portal: the account pages |
+| `WS_PORT` | WS | inbound | ws-server: WebSocket alert stream |
 | 8001 | HTTP | inbound | ws-server HTTP API (app POSTs alerts here) |
 | 8002 | HTTP | inbound | db-writer HTTP API (app POSTs alerts here) |
 
-### Access URLs (via Traefik on the comms host)
+8001 and 8002 are internal-only in the target topology; they are published here for the
+split deployment below, where the app runs on a separate machine.
+
+### Access URLs
+
+The portal composes the playback URLs itself, with a per-flight token attached — sign in at
+`http://<comms-host>:8003` and use the **Watch** button rather than building these by hand.
+Listed for debugging:
 
 | Resource | URL |
 | -------- | --- |
-| HLS playback | `http://<comms-host>/hls/annot/index.m3u8` |
-| WebRTC playback | `http://<comms-host>/webrtc/annot/whep` |
-| WebSocket alerts (WS) | `ws://<comms-host>/ws` |
-| WebSocket alerts (WSS, production) | `wss://<domain>/ws` |
-| WebSocket alerts (direct) | `ws://<comms-host>:${WS_PORT}` |
-| Traefik dashboard | `http://<comms-host>:8080` |
+| Portal | `http://<comms-host>:8003` |
+| HLS playback | `http://<comms-host>:8888/<output-path>/index.m3u8?jwt=<viewer-token>` |
+| WebRTC playback | `http://<comms-host>:8889/<output-path>/?jwt=<viewer-token>` |
+| WebSocket alerts | `ws://<comms-host>:${WS_PORT}/?token=<viewer-token>` |
+
+`<output-path>` is the per-flight path assigned when the flight opens; a viewer token is
+scoped to one flight and expires. Both come from the portal.
 
 ---
 

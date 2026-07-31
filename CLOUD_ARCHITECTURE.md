@@ -159,7 +159,15 @@ is that **MediaMTX and Mosquitto need `LoadBalancer` services carrying TCP and U
 HTTP Ingress — which is the same split already chosen for TLS termination in §7, so the
 topology and the security model agree.
 
-Managed Kubernetes also brings cert-manager, which closes the TLS item still open in §9.
+Kubernetes does **not** reverse-proxy anything itself: `Ingress` and the Gateway API are
+interfaces, and a controller has to be installed to implement them. That controller is
+Traefik here, and it is the same Traefik the compose stack will run, which is why the
+routing config survives the migration rather than being rewritten into a vendor's
+annotations. Nothing in the design depends on Traefik specifically — see §7.
+
+Managed Kubernetes also brings cert-manager, which is what closes the TLS item in §9 for
+all three terminators at once: Traefik for the HTTP family, and Secrets mounted by
+MediaMTX and Mosquitto for the protocols they terminate themselves.
 
 #### Build the orchestrator against an interface, not a cluster **[built]**
 
@@ -669,8 +677,9 @@ with expensive work.
 client and is forgeable. Taking the leftmost entry — the common shortcut — lets a client
 name its own bucket, and that is not merely evasion: it lets one client push another
 client's bucket to the limit and lock them out. The default is 0, which trusts nothing and
-uses the peer address; behind Traefik alone it is 1. **Setting it higher than the truth is
-the dangerous direction**, and both configurations are tested against each other (§9).
+uses the peer address, which is the compose stack today; each HTTP proxy actually in the
+path adds one (§8). **Setting it higher than the truth is the dangerous direction**, and
+both configurations are tested against each other (§9).
 
 ##### It fails open
 
@@ -871,15 +880,60 @@ looking live forever.
 | App ↔ hub | Cloud virtual network | Not separately encrypted — see below |
 | Hub → database | Private | Worker credentials, least privilege |
 
-### TLS termination
+The four public rows describe the target. The transport half of each — RTMPS, MQTTS,
+HTTPS/WSS — is **not deployed today**; the credential half (stream keys, per-stream MQTT
+users and ACLs, per-flight JWTs, the session cookie) is built and tested. So every public
+credential in the system currently crosses the internet in the clear, which is the single
+largest gap between this section and the running stack.
 
-Traefik terminates HTTPS and WSS for the HTTP-family services. **MediaMTX and Mosquitto
-terminate their own TLS**, for two reasons: it preserves the client identity that ACLs and
-the auth hook depend on, and WebRTC media is DTLS-SRTP over UDP end-to-end, so it bypasses
-an L7 proxy entirely. Only WHEP signalling is HTTP.
+### TLS termination **[designed]**
+
+Two layers, split by protocol.
+
+**A cloud L4 load balancer is the edge** — NLB, Azure Standard LB, GCP network LB — and
+deliberately *not* a cloud L7 load balancer. ALB, Application Gateway and the GCP HTTPS LB
+carry HTTP and nothing else, but most of what reaches this hub is not HTTP: RTMPS and RTSPS
+are arbitrary TCP, MQTTS is arbitrary TCP, and WebRTC media is UDP. A cloud L7 load balancer
+cannot front this system at all, so picking one would mean standing up a second L4 edge
+beside it — two edges to avoid one pod, which is worse than either choice made cleanly. The
+L4 layer stays managed, because terminating raw TCP in a pod we operate buys nothing: the
+provider's LB sits in the cloud fabric, outlives the cluster, and carries its DDoS
+protection with it.
+
+**Traefik is the L7 proxy behind it**, in-cluster, terminating HTTPS and WSS for the
+HTTP-family services only — HLS, WHEP signalling, and the portal. It stays in-cluster
+rather than dissolving into load-balancer configuration for three reasons:
+
+- the routing config is then the same under docker-compose and under Kubernetes, and the
+  compose deployment does not go away — the interim laptop-app deployment below still needs
+  an answer, and a cloud LB gives nothing locally
+- the middlewares are ours rather than a vendor's annotation dialect
+- nothing about it is provider-specific, which is the posture the recorder already takes
+  with `local | azure | aws`
+
+Traefik is not load-bearing in that choice. Caddy or ingress-nginx would fill the same role;
+the slice is small and the decision is reversible, which is the right size for it.
+
+**MediaMTX and Mosquitto terminate their own TLS**, for two reasons: it preserves the client
+identity that ACLs and the auth hook depend on, and WebRTC media is DTLS-SRTP over UDP
+end-to-end, so it bypasses an L7 proxy entirely. Only WHEP signalling is HTTP.
 
 (Traefik *does* support TCP routers with SNI, so proxying RTMPS is possible — self-termination
 is chosen for the identity-preservation reason, not because of a Traefik limitation.)
+
+**Certificates come from cert-manager, not from the load balancer**, and this is the reverse
+of the usual argument. A cloud-managed certificate terminates *at* the LB and hands back no
+key file — but MediaMTX and Mosquitto self-terminate and need a certificate and key on disk.
+A managed certificate therefore covers only the one slice that could have gone either way,
+leaving cert-manager to be run anyway for the other two: two issuance mechanisms where one
+would do. cert-manager writing into Secrets that all three services mount is that one
+mechanism.
+
+**Nothing in this subsection exists yet.** There is no Traefik service in
+`docker-compose.yml`, `configs/mediamtx/mediamtx.yaml` configures no encryption on any
+listener, and Mosquitto's MQTTS block is commented out. Every public-facing protocol in the
+running stack is currently in the clear, and the portal's own `PORTAL_COOKIE_SECURE` /
+`PORTAL_PUBLIC_TLS` defaults assume a terminator that has not been deployed. See §9.
 
 ### In-cloud traffic
 
@@ -910,25 +964,41 @@ GPU tier at all.
 
 ## 8. Network topology
 
-Externally reachable:
+Externally reachable. The **Today** column is what `docker-compose.yml` actually publishes,
+which is not yet the target — see the TLS item in §9.
 
-| Port | Protocol | Terminated by |
-| --- | --- | --- |
-| 1935 | RTMP (fallback only) | MediaMTX |
-| 1936 | RTMPS | MediaMTX |
-| 8554 / 8322 | RTSP / RTSPS | MediaMTX |
-| 8888 | HLS | Traefik |
-| 8889 | WebRTC / WHEP signalling | Traefik |
-| 8189/udp | WebRTC media | End-to-end DTLS-SRTP — **must not be proxied** |
-| 1883 / 8883 | MQTT (fallback) / MQTTS | Mosquitto |
-| 443 | HTTPS + WSS — includes the portal | Traefik |
+| Port | Protocol | Terminated by | Today |
+| --- | --- | --- | --- |
+| 1935 | RTMP (fallback only) | MediaMTX | published, in the clear |
+| 1936 | RTMPS | MediaMTX | **not configured** |
+| 8554 | RTSP (fallback only) | MediaMTX | published, in the clear |
+| 8322 | RTSPS | MediaMTX | **not configured** |
+| 8888 | HLS | Traefik | published direct, plain HTTP |
+| 8889 | WebRTC / WHEP signalling | Traefik | published direct, plain HTTP |
+| 8189/udp | WebRTC media | End-to-end DTLS-SRTP — **must not be proxied** | published |
+| 1883 | MQTT (fallback only) | Mosquitto | published, in the clear |
+| 8883 | MQTTS | Mosquitto | **commented out** in `mosquitto.conf` |
+| 443 | HTTPS + WSS — includes the portal | Traefik | **no Traefik service exists** |
+
+The plain-text ports are labelled *fallback only* because that is their designed role —
+drones without TLS support (§7). Today they are not a fallback but the only path, since no
+encrypted listener is configured on any of the three.
 
 In compose the portal is published on **8003** and speaks plain HTTP; 443 and the
-certificate are Traefik's in a real deployment. Two variables exist for the gap between
-those worlds, `PORTAL_COOKIE_SECURE` and `PORTAL_PUBLIC_TLS`, and both default to on.
-Turning them off is a local-HTTP affordance and nothing else: a `Secure` cookie is simply
-not returned over `http://`, so the symptom of leaving one off in production is not an
-error but a login that appears to work and then forgets the user.
+certificate are the ingress tier's in a real deployment. Two variables exist for the gap
+between those worlds, `PORTAL_COOKIE_SECURE` and `PORTAL_PUBLIC_TLS`, and both default to
+on. Turning them off is a local-HTTP affordance and nothing else: a `Secure` cookie is
+simply not returned over `http://`, so the symptom of leaving one off in production is not
+an error but a login that appears to work and then forgets the user. The corollary is that
+with the defaults on and no terminator deployed, **the portal has no working configuration
+today** — either the cookie never comes back, or it runs with the local-only affordance
+enabled in production.
+
+`PORTAL_TRUSTED_PROXY_HOPS` must count the *real* hops between the browser and the portal,
+which is a deployment fact and not a property of any product name. An L4 load balancer with
+source-IP preservation adds none, so a browser → LB → Traefik → portal path is 1; a cloud
+L7 LB in front of Traefik would make it 2. Counting too high is the dangerous direction —
+the client then names its own rate-limit bucket (§4).
 
 Internal only — **must never be routed from outside**: ws-server's alert-write API port,
 db-writer, Redis, the recorder, and the orchestrator.
@@ -1228,6 +1298,12 @@ list nearly empty. Everything here that mattered was portal work.
 ### Designed, not built
 
 - Kubernetes `FlightRuntime` backend (create Job, delete Job)
+- **The ingress tier — cloud L4 load balancer, Traefik, cert-manager (§7).** The shape is
+  decided; none of the three pieces is deployed. Concretely missing: a `traefik` service in
+  `docker-compose.yml` with routers for the portal, HLS and WHEP; `encryption` and cert
+  paths on MediaMTX's RTMP/RTSP listeners; Mosquitto's commented-out MQTTS listener; and
+  an issuer. Until it lands, every public protocol runs in the clear and the portal's own
+  defaults describe a deployment that does not exist.
 
 ### Open
 
@@ -1270,7 +1346,13 @@ list nearly empty. Everything here that mattered was portal work.
   Every row needed is already there (`flights`, `alerts`, `recordings`); what is missing
   is a paged read route and a page, and neither is on the path of anything else.
 - Recorder per-tenant upload prefixes
-- TLS certificate issue and renewal
+- **TLS certificate issue and renewal.** Distinct from the ingress tier above, which is a
+  deployment task: this is the ongoing one. cert-manager answers issue and renewal for
+  Traefik directly, but MediaMTX and Mosquitto read a certificate from disk, so a renewed
+  Secret has to reach a running process. Mosquitto rereads its certificates on `SIGHUP`;
+  MediaMTX's behaviour on a changed cert file has not been checked, and if it does not
+  reload, renewal means restarting the media server — which drops every flight in the air.
+  Verify that before the first certificate expires rather than after.
 - **Auth-endpoint caching and db-writer replica count.** Every publish and every read
   now costs one indexed lookup here. A short-TTL cache is the obvious fix and the wrong
   one to reach for blindly: it delays revocation of a credential that has no expiry.

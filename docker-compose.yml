@@ -15,7 +15,14 @@
 #   8889  — MediaMTX WebRTC (WHEP signalling)
 #   8189  — MediaMTX WebRTC (ICE/media UDP)
 #   ${WS_PORT} — WebSocket alert stream
-#   8003  — portal (HTTPS on 443 behind Traefik in a real deployment)
+#   8003  — portal
+#
+# NOTHING HERE IS ENCRYPTED. There is no reverse proxy in this file and no TLS
+# listener on MediaMTX or Mosquitto, so stream keys, telemetry credentials and the
+# session cookie all cross the wire in the clear. The target — a cloud L4 load
+# balancer, Traefik terminating HTTPS/WSS, cert-manager issuing for all three
+# terminators — is §7 of CLOUD_ARCHITECTURE.md and is not built. Run this on a
+# trusted network.
 #
 # Recording: MediaMTX records the annotated stream to the 'recordings' volume.
 #            The recorder sidecar uploads each segment on completion.
@@ -149,7 +156,7 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "8003:8000"     # Traefik terminates HTTPS on 443 and forwards here
+      - "8003:8000"     # plain HTTP; the ingress tier would forward 443 here
     environment:
       DB_WRITER_URL: http://db-writer:8000
       # Backs the rate limits on /login and /register — the two endpoints anyone

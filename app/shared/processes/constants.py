@@ -92,7 +92,7 @@ MEDIA_SERVER_HOST = "mediamtx"
 TELEMETRY_BROKER_HOST = "mosquitto"
 
 HTTP_PORT = 80
-# 443, not 8443. Traefik terminates HTTPS and WSS on the standard port; 8443 was both
+# 443, not 8443. The ingress tier terminates HTTPS and WSS on the standard port; 8443 was both
 # wrong and the source of a three-way collision in this block, since RTMPS was also
 # 8443 at the time.
 HTTPS_PORT = 443

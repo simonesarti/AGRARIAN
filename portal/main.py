@@ -113,8 +113,11 @@ _ALLOWED_ORIGIN_HOSTS = {
 
 # How many proxies stand between the client and this process. It decides which
 # entry of X-Forwarded-For is believed, and believing the wrong one lets a client
-# choose its own rate-limit bucket — or push somebody else's to the limit. 0
-# trusts nothing and uses the peer address; behind Traefik alone it is 1.
+# choose its own rate-limit bucket — or push somebody else's to the limit. Count
+# the hops that actually exist rather than copying a number: 0 trusts nothing and
+# uses the peer address, one HTTP proxy in front makes it 1, a cloud L7 load
+# balancer in front of that makes it 2. An L4 load balancer that preserves the
+# source address adds no hop.
 _TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "0"))
 
 # Required rather than optional, though the limiter fails open at request time.
