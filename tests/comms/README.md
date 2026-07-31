@@ -99,7 +99,7 @@ docker run --rm -v "$PWD/db_writer:/dbw" -v "$PWD/tests/comms:/tests:ro" \
 ./run_db_replication.sh      # 7 + 20×2 assertions, real PostgreSQL
 ./run_redis_failure.sh       # 3 + 7 assertions, Redis restarted mid-test
 ./run_portal_auth.sh         # 49 assertions, portal API across 2 replicas
-./run_mediamtx_auth.sh       # 22 assertions, real MediaMTX + ffmpeg publishes
+./run_mediamtx_auth.sh       # 27 assertions, real MediaMTX + ffmpeg publishes
 ./run_orchestrator.sh        # 21 assertions, real containers spawned and torn down
 ./run_orchestrator_real_app.sh  # 7 assertions, the real GPU app, not the stub
 ./run_recording_upload.sh    # 8 assertions, real segment upload + DB traceability
@@ -227,11 +227,18 @@ time round:
   followed request. Without `curl -L` and a cookie jar every result is 302 and the
   test silently measures nothing.
 
-It also exercises `/viewer/token`'s disambiguation against a real db-writer and
-PostgreSQL: alice starts a second concurrent flight, the plain request (no
+It also exercises `/viewer/token` against a real db-writer and PostgreSQL, in two
+parts. Disambiguation: alice starts a second concurrent flight, the plain request (no
 `stream_id`) turns from 200 into 409 rather than silently picking one, `stream_id`
-resolves each of her two flights correctly, and her own credentials cannot reach
-bob's stream_id.
+resolves each of her two flights correctly, and she cannot reach bob's stream_id.
+
+And the credential it now requires — a **session token**, never a password. Alice and
+bob log in first, exactly as the portal does. Email and password are refused where they
+used to work, and so are a viewer token and a publisher token: the first would make a
+viewer token self-renewing and therefore effectively permanent, and the second lives
+inside a container that processes untrusted video. This is a deliberate credential
+downgrade with no path back — a session token buys a flight-scoped one, and nothing
+buys a session token except a password at `/login`.
 
 It also aborts if MediaMTX fails to start, because a MediaMTX that never came up
 denies everything — which reads as a wall of passing deny-assertions.

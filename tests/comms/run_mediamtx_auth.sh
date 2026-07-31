@@ -69,15 +69,11 @@ KEY_A=$(echo "$SEED" | sed -n 's/.*stream key : \([a-z0-9]*\).*/\1/p')
 # Second tenant, so every denial can be tested against a real credential that simply
 # belongs to the wrong user.
 KEY_B=$(docker run --rm --network "$NET" "${ENVV[@]}" "$IMAGE" python -c "
-from db_manager import UserDirectory, User
-from sqlalchemy.orm import sessionmaker
-import os
+from db_manager import UserDirectory
 d = UserDirectory('postgresql://testuser:testpw@mtxa-pg:5432/testdb')
-S = sessionmaker(bind=d._engine)
-with S() as s:
-    u = User(email='bob@test.io', password=User.hash_password('pw456'))
-    s.add(u); s.commit()
-    uid = u.user_id
+# Through create_user, not by building the row: a second tenant the portal would
+# have refused to register is not a second tenant.
+uid = d.create_user('bob@test.io', 'pw12345678')['user_id']
 print(d.create_stream(uid, 'bob stream')['stream_key'])
 " 2>/dev/null | tail -1)
 
@@ -109,18 +105,28 @@ open_flight() {  # open_flight <stream_key>  -- what the orchestrator calls
     -d "{\"stream_key\":\"$1\"}"
 }
 
-viewer_token() {  # viewer_token <email> <password>  -- what the portal calls
-  curl -s -X POST "$API/viewer/token" -H 'Content-Type: application/json' \
-    -d "{\"email\":\"$1\",\"password\":\"$2\"}"
+login() {  # login <email> <password> -> session token
+  curl -s -X POST "$API/login" -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$1\",\"password\":\"$2\"}" | jsonget session_token
 }
 
-viewer_token_call() {  # viewer_token_call <email> <password> [stream_id] -> "<body>\n<code>"
-  if [ -n "${3:-}" ]; then
-    curl -s -w $'\n%{http_code}' -X POST "$API/viewer/token" -H 'Content-Type: application/json' \
-      -d "{\"email\":\"$1\",\"password\":\"$2\",\"stream_id\":$3}"
+# /viewer/token is authorised by a SESSION token, not an email and password: the
+# portal logs in once and holds the token, so the password reaches /login and
+# nothing else. Both helpers below therefore take a session token.
+
+viewer_token() {  # viewer_token <session_token>  -- what the portal calls
+  curl -s -X POST "$API/viewer/token" \
+    -H 'Content-Type: application/json' -H "Authorization: Bearer $1" -d '{}'
+}
+
+viewer_token_call() {  # viewer_token_call <session_token> [stream_id] -> "<body>\n<code>"
+  if [ -n "${2:-}" ]; then
+    curl -s -w $'\n%{http_code}' -X POST "$API/viewer/token" \
+      -H 'Content-Type: application/json' -H "Authorization: Bearer $1" \
+      -d "{\"stream_id\":$2}"
   else
-    curl -s -w $'\n%{http_code}' -X POST "$API/viewer/token" -H 'Content-Type: application/json' \
-      -d "{\"email\":\"$1\",\"password\":\"$2\"}"
+    curl -s -w $'\n%{http_code}' -X POST "$API/viewer/token" \
+      -H 'Content-Type: application/json' -H "Authorization: Bearer $1" -d '{}'
   fi
 }
 vt_code() { echo "$1" | tail -1; }
@@ -136,8 +142,14 @@ UID_A=$(echo "$A" | jsonget user_id)
 [ -n "$UUID_A" ] && [ -n "$UUID_B" ] || { echo "could not open flights: $A / $B"; exit 1; }
 echo "    alice flight uuid=$UUID_A   bob flight uuid=$UUID_B"
 
-VA=$(viewer_token alice@test.io pw12345678)
-VB=$(viewer_token bob@test.io pw456)
+# Log in once each, exactly as the portal does, then use the session token for
+# every viewer-token request from here on.
+SESS_A=$(login alice@test.io pw12345678)
+SESS_B=$(login bob@test.io pw12345678)
+[ -n "$SESS_A" ] && [ -n "$SESS_B" ] || { echo "could not log in"; exit 1; }
+
+VA=$(viewer_token "$SESS_A")
+VB=$(viewer_token "$SESS_B")
 VIEW_A=$(echo "$VA" | jsonget viewer_token)
 VIEW_B=$(echo "$VB" | jsonget viewer_token)
 [ -n "$VIEW_A" ] && [ -n "$VIEW_B" ] || { echo "could not issue viewer tokens: $VA / $VB"; exit 1; }
@@ -227,7 +239,7 @@ check "a revoked key can no longer publish" \
 
 echo
 echo "── viewer/token: disambiguation once a user has two active flights ────────"
-resp=$(viewer_token_call alice@test.io pw12345678)
+resp=$(viewer_token_call "$SESS_A")
 check "one active flight: 200, no stream_id needed" 200 "$(vt_code "$resp")"
 check "one active flight: resolves to it" "$FID_A" "$(echo "$(vt_body "$resp")" | jsonget flight_id)"
 
@@ -240,16 +252,45 @@ A2=$(open_flight "$KEY_A2")
 FID_A2=$(echo "$A2" | jsonget flight_id); SID_A2=$(echo "$A2" | jsonget stream_id)
 [ -n "$FID_A2" ] || { echo "could not open alice's second flight: $A2"; exit 1; }
 
-resp=$(viewer_token_call alice@test.io pw12345678)
+resp=$(viewer_token_call "$SESS_A")
 check "two active flights, no stream_id: 409 (ambiguous, not a guess)" 409 "$(vt_code "$resp")"
-resp=$(viewer_token_call alice@test.io pw12345678 "$SID_A")
+resp=$(viewer_token_call "$SESS_A" "$SID_A")
 check "two active flights, first stream_id: resolves to that flight" "$FID_A" \
       "$(echo "$(vt_body "$resp")" | jsonget flight_id)"
-resp=$(viewer_token_call alice@test.io pw12345678 "$SID_A2")
+resp=$(viewer_token_call "$SESS_A" "$SID_A2")
 check "two active flights, second stream_id: resolves to that flight" "$FID_A2" \
       "$(echo "$(vt_body "$resp")" | jsonget flight_id)"
-resp=$(viewer_token_call alice@test.io pw12345678 "$SID_B")
+resp=$(viewer_token_call "$SESS_A" "$SID_B")
 check "alice cannot get a token for bob's stream_id" 404 "$(vt_code "$resp")"
+
+echo
+echo "── viewer/token now takes a SESSION token, never a password ───────────────"
+# The credential downgrade: a session token buys a flight-scoped one, and there is
+# no path back. These four are the reason step 4 exists.
+resp=$(curl -s -w $'\n%{http_code}' -X POST "$API/viewer/token" \
+       -H 'Content-Type: application/json' -d '{}')
+check "no credential at all: 401" 401 "$(vt_code "$resp")"
+
+resp=$(curl -s -w $'\n%{http_code}' -X POST "$API/viewer/token" \
+       -H 'Content-Type: application/json' \
+       -d '{"email":"alice@test.io","password":"pw12345678"}')
+check "email+password no longer works: 401" 401 "$(vt_code "$resp")"
+
+# A VIEWER token must not buy another viewer token. It carries a sub claim, so the
+# scope check is the only thing stopping this from being a self-renewing credential.
+resp=$(curl -s -w $'\n%{http_code}' -X POST "$API/viewer/token" \
+       -H 'Content-Type: application/json' -H "Authorization: Bearer $VIEW_A" -d '{}')
+check "a viewer token cannot mint another viewer token: 401" 401 "$(vt_code "$resp")"
+
+# ...nor may a publisher token, which the app container holds inside a container
+# that processes untrusted video.
+resp=$(curl -s -w $'\n%{http_code}' -X POST "$API/viewer/token" \
+       -H 'Content-Type: application/json' -H "Authorization: Bearer $PUB_A" -d '{}')
+check "a publisher token cannot mint a viewer token: 401" 401 "$(vt_code "$resp")"
+
+# bob's session token must not reach alice's flight even with her stream_id.
+resp=$(viewer_token_call "$SESS_B" "$SID_A")
+check "bob's session cannot reach alice's stream: 404" 404 "$(vt_code "$resp")"
 
 echo
 echo "=========================================================="

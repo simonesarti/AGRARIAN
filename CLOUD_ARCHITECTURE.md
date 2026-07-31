@@ -229,9 +229,16 @@ covers that.
 
 ### Viewer tokens **[built]**
 
-A short-lived JWT (HS256), minted by db-writer, naming exactly one `flight_id`. ws-server
-validates it offline — signature and expiry only, no database or network call — so any
-replica can authorise any viewer. The token travels in the WebSocket query string, because
+A short-lived JWT (HS256), minted by db-writer, naming exactly one `flight_id`. Obtained
+from `POST /viewer/token` by presenting a **session token** — a deliberate credential
+downgrade, and the shape worth noting: the caller offers something that identifies their
+whole account and receives something that can watch one flight and do nothing else, with
+no path back. A viewer token cannot mint another viewer token, and neither can a
+publisher token; both are refused by the scope check, which matters because a viewer
+token that could renew itself would never expire in practice.
+
+ws-server validates it offline — signature and expiry only, no database or network call —
+so any replica can authorise any viewer. The token travels in the WebSocket query string, because
 browsers cannot set headers on a handshake; that is why it is short-lived.
 
 The same token now gates the **MediaMTX read** as well, through the auth hook in §4, so
@@ -273,13 +280,16 @@ validated offline by any replica exactly as viewer tokens already are. **No new
 infrastructure; one new scope value.**
 
 The password is presented once at login, exchanged for this token, and never seen again.
-That is not a stylistic preference. `/viewer/token` currently takes email and password
-in the body of every request, which is fine for a one-shot call and unusable for a
-portal, where a user clicks around for twenty minutes: the password would have to be
-kept somewhere for the whole session. §6 already tells this story about the app
-container — it used to carry the operator's email and password, and the fix was to inject
-a scoped token instead. Building the portal on the `/viewer/token` pattern would put the
-same reusable password back, this time in the one tier that faces the public internet.
+That is not a stylistic preference. `/viewer/token` used to take email and password in
+the body of every request, which is fine for a one-shot call and unusable for a portal,
+where a user clicks around for twenty minutes and the page silently refreshes a viewer
+token whenever one expires: the password would have to be kept somewhere for the whole
+session. §6 already tells this story about the app container — it used to carry the
+operator's email and password, and the fix was to inject a scoped token instead.
+Building the portal on the `/viewer/token` pattern would have put the same reusable
+password back, this time in the one tier that faces the public internet.
+
+**`POST /login` is now the only route in the system that accepts a password.**
 
 **The `user_id` must come from the token, never from the URL.**
 `UserDirectory.revoke_stream(stream_id, user_id)` already refuses cross-user access, but
@@ -567,7 +577,8 @@ than a guess. A `stream_id` naming another user's slot is answered with the **sa
 as one that does not exist; `stream_id` is sequential, so distinguishing them would
 confirm the existence of a row the caller has no business knowing about.
 
-`/viewer/token` is the one route still taking an email and password (step 4).
+`POST /viewer/token` is authorised the same way — by the session token, not by a
+password (§3) — so `POST /login` is the only route in the system that takes one.
 
 #### Adding a stream is the endpoint that spends money
 
@@ -678,9 +689,10 @@ existing ones.
 
 ## 6. Flight lifecycle
 
-Steps 3–6 and 8 are **[built]**; 1–2 wait on the portal. Step 6 is verified for
-`health_monitoring` mode; `danger_detection` mode still needs a TensorRT engine for the
-target GPU — see §9.
+**Every step is now [built] on the API side.** What steps 1, 2 and 7 wait on is only the
+front-end that calls them — the db-writer routes behind all three exist and are tested.
+Step 6 is verified for `health_monitoring` mode; `danger_detection` has never run end to
+end — see §9.
 
 1. User registers on the portal → row in `users`, and logs in for a session token.
    Registration is open to anyone. **[built]** — `POST /register` and `POST /login`
@@ -700,9 +712,11 @@ target GPU — see §9.
 6. App reads `in/<key>`, publishes annotated video to `out/<public_uuid>`, POSTs alerts to
    ws-server and db-writer. **[verified for `health_monitoring` mode against a real GPU
    container — see §9; `danger_detection` mode still needs a TensorRT engine]**
-7. Viewer opens the portal, receives a JWT scoped to that flight, and presents it for the
-   WebRTC/HLS read and the WebSocket connection alike. MediaMTX validates it through the
-   same auth endpoint with `action: "read"`.
+7. Viewer opens the portal and — holding a session token from step 1 — calls
+   `POST /viewer/token`, receiving a JWT scoped to that one flight, which it presents for
+   the WebRTC/HLS read and the WebSocket connection alike. MediaMTX validates it through
+   the same auth endpoint with `action: "read"`. **[built]** — with more than one flight
+   active the call must name a `stream_id` rather than being guessed for.
 8. Publisher disconnects. `runOnUnavailable` → container stopped, `end_time` stamped.
 
 **The app container never sees end-user credentials.** It used to call `/session/start`
@@ -831,6 +845,16 @@ simpler by one hop and would break this line.
 
 ### Built and tested
 
+- **`/viewer/token` takes a session token, not a password** (§3). The last route outside
+  `/login` that accepted one, so a password now reaches exactly one endpoint in the whole
+  system. Verified inside `run_mediamtx_auth.sh` (27/27, up from 22): email and password
+  are refused where they used to work, no credential is refused, and — the two that
+  matter — **a viewer token cannot mint another viewer token** and neither can a
+  publisher token. The first would be a self-renewing credential that never expires in
+  practice; the second is held inside a container processing untrusted video. A second
+  tenant's session token still cannot reach the first's flight even when naming its
+  `stream_id`. The disambiguation behaviour is unchanged and still verified: one active
+  flight resolves silently, two force a 409 rather than a guess.
 - **Stream slot CRUD — `GET/POST /streams`, `/rotate`, `/revoke`** (§4). The portal's
   operations, finally reachable, each scoped by the session claim rather than by
   anything in the request. Verified by 22 assertions in `test_schema.py` on the cap and
@@ -980,7 +1004,7 @@ simpler by one hop and would break this line.
   than silently guessing on the caller's behalf. Verified by 6 assertions against
   SQLite (`test_schema.py`, including that a landed flight is excluded) and 6 more
   end-to-end against a real db-writer and PostgreSQL (`run_mediamtx_auth.sh`,
-  22/22 total): the one-flight case still just works, a second concurrent flight
+  27/27 total): the one-flight case still just works, a second concurrent flight
   makes the plain request 409 rather than pick one, `stream_id` resolves each flight
   correctly, and a user cannot use `stream_id` to reach another tenant's flight.
 
@@ -1038,11 +1062,14 @@ list nearly empty. Everything here that mattered was portal work.
   1. ~~`UserDirectory.create_user`~~ — **[built]**, see §3
   2. ~~`POST /register`, `POST /login` → session token~~ — **[built]**, plus `GET /me`
   3. ~~Stream CRUD routes taking `user_id` from the claim~~ — **[built]**, see §4
-  4. `/viewer/token` accepts a session token instead of email and password
+  4. ~~`/viewer/token` accepts a session token~~ — **[built]**, see §3
   5. The front-end itself
 
-  Step 4 is the last of the db-writer work the front-end waits on. `_require_session`
-  in `db_writer/main.py` is the helper every account-scoped route uses.
+  **All of the db-writer work is done.** `_require_session` in `db_writer/main.py` is
+  the helper every account-scoped route uses, and the API the front-end needs is
+  complete: `/register`, `/login`, `/me`, `GET/POST /streams`,
+  `POST /streams/{id}/rotate`, `POST /streams/{id}/revoke`, `POST /viewer/token`.
+  What remains is the front-end and the service that serves it.
 
 ### Open
 

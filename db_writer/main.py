@@ -121,10 +121,14 @@ class CreateStreamRequest(BaseModel):
 
 
 class ViewerTokenRequest(BaseModel):
-    email: str
-    password: str
-    # Required only when the caller has more than one flight active at once —
-    # omitting it still works for the common case of exactly one.
+    """
+    Carries no credential: the caller is identified by their session token, in the
+    Authorization header, like every other account-scoped route.
+
+    stream_id is required only when the caller has more than one flight active at
+    once — omitting it still works for the common case of exactly one, which is why
+    the whole body is optional.
+    """
     stream_id: Optional[int] = None
 
 class OpenFlightRequest(BaseModel):
@@ -576,36 +580,52 @@ def mqtt_auth_acl(req: MqttAclRequest):
 
 
 @app.post("/viewer/token")
-def issue_viewer_token(req: ViewerTokenRequest):
+def issue_viewer_token(
+    req: Optional[ViewerTokenRequest] = None,
+    authorization: Optional[str] = Header(default=None),
+):
     """
     Issue a viewer token for one of the caller's own currently active flights,
     without opening a new one. This is how the UI gets the credential it
-    presents to ws-server.
+    presents to ws-server and to MediaMTX.
 
-    Used to just return "the most recent flight", which was wrong two ways at
-    once: it could hand out a token for a flight that had already landed (start
-    time is not a liveness signal), and it silently picked one for the caller
-    once a second stream could be active at the same time, rather than asking
-    which. Both are the same underlying bug — "latest" is not "active" — so
-    both are fixed by the same query: with zero active flights there is nothing
-    to hand out, with exactly one there is nothing to ask, and with more than
-    one the caller must say which stream_id it means.
+    Authorised by a **session token**, not an email and password. It used to take
+    the password on every call, which was survivable when the caller was a script
+    but not once a portal is the caller: a page that refreshes a viewer token
+    whenever one expires would have to keep the password for the length of the
+    session. This was the last endpoint outside /login that accepted one, so the
+    password now reaches exactly one route in the whole system.
+
+    This is also a **credential downgrade**, which is the point of doing it this
+    way round: the caller presents a token that identifies their account, and
+    receives one scoped to a single flight, with no path back. What the browser
+    hands to MediaMTX and ws-server can watch one flight and do nothing else,
+    while the session token that authorised it stays in an httpOnly cookie the
+    page's own JavaScript cannot read.
+
+    Which flight: it used to return "the most recent", which was wrong two ways
+    at once — it could hand out a token for a flight that had already landed
+    (start time is not a liveness signal), and it silently picked one once a
+    second stream could be active at the same time. Both are the same underlying
+    bug ("latest" is not "active"), so both are fixed by the same query: with
+    zero active flights there is nothing to hand out, with exactly one there is
+    nothing to ask, and with more than one the caller must say which stream_id
+    it means.
 
     The token is scoped to a flight belonging to the authenticated user, so a
     user can never be issued a token for someone else's flight.
     """
+    user_id = _require_session(authorization)
+    stream_id = req.stream_id if req is not None else None
+
     try:
-        user_id = _directory.authenticate(req.email, req.password)
-    except ValueError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        active = _directory.active_flights(user_id)
     except Exception as e:
         logger.error(f"Unexpected error issuing viewer token: {e}")
         raise HTTPException(status_code=500, detail="Failed to issue viewer token")
 
-    active = _directory.active_flights(user_id)
-
-    if req.stream_id is not None:
-        matches = [f for f in active if f["stream_id"] == req.stream_id]
+    if stream_id is not None:
+        matches = [f for f in active if f["stream_id"] == stream_id]
         if not matches:
             # Deliberately the same 404 whether stream_id belongs to someone else
             # or simply has nothing active: the caller already owns every row in
@@ -622,7 +642,7 @@ def issue_viewer_token(req: ViewerTokenRequest):
             "active_flights": active,
         })
 
-    logger.info(f"Viewer token issued: flight_id={flight_id}, user={req.email}")
+    logger.info(f"Viewer token issued: flight_id={flight_id}, user_id={user_id}")
     return {
         "flight_id": flight_id,
         "viewer_token": mint_viewer_token(flight_id, user_id),
