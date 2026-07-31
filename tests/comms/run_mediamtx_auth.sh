@@ -63,7 +63,7 @@ ENVV=(-e DB_SERVICE=postgresql -e DB_HOST=mtxa-pg -e DB_PORT=5432 -e DB_NAME=tes
 
 echo "==> seeding two tenants, one stream each"
 SEED=$(docker run --rm --network "$NET" "${ENVV[@]}" "$IMAGE" \
-  sh -c "echo yes | python rebuild_schema.py --drop --seed-user alice@test.io --seed-password pw123" 2>&1)
+  sh -c "echo yes | python rebuild_schema.py --drop --seed-user alice@test.io --seed-password pw12345678" 2>&1)
 KEY_A=$(echo "$SEED" | sed -n 's/.*stream key : \([a-z0-9]*\).*/\1/p')
 
 # Second tenant, so every denial can be tested against a real credential that simply
@@ -136,7 +136,7 @@ UID_A=$(echo "$A" | jsonget user_id)
 [ -n "$UUID_A" ] && [ -n "$UUID_B" ] || { echo "could not open flights: $A / $B"; exit 1; }
 echo "    alice flight uuid=$UUID_A   bob flight uuid=$UUID_B"
 
-VA=$(viewer_token alice@test.io pw123)
+VA=$(viewer_token alice@test.io pw12345678)
 VB=$(viewer_token bob@test.io pw456)
 VIEW_A=$(echo "$VA" | jsonget viewer_token)
 VIEW_B=$(echo "$VB" | jsonget viewer_token)
@@ -227,7 +227,7 @@ check "a revoked key can no longer publish" \
 
 echo
 echo "── viewer/token: disambiguation once a user has two active flights ────────"
-resp=$(viewer_token_call alice@test.io pw123)
+resp=$(viewer_token_call alice@test.io pw12345678)
 check "one active flight: 200, no stream_id needed" 200 "$(vt_code "$resp")"
 check "one active flight: resolves to it" "$FID_A" "$(echo "$(vt_body "$resp")" | jsonget flight_id)"
 
@@ -240,15 +240,15 @@ A2=$(open_flight "$KEY_A2")
 FID_A2=$(echo "$A2" | jsonget flight_id); SID_A2=$(echo "$A2" | jsonget stream_id)
 [ -n "$FID_A2" ] || { echo "could not open alice's second flight: $A2"; exit 1; }
 
-resp=$(viewer_token_call alice@test.io pw123)
+resp=$(viewer_token_call alice@test.io pw12345678)
 check "two active flights, no stream_id: 409 (ambiguous, not a guess)" 409 "$(vt_code "$resp")"
-resp=$(viewer_token_call alice@test.io pw123 "$SID_A")
+resp=$(viewer_token_call alice@test.io pw12345678 "$SID_A")
 check "two active flights, first stream_id: resolves to that flight" "$FID_A" \
       "$(echo "$(vt_body "$resp")" | jsonget flight_id)"
-resp=$(viewer_token_call alice@test.io pw123 "$SID_A2")
+resp=$(viewer_token_call alice@test.io pw12345678 "$SID_A2")
 check "two active flights, second stream_id: resolves to that flight" "$FID_A2" \
       "$(echo "$(vt_body "$resp")" | jsonget flight_id)"
-resp=$(viewer_token_call alice@test.io pw123 "$SID_B")
+resp=$(viewer_token_call alice@test.io pw12345678 "$SID_B")
 check "alice cannot get a token for bob's stream_id" 404 "$(vt_code "$resp")"
 
 echo

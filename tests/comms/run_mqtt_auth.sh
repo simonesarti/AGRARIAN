@@ -72,7 +72,7 @@ ENVV=(-e DB_SERVICE=postgresql -e DB_HOST=mqtta-pg -e DB_PORT=5432 -e DB_NAME=te
 
 echo "==> seeding two tenants, one stream each"
 SEED=$(docker run --rm --network "$NET" "${ENVV[@]}" "$IMAGE" \
-  sh -c "echo yes | python rebuild_schema.py --drop --seed-user alice@test.io --seed-password pw123" 2>&1)
+  sh -c "echo yes | python rebuild_schema.py --drop --seed-user alice@test.io --seed-password pw12345678" 2>&1)
 KEY_A=$(echo "$SEED" | sed -n 's/.*stream key : \([a-z0-9]*\).*/\1/p')
 
 KEY_B=$(docker run --rm --network "$NET" "${ENVV[@]}" "$IMAGE" python -c "

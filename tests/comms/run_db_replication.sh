@@ -40,7 +40,7 @@ ENVV=(-e DB_SERVICE=postgresql -e DB_HOST=dbw-pg -e DB_PORT=5432 -e DB_NAME=test
 
 echo "==> seeding schema, one user, one stream"
 SEED=$(docker run --rm --network "$NET" "${ENVV[@]}" "$IMAGE" \
-  sh -c "echo yes | python rebuild_schema.py --drop --seed-user pilot@test.io --seed-password pw123" \
+  sh -c "echo yes | python rebuild_schema.py --drop --seed-user pilot@test.io --seed-password pw12345678" \
   2>&1)
 echo "$SEED" | tail -5
 STREAM_KEY=$(echo "$SEED" | sed -n 's/.*stream key : \([a-z0-9]*\).*/\1/p')

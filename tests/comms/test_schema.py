@@ -36,6 +36,21 @@ def check(name, ok, detail=""):
     print(("PASS  " if ok else "FAIL  ") + name + (f"   [{detail}]" if detail else ""))
 
 
+def raises(exc, fn, *args):
+    """True if fn(*args) raises exc. Anything else propagates — a test that passes
+    because the wrong error was raised is worse than one that fails."""
+    try:
+        fn(*args)
+    except exc:
+        return True
+    return False
+
+
+def stored_password(SessionFactory, user_id):
+    with SessionFactory() as s:
+        return s.query(m.User).filter_by(user_id=user_id).first().password
+
+
 def build():
     """A UserDirectory bound to a throwaway in-memory database."""
     d = m.UserDirectory.__new__(m.UserDirectory)      # skip __init__; no real DB URL
@@ -58,12 +73,54 @@ def main():
     check("flights carries stream_id + public_uuid + output_path",
           {"stream_id", "public_uuid", "output_path"} <= set(flight_cols))
 
-    with S() as s:
-        s.add(m.User(email="a@b.c", password=m.User.hash_password("pw")))
-        s.add(m.User(email="x@y.z", password=m.User.hash_password("pw")))
-        s.commit()
-    u1 = d.authenticate("a@b.c", "pw")
-    u2 = d.authenticate("x@y.z", "pw")
+    # ── registration ─────────────────────────────────────────────────────────
+    # Open to anyone (§3), so every argument here is untrusted input.
+    created = d.create_user("a@b.c", "correct horse")
+    d.create_user("x@y.z", "correct horse")
+    check("create_user returns the new user_id", isinstance(created["user_id"], int))
+    u1 = d.authenticate("a@b.c", "correct horse")
+    u2 = d.authenticate("x@y.z", "correct horse")
+    check("a registered user authenticates", u1 == created["user_id"])
+    check("the wrong password is refused", raises(ValueError, d.authenticate, "a@b.c", "nope"))
+
+    check("the password is not stored in plaintext", stored_password(S, u1) != "correct horse")
+
+    # Case and whitespace: the unique constraint is case-sensitive in PostgreSQL, so
+    # without normalisation these are two accounts and the second login silently fails.
+    check("a duplicate email is refused",
+          raises(m.EmailAlreadyRegistered, d.create_user, "a@b.c", "correct horse"))
+    check("the same email in another case is a duplicate too",
+          raises(m.EmailAlreadyRegistered, d.create_user, "A@B.C", "correct horse"))
+    check("surrounding whitespace does not make a new account",
+          raises(m.EmailAlreadyRegistered, d.create_user, "  a@b.c  ", "correct horse"))
+    check("login works in any casing", d.authenticate("A@b.C", "correct horse") == u1)
+    check("EmailAlreadyRegistered is still a ValueError",
+          issubclass(m.EmailAlreadyRegistered, ValueError))
+
+    check("a too-short password is refused",
+          raises(ValueError, d.create_user, "new@b.c", "a" * (m.MIN_PASSWORD_LENGTH - 1)))
+    # bcrypt ignores everything past the 72nd byte and 5.x raises rather than
+    # truncating, so this has to be caught before hashing or it is a 500.
+    check("a password over bcrypt's 72-byte limit is refused",
+          raises(ValueError, d.create_user, "new@b.c", "a" * (m.MAX_PASSWORD_BYTES + 1)))
+    check("the byte limit counts bytes, not characters",
+          raises(ValueError, d.create_user, "new@b.c", "🔒" * 19))    # 76 bytes, 19 chars
+    check("a 72-byte password is accepted",
+          d.create_user("edge@b.c", "a" * m.MAX_PASSWORD_BYTES)["user_id"] > 0)
+
+    for bad in ("", "   ", "nope", "@b.c", "a@", "a@b", "a b@c.d"):
+        check(f"a malformed email is refused: {bad!r}",
+              raises(ValueError, d.create_user, bad, "correct horse"))
+    # 254 is RFC 5321's limit and therefore legal; 255 is not.
+    check("an email at exactly the length limit is accepted",
+          d.create_user("a" * 250 + "@b.c", "correct horse")["user_id"] > 0)
+    check("an over-long email is refused",
+          raises(ValueError, d.create_user, "a" * 251 + "@b.c", "correct horse"))
+
+    # A rejected registration must leave nothing behind — a half-created account
+    # would take the address without being loginable.
+    check("a rejected registration creates no row",
+          raises(ValueError, d.authenticate, "new@b.c", "correct horse"))
 
     # ── key generation ───────────────────────────────────────────────────────
     keys = {m.generate_stream_key() for _ in range(5000)}

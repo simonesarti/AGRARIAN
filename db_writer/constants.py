@@ -28,6 +28,24 @@ TOKEN_SCOPE_PUBLISH = "publish"
 # container than a genuinely long sortie.
 PUBLISHER_TOKEN_TTL_S = 24 * 60 * 60       # 24 h
 
+# ── Account registration ──────────────────────────────────────────────────────
+# Registration is open to anyone, so create_user is reachable from the public
+# internet and every argument it takes is untrusted.
+
+# NIST SP 800-63B's floor for a user-chosen secret. Deliberately no composition
+# rules (a digit, a symbol, a capital): they cost users more than they cost an
+# attacker, and the same document advises against them.
+MIN_PASSWORD_LENGTH = 8
+
+# bcrypt's hard limit, and not a policy choice. Everything past the 72nd BYTE is
+# ignored by the algorithm — bcrypt 5.x raises rather than truncating, so without
+# this check a long passphrase is a 500 instead of a clear error. Bytes, not
+# characters: one emoji is four of these.
+MAX_PASSWORD_BYTES = 72
+
+# RFC 5321's maximum forward-path length.
+MAX_EMAIL_LENGTH = 254
+
 # ── Drone stream keys ─────────────────────────────────────────────────────────
 # The operator types the ingest URL into the drone controller by hand before every
 # flight, so the key has to be short enough to transcribe without error. That rules

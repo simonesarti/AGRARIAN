@@ -295,12 +295,36 @@ worth different amounts:
 | **Session** | `httpOnly` cookie | Browser JavaScript cannot read it, so an XSS bug in the front-end cannot steal the credential that controls the whole account |
 | **Viewer** | readable by JS | It *must* be — JS puts it in a WebSocket query string and an `Authorization` header. Flight-scoped and hours-long, so it is designed to be exposed |
 
-### Registration is open **[designed]**
+### Registration is open **[built]**
 
 Anyone may create an account. The consequence to keep in view: an account can mint stream
 keys, and a stream key is the thing that causes a GPU container to be created. Open
 registration therefore connects an anonymous signup to GPU spend, and the limit on that
 is **concurrent flights per user**, which nothing enforces yet — see §9.
+
+`UserDirectory.create_user` is the only way an account comes into existence, including
+from `rebuild_schema.py --seed-user`, which used to build the rows itself. A seeded
+account the portal would have refused to create is a fixture that does not represent a
+real user, and the bug that hides only appears in production.
+
+Three properties of it are worth stating because each closes a defect that is invisible
+until it bites:
+
+- **Emails are normalised on write *and* on read.** PostgreSQL's unique constraint is
+  case-sensitive, so `Alice@example.com` and `alice@example.com` are two accounts —
+  and whichever casing the user did not type at login fails to authenticate with
+  nothing on screen to explain it. Normalising on write alone would not fix that;
+  `authenticate` had to change too.
+- **Duplicates are caught by the constraint, not by a prior `SELECT`.** db-writer runs
+  N replicas, so check-then-insert is a race two simultaneous registrations of the same
+  address can both pass. The unique index is the only arbiter that sees both.
+  `EmailAlreadyRegistered` subclasses `ValueError`, so the HTTP layer can answer 409
+  rather than 400 without matching on message text.
+- **Passwords are bounded at 72 *bytes*.** That is bcrypt's limit, not a policy: every
+  byte past it is ignored by the algorithm, and bcrypt 5.x raises rather than truncating,
+  so an unchecked long passphrase is a 500. Bytes rather than characters, because one
+  emoji is four of them. The minimum is 8 (NIST SP 800-63B) with no composition rules,
+  which the same document advises against.
 
 ---
 
@@ -515,9 +539,9 @@ HTTP route. A second service writing the same tables would give two authorities 
 schema with nothing to say which is right — the objection §5 uses to keep `user_id` off
 the `flights` table, applied to services instead of columns.
 
-`create_user` does **not** exist in any form. The only code that has ever created a user
-is `rebuild_schema.py --seed-user`, which is the destructive rebuild script, so
-lifecycle step 1 has no backend at all today.
+`UserDirectory.create_user` now exists (§3) and `rebuild_schema.py --seed-user` goes
+through it, so registration and seeding are one code path. What is still missing is the
+HTTP route in front of it — nothing reachable over the network creates a user.
 
 #### The browser never reaches db-writer
 
@@ -615,8 +639,8 @@ Steps 3–6 and 8 are **[built]**; 1–2 wait on the portal. Step 6 is verified 
 target GPU — see §9.
 
 1. User registers on the portal → row in `users`, and logs in for a session token.
-   Registration is open to anyone. **[designed]** — needs `UserDirectory.create_user`,
-   which does not exist yet.
+   Registration is open to anyone. `UserDirectory.create_user` is **[built]**; the
+   HTTP route in front of it is **[designed]**.
 2. User adds a stream → row in `streams` with a generated `stream_key`, shown once. The
    portal offers rotate and retire. **[designed]** — the `UserDirectory` methods exist
    and are tested; nothing exposes them over HTTP.
@@ -761,6 +785,17 @@ simpler by one hop and would break this line.
 
 ### Built and tested
 
+- **Account registration** (`UserDirectory.create_user`, §3). Verified by 22 assertions
+  against SQLite in `test_schema.py` — email normalisation on both write and read,
+  duplicate refusal including a differing case and surrounding whitespace, the bcrypt
+  72-**byte** boundary measured in bytes rather than characters, the 8-character floor,
+  malformed and over-long addresses, and that a rejected registration leaves no row —
+  plus 6 against **real PostgreSQL**, which is where the duplicate path actually
+  matters: psycopg2's `IntegrityError` (not SQLite's) is what the race guard catches,
+  the case-variant duplicate is refused by a genuinely case-sensitive unique index, and
+  the directory keeps working after a rejected insert rather than being poisoned by it.
+  `rebuild_schema.py --seed-user` was rewritten onto the same path and re-verified end
+  to end, including that it now refuses to seed an account the portal would reject.
 - ws-server per-flight isolation, Redis fan-out across replicas, and viewer JWT
   validation. Verified by 11 tenancy tests and 2 cross-replica tests, including
   confirmation that a second tenant's viewer receives nothing.
@@ -909,6 +944,8 @@ work that has yet to start.
 The schema and its accessors exist and are tested; **no service consumes them yet**, so
 they change nothing about how the system currently behaves.
 
+- `UserDirectory.create_user` — registration works and is tested, but nothing reachable
+  over the network calls it. Only `rebuild_schema.py --seed-user` does.
 - `UserDirectory.create_stream` / `list_streams` / `revoke_stream` / `rotate_stream_key`,
   with cross-user access refused — these are the portal's operations, and there is no
   portal. They need no rewrite, only an HTTP route that passes `user_id` from a verified
@@ -928,7 +965,7 @@ this list — it is set inside `open_flight_for_key` the moment a flight opens, 
   the existing JWT mechanism, user-facing routes on db-writer, a stateless front-end
   service holding an `httpOnly` cookie, and the browser never reaching db-writer
   directly. In order:
-  1. `UserDirectory.create_user` — the `User` model already hashes with bcrypt
+  1. ~~`UserDirectory.create_user`~~ — **[built]**, see §3
   2. `POST /register`, `POST /login` on db-writer → session token
   3. Stream CRUD routes taking `user_id` from the claim, wrapping methods that exist
   4. `/viewer/token` accepts a session token instead of email and password

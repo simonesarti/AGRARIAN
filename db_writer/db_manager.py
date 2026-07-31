@@ -8,6 +8,7 @@ from typing import List, Optional
 
 import bcrypt
 from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, LargeBinary, String, create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 
 from constants import (
@@ -16,6 +17,9 @@ from constants import (
     DB_MANAGER_POOL_SIZE,
     DB_MANAGER_QUEUE_WAIT_TIMEOUT,
     DB_MANAGER_THREAD_CLOSE_TIMEOUT,
+    MAX_EMAIL_LENGTH,
+    MAX_PASSWORD_BYTES,
+    MIN_PASSWORD_LENGTH,
     STREAM_KEY_ALPHABET,
     STREAM_KEY_LENGTH,
 )
@@ -101,6 +105,38 @@ def generate_stream_key() -> str:
     default RNG is predictable from prior outputs.
     """
     return "".join(secrets.choice(STREAM_KEY_ALPHABET) for _ in range(STREAM_KEY_LENGTH))
+
+
+def normalize_email(email: str) -> str:
+    """
+    One canonical form per address, applied on every read and every write.
+
+    The unique constraint on users.email is case-SENSITIVE in PostgreSQL, so
+    without this "Alice@example.com" and "alice@example.com" are two separate
+    accounts — and the user who registers with one and logs in with the other
+    gets "invalid credentials" with nothing on screen to explain why.
+
+    Lowercasing the whole address is stricter than RFC 5321, which makes the
+    local part case-sensitive on paper. No mail provider treats it that way in
+    practice, and the alternative is a class of unexplainable login failures.
+
+    Applied in exactly one place per direction — create_user and authenticate —
+    which is the only way it protects anything: normalising on write alone would
+    still fail to match a differently-cased login.
+    """
+    return email.strip().lower()
+
+
+class EmailAlreadyRegistered(ValueError):
+    """
+    Raised by create_user when the address is taken.
+
+    A ValueError subclass on purpose: callers that catch ValueError for the other
+    validation failures keep working unchanged, while the HTTP layer can still
+    separate "this email exists" (409) from "this password is too short" (400)
+    without matching on message text.
+    """
+
 
 Base = declarative_base()
 
@@ -297,11 +333,71 @@ class UserDirectory:
             connect_args={'connect_timeout': 5},
         )
 
+    # ── Accounts ──────────────────────────────────────────────────────────────
+
+    def create_user(self, email: str, password: str) -> dict:
+        """
+        Register an account. Returns {"user_id", "email"} with the stored form of
+        the address.
+
+        Registration is open, so this is reachable by anyone on the internet and
+        both arguments are untrusted. It is also the only method here that creates
+        a principal rather than something belonging to one.
+
+        Raises EmailAlreadyRegistered if the address is taken, ValueError for any
+        other rejection.
+        """
+        email = normalize_email(email)
+
+        if not email:
+            raise ValueError("Email is required")
+        if len(email) > MAX_EMAIL_LENGTH:
+            raise ValueError(f"Email must be at most {MAX_EMAIL_LENGTH} characters")
+        # Deliberately not RFC-complete: a full grammar is large, and every address
+        # it would additionally reject is one that simply fails to receive mail.
+        # This catches the input that is not an address at all.
+        local, sep, domain = email.partition("@")
+        if not sep or not local or not domain or "." not in domain:
+            raise ValueError("Email is not a valid address")
+        # Interior whitespace survives .strip() and would otherwise pass every check
+        # above — "a b@c.d" has a local part, a domain and a dot.
+        if any(c.isspace() for c in email):
+            raise ValueError("Email is not a valid address")
+
+        if len(password) < MIN_PASSWORD_LENGTH:
+            raise ValueError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters")
+        # Checked in bytes because that is the unit bcrypt's limit is expressed in,
+        # and it is measured BEFORE hashing so an over-long passphrase is a clear
+        # rejection rather than the ValueError bcrypt itself would raise from inside
+        # hash_password, which the caller could only report as a 500.
+        if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
+            raise ValueError(f"Password must be at most {MAX_PASSWORD_BYTES} bytes")
+
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            user = User(email=email, password=User.hash_password(password))
+            session.add(user)
+            try:
+                session.commit()
+            except IntegrityError:
+                # Insert first and let the unique constraint decide, rather than
+                # SELECT-then-INSERT. db-writer runs N replicas (§4), so a check
+                # before the insert is a race two simultaneous registrations of the
+                # same address can both pass — the constraint is the only arbiter
+                # that sees both.
+                session.rollback()
+                raise EmailAlreadyRegistered("That email is already registered")
+
+            logger.info(f"User registered: user_id={user.user_id}")
+            return {"user_id": user.user_id, "email": user.email}
+
     def authenticate(self, email: str, password: str) -> int:
         """Return the user_id for valid credentials; raise ValueError otherwise."""
         SessionFactory = sessionmaker(bind=self._engine)
         with SessionFactory() as session:
-            user = session.query(User).filter_by(email=email).first()
+            # Normalised the same way create_user stored it, or a correct password
+            # under a differently-cased address would be rejected.
+            user = session.query(User).filter_by(email=normalize_email(email)).first()
             if not user or not user.verify_password(password):
                 raise ValueError("Authentication failed: Invalid credentials.")
             return user.user_id

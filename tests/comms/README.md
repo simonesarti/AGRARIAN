@@ -138,6 +138,15 @@ Also pins `active_flights()`, which resolves `/viewer/token`: only currently ope
 flights count (a landed one — `end_time` set — must not come back), and a lone
 active flight resolves with nothing to disambiguate.
 
+Registration (`create_user`) is pinned here too, since it is open to the internet and
+every argument is untrusted: emails normalise on write *and* on read (PostgreSQL's
+unique index is case-sensitive, so without both halves a user who registers as
+`Alice@` and logs in as `alice@` is simply refused), duplicates are caught by the
+constraint rather than a prior `SELECT` (check-then-insert is a race across replicas),
+and passwords are bounded at bcrypt's 72-**byte** limit measured in bytes — one emoji
+is four — because bcrypt 5.x raises past it and an unguarded long passphrase would be
+a 500 rather than a clear rejection.
+
 **`test_tokens.py`** — viewer and publisher tokens are signed with the same secret, so
 the `scope` claim is the only thing separating them. Checked in both directions, plus
 cross-flight replay, forged signatures, expiry, and a scopeless token (which must fail

@@ -74,7 +74,7 @@ ENVV=(-e DB_SERVICE=postgresql -e DB_HOST=orchreal-pg -e DB_PORT=5432 -e DB_NAME
 
 echo "==> seeding a tenant"
 SEED=$(docker run --rm --network "$NET" "${ENVV[@]}" "$DBW_IMAGE" \
-  sh -c "echo yes | python rebuild_schema.py --drop --seed-user pilot@test.io --seed-password pw123" 2>&1)
+  sh -c "echo yes | python rebuild_schema.py --drop --seed-user pilot@test.io --seed-password pw12345678" 2>&1)
 KEY=$(echo "$SEED" | sed -n 's/.*stream key : \([a-z0-9]*\).*/\1/p')
 [ -n "$KEY" ] || { echo "seeding failed:"; echo "$SEED"; exit 1; }
 echo "    stream key = $KEY"

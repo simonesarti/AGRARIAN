@@ -23,8 +23,7 @@ import sys
 
 from sqlalchemy import create_engine
 
-from db_manager import Base, Stream, User, generate_stream_key
-from sqlalchemy.orm import sessionmaker
+from db_manager import Base, UserDirectory
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 logger = logging.getLogger("rebuild_schema")
@@ -77,24 +76,28 @@ def main() -> int:
     logger.info(f"Tables present: {', '.join(sorted(Base.metadata.tables))}")
 
     if args.seed_user:
-        SessionFactory = sessionmaker(bind=engine)
-        with SessionFactory() as session:
-            user = User(email=args.seed_user,
-                        password=User.hash_password(args.seed_password))
-            session.add(user)
-            session.commit()
+        # Through UserDirectory rather than building the rows directly, so seeding
+        # and registration are the same code path. A seeded account that the portal
+        # would have refused to create — a too-short password, an address stored in
+        # a casing that then fails to authenticate — is a test fixture that does not
+        # represent a real user, and the bug it hides shows up in production only.
+        directory = UserDirectory.__new__(UserDirectory)
+        directory._engine = engine
 
-            stream = Stream(user_id=user.user_id, label=args.seed_stream,
-                            stream_key=generate_stream_key())
-            session.add(stream)
-            session.commit()
+        try:
+            user = directory.create_user(args.seed_user, args.seed_password)
+        except ValueError as e:
+            logger.error(f"Cannot seed user: {e}")
+            return 1
 
-            logger.info(f"Seeded user_id={user.user_id} ({args.seed_user})")
-            logger.info(f"Seeded stream_id={stream.stream_id} ({args.seed_stream})")
-            print()
-            print(f"  stream key : {stream.stream_key}")
-            print(f"  ingest URL : rtmp://<host>:1935/in/{stream.stream_key}")
-            print()
+        stream = directory.create_stream(user["user_id"], args.seed_stream)
+
+        logger.info(f"Seeded user_id={user['user_id']} ({user['email']})")
+        logger.info(f"Seeded stream_id={stream['stream_id']} ({args.seed_stream})")
+        print()
+        print(f"  stream key : {stream['stream_key']}")
+        print(f"  ingest URL : rtmp://<host>:1935/in/{stream['stream_key']}")
+        print()
 
     logger.info("Done.")
     return 0
