@@ -13,7 +13,7 @@
 # Ports exposed to the viewer:
 #   8888  — MediaMTX HLS
 #   8889  — MediaMTX WebRTC (WHEP signalling)
-#   8189  — MediaMTX WebRTC (ICE/media UDP)
+#   8189  — MediaMTX WebRTC (ICE/media, UDP and TCP)
 #   ${WS_PORT} — WebSocket alert stream
 #   8003  — portal
 #
@@ -83,7 +83,8 @@ services:
       - "1935:1935"       # RTMP  — app pushes annotated stream
       - "8888:8888"       # HLS
       - "8889:8889"       # WebRTC signalling (WHEP)
-      - "8189:8189/udp"   # WebRTC ICE — actual media UDP flow
+      - "8189:8189/udp"   # WebRTC ICE — actual media flow
+      - "8189:8189/tcp"   # WebRTC ICE over TCP — for networks that pass no UDP
     environment:
       MTX_WEBRTCICEHOSTNAT1TO1IPS: ${MEDIAMTX_HOST}
     volumes:

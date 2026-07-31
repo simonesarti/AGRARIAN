@@ -24,6 +24,22 @@ webrtcAddress: :8889
 webrtcICEServers2:
   - url: stun:stun.l.google.com:19302
 
+# ICE over TCP, in addition to the UDP flow on the same port number. Off by
+# default in MediaMTX (webrtcLocalTCPAddress: "").
+#
+# WebRTC media is UDP, and some networks — office and corporate firewalls
+# especially — pass no UDP at all. Without this such a viewer sees nothing and
+# has no way round it. With it the same WHEP session, the same viewer token and
+# the same player fall back to TCP, at a modest cost in behaviour under packet
+# loss since TCP retransmits what a real-time stream would rather drop.
+#
+# This is the reason the portal no longer offers HLS as the fallback: HLS meant
+# a second protocol, a second player and a second manifest-auth path to solve a
+# problem one line of transport configuration solves, and it costs 6-30s of
+# latency, which puts the video visibly out of step with the alert feed beside
+# it. What ICE-TCP does NOT cover is a network that permits only 443 — see §9.
+webrtcLocalTCPAddress: :8189
+
 hls: yes
 hlsAddress: :8888
 

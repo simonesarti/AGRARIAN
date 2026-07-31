@@ -22,15 +22,14 @@
          the internal user roster that authMethod: http replaced — so no
          credential could ever have opened it. #}
       <video id="player" autoplay muted playsinline controls title="Annotated live video"></video>
-      {# Not a link to the .m3u8. Chrome, Firefox and Edge have no native HLS
-         support, so navigating to a playlist gives a blank page — which is what
-         this used to do. The button switches the player above instead, and says
-         so plainly when the browser cannot do it either. #}
-      <p class="muted small">
-        Video not playing? <button id="hls" type="button" class="linkish" hidden>Play via HLS instead</button>
-        — WebRTC needs UDP, which some networks block.
-      </p>
-      <p id="hls-note" class="muted small" hidden></p>
+      {# No HLS fallback control. It offered a second protocol, a second player
+         and a second manifest-auth path to solve one problem — networks that
+         pass no UDP — which MediaMTX's ICE-TCP now solves in the same session,
+         with the same token, at the same latency. HLS also runs 6-30s behind,
+         which would put this video visibly out of step with the alert feed
+         beside it. hls_url is still returned by /api/viewer-token for VLC and
+         ffmpeg; it is simply not a button. #}
+      <p id="video-note" class="muted small" hidden></p>
     </div>
 
     <aside class="alerts">

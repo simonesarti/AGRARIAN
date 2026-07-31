@@ -21,8 +21,7 @@
   const alertStatusEl = document.getElementById("alert-status");
   const listEl = document.getElementById("alert-list");
   const playerEl = document.getElementById("player");
-  const hlsEl = document.getElementById("hls");
-  const hlsNoteEl = document.getElementById("hls-note");
+  const videoNoteEl = document.getElementById("video-note");
 
   const MAX_ALERTS = 50;          // the DOM, not the flight — older ones scroll off
   const RECONNECT_MS = 3000;
@@ -30,6 +29,11 @@
   let socket = null;
   let pc = null;
   let closing = false;
+
+  function note(text) {
+    videoNoteEl.textContent = text;
+    videoNoteEl.hidden = false;
+  }
 
   function setStatus(text, kind) {
     statusEl.textContent = text;
@@ -93,43 +97,7 @@
     });
   }
 
-  /*
-   * The HLS fallback exists for networks that block WebRTC's UDP, which is a
-   * real case in offices. It is NOT a link to the .m3u8: Chrome, Firefox and
-   * Edge have no native HLS support, so navigating to a playlist renders a blank
-   * page — the symptom this replaced.
-   *
-   * Playing it in-page needs either native support (Safari, iOS) or Media Source
-   * Extensions plus a demuxer, which is what hls.js is. Nothing is vendored
-   * here, so on a browser without native support this says so rather than
-   * showing black.
-   */
-  function nativeHls() {
-    return Boolean(playerEl.canPlayType("application/vnd.apple.mpegurl"));
-  }
-
-  function startHls(info) {
-    if (!nativeHls()) {
-      hlsNoteEl.textContent =
-        "This browser cannot play HLS without an extra library. Safari and iOS can; " +
-        "Chrome, Firefox and Edge cannot. WebRTC above is the supported path here.";
-      hlsNoteEl.hidden = false;
-      return;
-    }
-    if (pc) { pc.close(); pc = null; }
-    playerEl.srcObject = null;
-    playerEl.src = info.hls_url;
-    playerEl.play().catch(function () {
-      // Autoplay refusal is not a stream failure; the controls are visible.
-      hlsNoteEl.textContent = "Press play to start the HLS stream.";
-      hlsNoteEl.hidden = false;
-    });
-    setStatus("Live over HLS — flight " + info.flight_id, "live-text");
-  }
-
   async function startVideo(info) {
-    hlsEl.hidden = false;
-    hlsEl.onclick = function () { startHls(info); };
 
     // start() also runs when the ALERT socket reconnects, which says nothing
     // about the video. Renegotiating a healthy stream would black the picture
@@ -150,7 +118,9 @@
     pc.onconnectionstatechange = function () {
       if (!pc) return;
       if (pc.connectionState === "failed") {
-        setStatus("Video connection failed — use the HLS link below.", "error");
+        setStatus("Video connection failed.", "error");
+        note("The stream could not be reached. Reload to try again — WebRTC "
+             + "falls back to TCP automatically where UDP is blocked.");
       }
     };
 
@@ -166,7 +136,7 @@
         body: pc.localDescription.sdp,
       });
     } catch (e) {
-      setStatus("Could not reach the video server. Use the HLS link below.", "error");
+      setStatus("Could not reach the video server.", "error");
       return;
     }
 
@@ -262,7 +232,7 @@
     // Not awaited: the alert stream must not wait on an ICE gathering timeout,
     // and a video failure is reported in place rather than stopping the page.
     startVideo(info).catch(function () {
-      setStatus("Could not start the video. Use the HLS link below.", "error");
+      setStatus("Could not start the video.", "error");
     });
     openAlerts(info);
   }

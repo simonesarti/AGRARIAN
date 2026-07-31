@@ -3,10 +3,10 @@
 # here can reach.
 #
 # Everything else in this directory asserts against logs, databases and HTTP status
-# codes. Playback cannot be checked that way: the watch page embeds MediaMTX's own
-# reader page in an iframe rather than negotiating WHEP itself, so whether a viewer
-# sees video depends on MediaMTX's client JavaScript carrying the ?jwt= query
-# through to its own WHEP request. That is a browser behaviour, and it needs eyes.
+# codes. The playback PROTOCOL is now covered that way — a WHEP client gets a 201
+# and decodes frames — but the page around it is not: autoplay policy on a <video>
+# element, whether the alert aside renders, and behaviour on a phone are browser
+# behaviours, and they need eyes.
 #
 # So this script is not a test — it stands the whole product up, puts a flight in
 # the air, prints a URL, and waits. It exits when you press Enter, cleaning up
@@ -59,7 +59,7 @@ docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi >/dev/
   && [ -f "$REPO/checkpoints/best_model_segunified_1280_720.onnx" ] \
   || { echo "missing checkpoints/ files for danger_detection"; exit 1; }
 
-for p in 8003 8888 8889 8765 1935; do
+for p in 8003 8888 8889 8765 1935 8189; do
   if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
     exec 3<&- 3>&-
     echo "port $p is already in use — is a compose stack or a previous run still up?"
@@ -134,7 +134,7 @@ docker run -d --name watch-orchestrator --network "$NET" \
   "$ORC_IMAGE" >/dev/null || { echo "orchestrator failed"; exit 1; }
 
 docker run -d --name watch-mediamtx --network "$NET" \
-  -p 1935:1935 -p 8888:8888 -p 8889:8889 -p 8189:8189/udp \
+  -p 1935:1935 -p 8888:8888 -p 8889:8889 -p 8189:8189/udp -p 8189:8189/tcp \
   -e MTX_WEBRTCICEHOSTNAT1TO1IPS="$HOST" \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
   bluenviron/mediamtx:latest-ffmpeg >/dev/null || { echo "mediamtx failed"; exit 1; }
@@ -210,10 +210,15 @@ cat <<BANNER
        docker exec watch-redis redis-cli -n 0 PUBLISH flight:$FLIGHT_ID \\
          '{"message":"hand-injected alert","timestamp":"now"}'
 
-  d) Try the HLS URL directly if WebRTC fails — it is the same token on a
-     different protocol, and tells you whether the problem is the credential
-     or the WebRTC path:
-         http://$HOST:8888/out/$UUID/index.m3u8?jwt=<token from the page>
+  d) The page offers no HLS button any more — ICE-TCP covers the UDP-blocked
+     case in the same session. HLS is still served, and is still the quickest
+     way to tell a credential problem from a WebRTC one, but you now reach it
+     with a real player rather than a browser:
+
+       ffplay "http://$HOST:8888/out/$UUID/index.m3u8?jwt=<token from devtools>"
+
+     Browsers other than Safari cannot play a .m3u8 natively, which is exactly
+     why the button went.
 
   Logs while you look:
      docker logs -f watch-mediamtx        # auth decisions, reader connects

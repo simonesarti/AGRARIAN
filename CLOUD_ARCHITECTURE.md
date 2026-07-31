@@ -41,6 +41,12 @@ MediaMTX, Mosquitto, ws-server, db-writer, Redis, the recorder and the portal ar
 **shared, multi-tenant services**. One deployment serves every user. Replicas are added
 when load demands it, not when a user signs up.
 
+One exception, stated here rather than discovered later: **MediaMTX does not replicate
+behind a load balancer.** A path lives on the single instance its publisher connected to,
+so adding replicas does not add capacity for an existing flight — it needs path-aware
+routing or a relay tree instead. Everything else on this list is stateless or made so.
+See §9; it is not pressing, because the GPU tier saturates long first.
+
 These are I/O-bound and cheap. Running a private copy per user would waste an order of
 magnitude of resource and multiply the operational surface (certificates, DNS entries,
 health checks, upgrades) by the user count.
@@ -919,6 +925,14 @@ the slice is small and the decision is reversible, which is the right size for i
 identity that ACLs and the auth hook depend on, and WebRTC media is DTLS-SRTP over UDP
 end-to-end, so it bypasses an L7 proxy entirely. Only WHEP signalling is HTTP.
 
+WebRTC media also listens on **TCP/8189 as well as UDP** (`webrtcLocalTCPAddress`), because
+some networks pass no UDP at all and such a viewer would otherwise have no way to watch.
+ICE picks the transport; the session, the token and the latency are unchanged. This is why
+the portal offers no HLS fallback: HLS would mean a second protocol, a second player and a
+second manifest-auth path to solve the same problem, at 6–30s of added latency that would
+put the video visibly out of step with the alert feed beside it. Neither transport may be
+proxied — both are end-to-end DTLS-SRTP.
+
 (Traefik *does* support TCP routers with SNI, so proxying RTMPS is possible — self-termination
 is chosen for the identity-preservation reason, not because of a Traefik limitation.)
 
@@ -977,6 +991,7 @@ which is not yet the target — see the TLS item in §9.
 | 8888 | HLS | Traefik | published direct, plain HTTP |
 | 8889 | WebRTC / WHEP signalling | Traefik | published direct, plain HTTP |
 | 8189/udp | WebRTC media | End-to-end DTLS-SRTP — **must not be proxied** | published |
+| 8189/tcp | WebRTC media over ICE-TCP | End-to-end DTLS-SRTP — **must not be proxied** | published |
 | 1883 | MQTT (fallback only) | Mosquitto | published, in the clear |
 | 8883 | MQTTS | Mosquitto | **commented out** in `mosquitto.conf` |
 | 443 | HTTPS + WSS — includes the portal | Traefik | **no Traefik service exists** |
@@ -1386,6 +1401,29 @@ list nearly empty. Everything here that mattered was portal work.
   cover a token already copied. A deny-list in Redis would fix it and would put a
   server-side lookup back on every request, which is the thing §4 is careful not to do;
   worth revisiting only if a real reason to force logout appears.
+- **MediaMTX is the one hub component a load balancer cannot scale.** A path lives on
+  exactly one instance — the one the flight's app container published to — so a viewer of
+  `out/<uuid>` must reach *that* instance. Round-robin an L4 load balancer across MediaMTX
+  replicas and viewers land on instances that have never heard of the path. This is the
+  weak point in §2's "the hub scales on load": ws-server was deliberately made stateless
+  through Redis pub/sub and db-writer holds nothing, but MediaMTX is stateful per path and
+  no amount of load balancing changes that. The options when it matters are path-aware
+  routing (the portal already knows which instance holds each flight, since flights are
+  assigned when they open), a relay tree where replicas pull from the origin with
+  `source: whep://…`, or sharding flights across instances by path.
+
+  Not urgent, and worth being clear why: one MediaMTX serves far more concurrent viewers
+  than this system can produce flights, because each flight costs a whole GPU container
+  and each viewer costs a peer connection. **The GPU tier saturates first, by orders of
+  magnitude.** This becomes real only once the node pool in §2 is large.
+- **ICE-TCP does not cover a network that permits only 443.** `webrtcLocalTCPAddress`
+  handles the common case — firewalls that pass TCP but no UDP — in the same WHEP session,
+  with the same token and the same latency, which is why the portal dropped its HLS
+  fallback rather than vendoring a second player. What it does not handle is a network
+  where nothing but 443 leaves at all: port 8189 is as blocked as 8189/udp was. The real
+  answers there are TURN over 443 or HLS proxied through the ingress tier on 443 (§8
+  already routes HLS through it). Both are infrastructure, both wait for the ingress tier,
+  and neither is worth building before a real user reports being unable to watch.
 - **No browser has loaded the finished watch page.** The playback path itself is now
   verified — see the entry below — but by a WHEP client and `ffprobe`, not by Chrome or
   Firefox. What remains unproven is the page around it: autoplay policy on a `<video>`

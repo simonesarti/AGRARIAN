@@ -262,6 +262,7 @@ The app detects engine files at startup and switches to engine mode automaticall
 | 8888 | HTTP | inbound | MediaMTX: HLS playback |
 | 8889 | HTTP | inbound | MediaMTX: WebRTC/WHEP signalling |
 | 8189 | UDP | inbound | MediaMTX: WebRTC media (DTLS-SRTP, never proxied) |
+| 8189 | TCP | inbound | MediaMTX: WebRTC media over ICE-TCP, for networks that block UDP |
 | 1883 | MQTT | inbound | Mosquitto: drone telemetry + app subscription |
 | 8003 | HTTP | inbound | portal: the account pages |
 | `WS_PORT` | WS | inbound | ws-server: WebSocket alert stream |
