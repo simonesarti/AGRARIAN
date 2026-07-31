@@ -21,7 +21,10 @@ SESSION_COOKIE_MAX_AGE_S = 8 * 60 * 60
 # token. See §8 — these are the ports that are meant to be externally reachable.
 
 RTMPS_PORT = 1936      # what the operator types into the drone controller
-WEBRTC_PORT = 8889     # MediaMTX WHEP signalling and its built-in reader page
+# WHEP signalling. MediaMTX also serves a reader page at /<path>/ on this port,
+# which this portal deliberately does not use: it 401s without ever consulting
+# the auth hook, so no viewer token can open it. watch.js speaks WHEP directly.
+WEBRTC_PORT = 8889
 HLS_PORT = 8888        # MediaMTX HLS, the fallback for browsers that need it
 WS_PORT = 8765         # ws-server's viewer WebSocket
 

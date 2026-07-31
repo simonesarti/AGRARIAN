@@ -247,11 +247,16 @@ def _watch_urls(output_path: str, viewer_token: str) -> dict:
     source can carry an Authorization header.
     """
     return {
-        # MediaMTX's own reader page, which negotiates WHEP and forwards the
-        # query string as its credential. Deliberately not reimplemented here:
-        # the media path is browser-to-MediaMTX end to end (DTLS-SRTP over UDP,
-        # §7), and the portal has no business in the middle of it.
-        "webrtc_url": f"{_SCHEME}://{_MEDIA_PUBLIC_HOST}:{WEBRTC_PORT}/{output_path}/?jwt={viewer_token}",
+        # The WHEP endpoint itself, not MediaMTX's built-in reader page at
+        # /<path>/. That page was the original target and it cannot work here:
+        # it answers 401 with WWW-Authenticate: Basic and never calls the auth
+        # hook at all — not for ?jwt=, ?token=, ?user=&pass=, Bearer, or Basic.
+        # It is gated behind MediaMTX's internal user roster, which authMethod:
+        # http deliberately replaced (§4). The WHEP endpoint below does consult
+        # the hook and does accept the viewer token, so watch.js negotiates the
+        # session itself. The media path is still browser-to-MediaMTX end to end
+        # (DTLS-SRTP over UDP, §7) — only the signalling moved.
+        "whep_url": f"{_SCHEME}://{_MEDIA_PUBLIC_HOST}:{WEBRTC_PORT}/{output_path}/whep?jwt={viewer_token}",
         "hls_url": f"{_SCHEME}://{_MEDIA_PUBLIC_HOST}:{HLS_PORT}/{output_path}/index.m3u8?jwt={viewer_token}",
         "ws_url": f"{_WS_SCHEME}://{_WS_PUBLIC_HOST}:{_WS_PUBLIC_PORT}/?token={viewer_token}",
     }

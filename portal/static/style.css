@@ -165,9 +165,12 @@ button:hover, .button:hover { border-color: var(--muted); }
 .watch { display: grid; grid-template-columns: 2fr 1fr; gap: 18px; margin-top: 14px; }
 @media (max-width: 780px) { .watch { grid-template-columns: 1fr; } }
 
-.video iframe {
+.video video {
   width: 100%;
   aspect-ratio: 16 / 9;
+  /* The annotated frame is letterboxed rather than cropped: a danger marker at
+     the edge is the thing most worth not cutting off. */
+  object-fit: contain;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: #000;

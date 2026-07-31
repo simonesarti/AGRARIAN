@@ -440,9 +440,15 @@ unexercised. See `CLOUD_ARCHITECTURE.md` §9 for current status.
 each. `danger_detection` additionally verifies the telemetry plane end to end, against a
 real broker enforcing the real ACLs.
 
-What that still does not cover: **no browser has opened the annotated stream.** The test
-asserts MediaMTX logged the publish to `out/<uuid>`; whether a viewer's WebRTC or HLS
-request plays it, with a `?jwt=` viewer token attached, needs a human and a browser.
+Playback is verified too, though not by these scripts. HLS with `?jwt=` serves H.264
+1920×1080 (`ffprobe`), and a real WHEP client (`aiortc`) gets a 201 and decodes 1920×1080
+frames. What that leaves is the *page* rather than the protocol — autoplay policy, the
+alert aside, small screens — which is what `run_watch_live.sh` is for.
+
+**`run_watch_live.sh [host]`** — not a test. It stands the whole product up, puts a real
+flight in the air, prints a URL and waits for you to look at it. Use it for anything that
+needs a browser. Note that it runs the portal with `COOKIE_SECURE=false`, which is the
+only way it works at all until the ingress tier exists.
 
 The recording upload path is verified for the `local` storage backend
 (`run_recording_upload.sh`). The `azure` and `aws` backends in `recorder/main.py` are

@@ -340,10 +340,18 @@ r = call(PORTAL1, "/api/viewer-token", form={},
 info = r.json()
 check("the viewer-token API answers for the one live flight",
       r.status == 200 and info.get("flight_id") == flight["flight_id"], f"{r.status} {r.body[:120]}")
-check("the video URL points at MediaMTX's public host and the flight's own path",
-      info.get("webrtc_url", "").startswith(
-          f"https://media.test.local:8889/out/{flight['public_uuid']}/?jwt="),
-      info.get("webrtc_url", "")[:120])
+check("the video URL is MediaMTX's WHEP endpoint on the flight's own path",
+      info.get("whep_url", "").startswith(
+          f"https://media.test.local:8889/out/{flight['public_uuid']}/whep?jwt="),
+      info.get("whep_url", "")[:120])
+# Regression pin. This used to point at MediaMTX's built-in reader page at
+# /<path>/, which answers 401 and never reaches the auth hook at all -- it is
+# gated behind the internal user roster that authMethod: http replaced, so no
+# credential could open it. Nothing may quietly go back to serving that URL.
+check("and it is NOT the built-in reader page, which no credential can open",
+      "/whep?jwt=" in info.get("whep_url", "")
+      and not info.get("whep_url", "").endswith(f"/out/{flight['public_uuid']}/"),
+      info.get("whep_url", "")[:120])
 check("an HLS URL is offered as the fallback for browsers that cannot do WebRTC",
       f"https://media.test.local:8888/out/{flight['public_uuid']}/index.m3u8?jwt="
       in info.get("hls_url", ""), info.get("hls_url", "")[:120])
@@ -351,7 +359,7 @@ check("the alert stream points at ws-server over WSS, on its own host",
       info.get("ws_url", "").startswith("wss://ws.test.local:8765/?token="),
       info.get("ws_url", "")[:80])
 
-viewer = info.get("webrtc_url", "").split("jwt=")[-1]
+viewer = info.get("whep_url", "").split("jwt=")[-1]
 check("what reaches the page is NOT the session token — it is a downgrade",
       viewer and viewer != alice, "the page was handed the account credential")
 check("the same token is used for video and for alerts (one flight, one credential)",

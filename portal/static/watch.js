@@ -27,6 +27,7 @@
   const RECONNECT_MS = 3000;
 
   let socket = null;
+  let pc = null;
   let closing = false;
 
   function setStatus(text, kind) {
@@ -59,10 +60,94 @@
     return body;
   }
 
-  function startVideo(info) {
-    playerEl.src = info.webrtc_url;
+  /*
+   * WHEP, negotiated here rather than by MediaMTX's built-in reader page.
+   *
+   * The page was the obvious choice and it cannot be used: GET /<path>/ answers
+   * 401 with WWW-Authenticate: Basic and never calls db-writer's auth hook, for
+   * ?jwt=, ?token=, ?user=&pass=, Bearer and Basic alike. It is protected by
+   * MediaMTX's internal user roster, which this deployment replaced with
+   * authMethod: http. The WHEP endpoint underneath it has no such problem: it
+   * consults the hook and accepts the viewer token in the query.
+   *
+   * Non-trickle: all candidates are gathered before the offer is sent, so there
+   * is one request and no PATCH. It costs a moment of setup latency and removes
+   * the ICE resource lifecycle entirely, which is the right trade for a page
+   * that opens one stream and holds it.
+   */
+  const GATHER_TIMEOUT_MS = 3000;
+
+  async function gatherComplete(pc) {
+    if (pc.iceGatheringState === "complete") return;
+    await new Promise(function (resolve) {
+      const done = function () {
+        if (pc.iceGatheringState !== "complete") return;
+        pc.removeEventListener("icegatheringstatechange", done);
+        resolve();
+      };
+      pc.addEventListener("icegatheringstatechange", done);
+      // A candidate that never arrives must not hang the page. Whatever was
+      // gathered by now is usually enough on a reachable network.
+      window.setTimeout(resolve, GATHER_TIMEOUT_MS);
+    });
+  }
+
+  async function startVideo(info) {
     hlsEl.href = info.hls_url;
     hlsEl.hidden = false;
+
+    // start() also runs when the ALERT socket reconnects, which says nothing
+    // about the video. Renegotiating a healthy stream would black the picture
+    // out every time the WebSocket blinked.
+    if (pc && (pc.connectionState === "connected" || pc.connectionState === "connecting")) return;
+    if (pc) { pc.close(); pc = null; }
+    pc = new RTCPeerConnection({ iceServers: [] });
+
+    pc.addTransceiver("video", { direction: "recvonly" });
+    pc.addTransceiver("audio", { direction: "recvonly" });
+
+    pc.ontrack = function (event) {
+      if (playerEl.srcObject !== event.streams[0]) {
+        playerEl.srcObject = event.streams[0];
+      }
+    };
+
+    pc.onconnectionstatechange = function () {
+      if (!pc) return;
+      if (pc.connectionState === "failed") {
+        setStatus("Video connection failed — use the HLS link below.", "error");
+      }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await gatherComplete(pc);
+
+    let resp;
+    try {
+      resp = await fetch(info.whep_url, {
+        method: "POST",
+        headers: { "Content-Type": "application/sdp" },
+        body: pc.localDescription.sdp,
+      });
+    } catch (e) {
+      setStatus("Could not reach the video server. Use the HLS link below.", "error");
+      return;
+    }
+
+    if (!resp.ok) {
+      // 401 here is the viewer token, not the session: it is minted per flight
+      // and expires on its own schedule. Reloading buys a fresh one.
+      setStatus(
+        resp.status === 401
+          ? "The video credential expired. Reload the page."
+          : `The video server refused the stream (${resp.status}).`,
+        "error");
+      return;
+    }
+
+    const answer = await resp.text();
+    await pc.setRemoteDescription({ type: "answer", sdp: answer });
   }
 
   function renderAlert(alert) {
@@ -139,13 +224,18 @@
     if (!info) return;
 
     setStatus("Live — flight " + info.flight_id, "live-text");
-    startVideo(info);
+    // Not awaited: the alert stream must not wait on an ICE gathering timeout,
+    // and a video failure is reported in place rather than stopping the page.
+    startVideo(info).catch(function () {
+      setStatus("Could not start the video. Use the HLS link below.", "error");
+    });
     openAlerts(info);
   }
 
   window.addEventListener("beforeunload", function () {
     closing = true;
     if (socket) socket.close();
+    if (pc) pc.close();
   });
 
   start();

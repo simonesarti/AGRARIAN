@@ -12,11 +12,16 @@
 
   <div class="watch">
     <div class="video">
-      {# The video never passes through the portal. This frame points straight at
-         MediaMTX, which is where the WebRTC negotiation happens and where the
-         media (DTLS-SRTP over UDP) actually flows. The portal's only role was
-         composing the URL and putting a flight-scoped token in it. #}
-      <iframe id="player" allow="autoplay; fullscreen" allowfullscreen title="Annotated live video"></iframe>
+      {# The video never passes through the portal. watch.js negotiates WHEP
+         straight against MediaMTX and attaches the resulting track here, so the
+         media (DTLS-SRTP over UDP) flows browser-to-MediaMTX. The portal's only
+         role was composing the URL and putting a flight-scoped token in it.
+
+         This used to be an <iframe> pointed at MediaMTX's own reader page. That
+         page answers 401 and never reaches the auth hook — it is gated behind
+         the internal user roster that authMethod: http replaced — so no
+         credential could ever have opened it. #}
+      <video id="player" autoplay muted playsinline controls title="Annotated live video"></video>
       <p class="muted small">
         Video not playing? <a id="hls" href="#" hidden>Open the HLS stream instead</a> —
         some browsers and networks cannot use WebRTC.

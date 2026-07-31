@@ -1199,6 +1199,29 @@ simpler by one hop and would break this line.
     sets `INFO`). An operator could not previously turn on the diagnostics the workers
     were already writing.
   - **The telemetry plane needed a real publisher.** See below.
+- **Playback works, and the way it was built did not.** The watch page used to embed
+  MediaMTX's own reader page in an `<iframe>`, on the reasoning that reimplementing WHEP
+  would put the portal in the middle of a media path that should be
+  browser-to-MediaMTX. The reasoning was right and the mechanism was impossible:
+  `GET /<path>/` answers **401 with `WWW-Authenticate: Basic` and never calls
+  `/auth/mediamtx` at all**. Not for `?jwt=`, `?token=`, `?user=&pass=`, `Authorization:
+  Bearer`, or HTTP Basic — five forms tried, five 401s, and db-writer logged no decision
+  for any of them. That page is gated behind MediaMTX's internal user roster, which is
+  exactly what `authMethod: http` replaced (§4), so no credential this system can mint
+  would ever have opened it. The earlier guess — that MediaMTX was dropping the query
+  string on its way to WHEP — was wrong in an instructive way: it never got that far.
+
+  Everything underneath the page was already correct. HLS with `?jwt=` serves real
+  annotated media (`ffprobe`: H.264 1920×1080), and the WHEP endpoint authorises the same
+  token and reaches the hook as `protocol='webrtc'`. So the fix was to drop the iframe and
+  negotiate WHEP in `watch.js` against a `<video>` element — non-trickle, all candidates
+  gathered before the offer, one POST and no PATCH. Verified with a real WebRTC client
+  (`aiortc`): **201 on the offer, then decoded 1920×1080 video frames.** The media path is
+  still end-to-end DTLS-SRTP browser-to-MediaMTX; only the signalling moved into our code.
+
+  `run_portal.sh` pins the new shape at 88 assertions, including a regression check that
+  the URL is the WHEP endpoint and *not* the reader page — the one thing that must never
+  quietly come back.
 - **The telemetry plane carries a real message from the real app.** `run_mqtt_auth.sh`
   proves Mosquitto's authorisation — who may publish where, and that one flight cannot
   read another's topics — but it proves nothing about the plane as a *pipe*, because no
@@ -1363,13 +1386,11 @@ list nearly empty. Everything here that mattered was portal work.
   cover a token already copied. A deny-list in Redis would fix it and would put a
   server-side lookup back on every request, which is the thing §4 is careful not to do;
   worth revisiting only if a real reason to force logout appears.
-- **Browser playback is unverified.** `run_portal.sh` asserts the shape of the WebRTC and
-  HLS URLs but no browser has opened one, and the watch page embeds MediaMTX's own reader
-  page rather than negotiating WHEP itself — which assumes MediaMTX forwards the `?jwt=`
-  query on to its WHEP request. That assumption is the one thing on the page that a test
-  here cannot reach; it needs a human with a browser and a live flight. This is now the
-  **only** remaining part of the end-to-end product path that has never been exercised —
-  `danger_detection` and the telemetry plane came off this list below.
+- **No browser has loaded the finished watch page.** The playback path itself is now
+  verified — see the entry below — but by a WHEP client and `ffprobe`, not by Chrome or
+  Firefox. What remains unproven is the page around it: autoplay policy on a `<video>`
+  element, whether the alert aside renders as intended, and behaviour on a phone. That
+  needs a human and `run_watch_live.sh`, and it is a UI risk rather than a protocol one.
 - **No flight history.** The portal shows what is airborne now and nothing that has
   landed, so recordings and past alerts are in the database and unreachable from the UI.
   Every row needed is already there (`flights`, `alerts`, `recordings`); what is missing
