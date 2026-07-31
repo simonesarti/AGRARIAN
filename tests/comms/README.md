@@ -16,6 +16,7 @@ try to run these directly with `python3`.
 | --- | --- | --- |
 | `test_schema.py` | nothing | one-liner below |
 | `test_tokens.py` | nothing | one-liner below |
+| `test_session_tokens.py` | nothing | one-liner below |
 | `test_mediamtx_auth.py` | nothing | one-liner below |
 | `test_mqtt_auth.py` | nothing | one-liner below |
 | `test_orchestrator.py` | nothing | one-liner below |
@@ -28,6 +29,7 @@ try to run these directly with `python3`.
 | `run_orchestrator_real_app.sh` | the above + a GPU, `nvidia-container-toolkit`, `checkpoints/*.pt` | `./run_orchestrator_real_app.sh` |
 | `run_recording_upload.sh` | MediaMTX + recorder + db-writer + Postgres, host `ffmpeg` | `./run_recording_upload.sh` |
 | `run_mqtt_auth.sh` | mosquitto-go-auth + db-writer + Postgres | `./run_mqtt_auth.sh` |
+| `run_portal_auth.sh` | Postgres + 2 db-writer replicas | `./run_portal_auth.sh` |
 | `run_orchestrator_recovery.sh` | the same as `run_orchestrator.sh` | `./run_orchestrator_recovery.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
@@ -83,11 +85,20 @@ docker run --rm -v "$PWD/ws_server:/ws" -v "$PWD/tests/comms:/tests:ro" \
 `test_tokens.py` prints an `InsecureKeyLengthWarning` — that is the *deliberately forged*
 token signed with a 17-character wrong secret, not a real key. Expected.
 
+Session tokens — the portal's credential, and its separation from the other two:
+
+```bash
+docker run --rm -v "$PWD/db_writer:/dbw" -v "$PWD/tests/comms:/tests:ro" \
+  -w /tmp -e DB_WRITER_DIR=/dbw python:3.12-slim \
+  sh -c "pip install -q pyjwt; python /tests/test_session_tokens.py"
+```
+
 ## Orchestrated
 
 ```bash
 ./run_db_replication.sh      # 7 + 20×2 assertions, real PostgreSQL
 ./run_redis_failure.sh       # 3 + 7 assertions, Redis restarted mid-test
+./run_portal_auth.sh         # 20 assertions, /register + /login across 2 replicas
 ./run_mediamtx_auth.sh       # 22 assertions, real MediaMTX + ffmpeg publishes
 ./run_orchestrator.sh        # 21 assertions, real containers spawned and torn down
 ./run_orchestrator_real_app.sh  # 7 assertions, the real GPU app, not the stub
@@ -137,6 +148,24 @@ that cascade exists for. Also asserts `delete_stream()` does **not** exist; a po
 Also pins `active_flights()`, which resolves `/viewer/token`: only currently open
 flights count (a landed one — `end_time` set — must not come back), and a lone
 active flight resolves with nothing to disambiguate.
+
+**`test_session_tokens.py`** — the portal credential's separation from the other two.
+All three are signed with the same secret, so the `scope` claim is the only thing
+keeping them apart, and it matters most here: a **viewer token already carries a `sub`
+claim naming its user**, so without the scope check a token issued to watch one flight
+would *be* a full account credential. Both directions are pinned, plus the property that
+makes the reverse impossible by construction — a session token carries **no `flight_id`
+claim at all**, so it cannot answer "which flight" even if a future caller forgets to
+check scope. Also forged signatures, expiry, `alg:none`, a missing or non-numeric
+subject, and five malformed `Authorization` headers.
+
+**`run_portal_auth.sh` / `test_portal_auth.py`** — the same endpoints over real HTTP
+against real PostgreSQL, with **two replicas**. The second replica is the point rather
+than padding: a token minted on replica 1 must be accepted by replica 2 with no shared
+session store, which is exactly what an in-memory session would break — the defect
+ws-server had with its in-memory client set. Also pins the status codes the portal will
+branch on (409 for a duplicate, 400 for a bad password or address, 401 for bad
+credentials) and that a failed login's body never says whether the account exists.
 
 Registration (`create_user`) is pinned here too, since it is open to the internet and
 every argument is untrusted: emails normalise on write *and* on read (PostgreSQL's

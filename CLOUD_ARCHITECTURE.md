@@ -264,7 +264,7 @@ claim** (`view` / `publish`) that is checked on every path. That check is load-b
 without it a viewer token would be a valid publisher token for the flight being watched,
 letting anyone with read access inject alerts into it.
 
-### Session tokens **[designed]**
+### Session tokens **[built]**
 
 The portal's credential, and the third value of the same `scope` claim: `session`. Where
 a viewer token says *"bearer may watch flight 7"*, a session token says *"bearer is user
@@ -294,6 +294,25 @@ worth different amounts:
 | --- | --- | --- |
 | **Session** | `httpOnly` cookie | Browser JavaScript cannot read it, so an XSS bug in the front-end cannot steal the credential that controls the whole account |
 | **Viewer** | readable by JS | It *must* be — JS puts it in a WebSocket query string and an `Authorization` header. Flight-scoped and hours-long, so it is designed to be exposed |
+
+Two structural details, both load-bearing:
+
+**A session token carries no `flight_id` claim at all** — not a null, not a zero. The
+two flight-scoped kinds answer "which flight"; this one answers "which user". Omitting
+the claim means a session token cannot satisfy `flight_id_from_credential` even if some
+future caller forgets to check the scope, which makes the separation structural rather
+than a check somebody has to remember. Verified in both directions, including against
+ws-server, which rejects a session token as either of its two kinds.
+
+**The scope check is what stops a viewer token being an account credential.** Viewer
+tokens carry a `sub` claim naming their user — they always have, for logging — so the
+scope claim is the *only* difference between "may watch flight 7" and "is user 3". This
+is the same escalation §3 already describes between view and publish, and it is the
+reason the third scope was added to the existing mechanism rather than a new one being
+invented alongside it.
+
+It is the shortest-lived of the three (8 h, against the viewer token's 12) because it is
+the most powerful and there is no refresh: it is the whole session.
 
 ### Registration is open **[built]**
 
@@ -346,7 +365,7 @@ until it bites:
 | Redis | Shared | Channel per flight (`flight:{id}`) | **[built]** |
 | Recorder | Shared | Segment → flight_id resolved via `recordings` table | upload **[built]**, per-tenant prefix **[open]** |
 | Orchestrator | Shared | Spawns/stops app containers | **[built]** |
-| Portal | Shared, replicated on load | Session token → `user_id`, read from the claim not the URL | **[designed]** |
+| Portal | Shared, replicated on load | Session token → `user_id`, read from the claim not the URL | credential **[built]**, routes **[designed]**, front-end **[designed]** |
 
 A single MediaMTX serves every drone publishing and every viewer watching; a single
 Mosquitto carries every publisher's telemetry. They are separated by path regex, credentials
@@ -539,9 +558,12 @@ HTTP route. A second service writing the same tables would give two authorities 
 schema with nothing to say which is right — the objection §5 uses to keep `user_id` off
 the `flights` table, applied to services instead of columns.
 
-`UserDirectory.create_user` now exists (§3) and `rebuild_schema.py --seed-user` goes
-through it, so registration and seeding are one code path. What is still missing is the
-HTTP route in front of it — nothing reachable over the network creates a user.
+The account half of that API now exists: `POST /register`, `POST /login` and `GET /me`
+on db-writer, with `UserDirectory.create_user` beneath them and `rebuild_schema.py
+--seed-user` on the same path, so registration and seeding cannot diverge. What is still
+missing is the **stream** half — the CRUD routes over `create_stream` / `list_streams` /
+`revoke_stream` / `rotate_stream_key`, each taking `user_id` from the session claim via
+`_require_session` rather than from the request.
 
 #### The browser never reaches db-writer
 
@@ -639,8 +661,8 @@ Steps 3–6 and 8 are **[built]**; 1–2 wait on the portal. Step 6 is verified 
 target GPU — see §9.
 
 1. User registers on the portal → row in `users`, and logs in for a session token.
-   Registration is open to anyone. `UserDirectory.create_user` is **[built]**; the
-   HTTP route in front of it is **[designed]**.
+   Registration is open to anyone. **[built]** — `POST /register` and `POST /login`
+   on db-writer; only the front-end calling them is missing.
 2. User adds a stream → row in `streams` with a generated `stream_key`, shown once. The
    portal offers rotate and retire. **[designed]** — the `UserDirectory` methods exist
    and are tested; nothing exposes them over HTTP.
@@ -785,6 +807,20 @@ simpler by one hop and would break this line.
 
 ### Built and tested
 
+- **Portal authentication — `/register`, `/login`, `/me`** (§3 session tokens). The
+  third scope on the existing JWT mechanism, so no new infrastructure. Verified by 21
+  assertions on the token itself (`test_session_tokens.py`) and 20 end-to-end over real
+  HTTP against real PostgreSQL with **two replicas** (`run_portal_auth.sh`). The two
+  that matter most: a **viewer token is refused as a session token** — it carries a
+  `sub` claim naming its user, so the scope check is the only thing between "may watch
+  flight 7" and "is user 3" — and a **token minted on replica 1 is accepted on replica
+  2**, which is the stateless property the whole design rests on and what an in-memory
+  session store would silently break. Also pinned: a session token carries no
+  `flight_id` claim, so it is refused by `flight_id_from_credential` and by ws-server
+  in both of ws-server's scopes; forged signatures, expiry, `alg:none`, missing and
+  non-numeric subjects, five malformed `Authorization` headers; and the status codes
+  the portal will branch on (409 duplicate, 400 malformed, 401 bad credentials) with a
+  failed login never disclosing whether the account exists.
 - **Account registration** (`UserDirectory.create_user`, §3). Verified by 22 assertions
   against SQLite in `test_schema.py` — email normalisation on both write and read,
   duplicate refusal including a differing case and surrounding whitespace, the bcrypt
@@ -966,15 +1002,29 @@ this list — it is set inside `open_flight_for_key` the moment a flight opens, 
   service holding an `httpOnly` cookie, and the browser never reaching db-writer
   directly. In order:
   1. ~~`UserDirectory.create_user`~~ — **[built]**, see §3
-  2. `POST /register`, `POST /login` on db-writer → session token
+  2. ~~`POST /register`, `POST /login` → session token~~ — **[built]**, plus `GET /me`
   3. Stream CRUD routes taking `user_id` from the claim, wrapping methods that exist
   4. `/viewer/token` accepts a session token instead of email and password
   5. The front-end itself
 
-  Steps 1–4 are db-writer work and are what the front-end waits on.
+  Steps 1–4 are db-writer work and are what the front-end waits on. `_require_session`
+  in `db_writer/main.py` is the helper steps 3 and 4 both use; `GET /me` is currently
+  its only consumer and exists mostly to give the portal an "am I still logged in?".
 
 ### Open
 
+- **`/login` is an unrated password oracle.** It is reachable by anything that can
+  reach db-writer and is slowed only by bcrypt's own cost — there is no lockout, no
+  backoff and no attempt counter. The blast radius is currently small (db-writer is
+  internal-only, and the portal in front of it does not exist yet), but this endpoint
+  is the reason rate limiting has to land *with* the portal rather than after it.
+  Deliberately not addressed by equalising response time between "no such user" and
+  "wrong password": `/register` already discloses exactly that fact by design, so a
+  dummy hash on every failed login would cost real time and conceal nothing.
+- **No email verification.** Registration accepts any syntactically valid address
+  without proving the registrant controls it, so an account can be created against
+  somebody else's address. Little is at stake while nothing is emailed — no password
+  reset exists either — and both land together when one is needed.
 - **No cap on concurrent flights per user.** Registration is open (§3) and a stream key
   is what causes a GPU container to exist, so an anonymous signup can currently reach
   GPU spend with nothing between the two. Not urgent while the deployment is a single

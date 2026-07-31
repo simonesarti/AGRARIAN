@@ -17,11 +17,18 @@ DB_MANAGER_THREAD_CLOSE_TIMEOUT = 5.0      # 5.0 s
 JWT_ALGORITHM = "HS256"
 VIEWER_TOKEN_TTL_S = 12 * 60 * 60          # 12 h — longer than any plausible flight
 
-# Both token kinds are signed with the same secret, so the scope claim is what keeps
-# them apart. Without it a viewer token would be accepted as a publisher token and a
-# viewer could inject alerts into the flight they are watching.
+# All three token kinds are signed with the same secret, so the scope claim is what
+# keeps them apart. Without it a viewer token would be accepted as a publisher token
+# and a viewer could inject alerts into the flight they are watching.
 TOKEN_SCOPE_VIEW    = "view"
 TOKEN_SCOPE_PUBLISH = "publish"
+
+# The portal's credential. Unlike the other two it names a USER, not a flight, and
+# is the only one that grants authority over an account rather than over one flight's
+# data. That is also why it is the shortest-lived: it is the most valuable of the
+# three, and there is no refresh mechanism, so this is the whole session.
+TOKEN_SCOPE_SESSION = "session"
+SESSION_TOKEN_TTL_S = 8 * 60 * 60          # 8 h — a working day
 
 # Publisher tokens are minted when a flight opens and live only as long as the app
 # container processing it. A flight outlasting this is far more likely to be a stuck

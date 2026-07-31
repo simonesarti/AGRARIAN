@@ -22,8 +22,15 @@ import uvicorn
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from auth import AuthError, mint_publisher_token, mint_viewer_token, verify_publisher
-from db_manager import AlertWriter, UserDirectory
+from auth import (
+    AuthError,
+    mint_publisher_token,
+    mint_session_token,
+    mint_viewer_token,
+    user_id_from_session,
+    verify_publisher,
+)
+from db_manager import AlertWriter, EmailAlreadyRegistered, UserDirectory
 from media_auth import Denied, authorize, credential_from
 from mqtt_auth import Denied as MqttDenied
 from mqtt_auth import authorize as mqtt_authorize
@@ -79,9 +86,30 @@ def _require_publisher(authorization: Optional[str], flight_id: int) -> None:
         logger.warning(f"Rejected write to flight {flight_id}: {e}")
         raise HTTPException(status_code=401, detail=str(e))
 
+
+def _require_session(authorization: Optional[str]) -> int:
+    """
+    Resolve the caller's user_id from a session token, or 401.
+
+    Account-scoped endpoints call this instead of trusting a user_id in the
+    request. Same shape as _require_publisher on purpose — one way to check a
+    credential in this service, not two.
+    """
+    try:
+        return user_id_from_session(authorization)
+    except AuthError as e:
+        logger.warning(f"Rejected session-scoped request: {e}")
+        raise HTTPException(status_code=401, detail=str(e))
+
 # ------------------------------------------------------------------ #
 # Request / response models
 # ------------------------------------------------------------------ #
+
+class CredentialsRequest(BaseModel):
+    """Registration and login take the same pair, so they share one model."""
+    email: str
+    password: str
+
 
 class ViewerTokenRequest(BaseModel):
     email: str
@@ -168,6 +196,86 @@ def health():
         "alert_queue_depth": _writer.queue_depth,
         "alerts_dropped": _writer.dropped,
     }
+
+
+@app.post("/register", status_code=201)
+def register(req: CredentialsRequest):
+    """
+    Create an account and return a session token for it.
+
+    Registration is open, so this is the one endpoint here that anyone on the
+    internet can reach and succeed at. It is still not routed publicly: the portal
+    calls it over the private network and holds the returned token in an httpOnly
+    cookie (§4), so db-writer stays off the public side.
+
+    Returning a token rather than making the caller log in immediately afterwards
+    is not a shortcut — the password was just proven in the same request, and a
+    second round trip would prove nothing further.
+
+    409 rather than 400 for a taken address, which does disclose that the address
+    is registered. That is unavoidable in open registration: the user has to be
+    told why their signup failed, and "something was wrong" would leave them
+    retyping a password that was never the problem.
+    """
+    try:
+        user = _directory.create_user(req.email, req.password)
+    except EmailAlreadyRegistered as e:
+        # Checked before ValueError — it is a subclass, so the order matters.
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error registering user: {e}")
+        raise HTTPException(status_code=500, detail="Registration failed")
+
+    logger.info(f"Registered user_id={user['user_id']}")
+    return {
+        "user_id": user["user_id"],
+        "email": user["email"],
+        "session_token": mint_session_token(user["user_id"]),
+    }
+
+
+@app.post("/login")
+def login(req: CredentialsRequest):
+    """
+    Exchange an email and password for a session token.
+
+    The password is presented here and nowhere else for the rest of the session,
+    which is the entire reason this endpoint exists — the portal would otherwise
+    have to keep it for as long as the user stayed logged in.
+
+    No attempt is made to equalise response time between "no such user" and "wrong
+    password". bcrypt runs only in the second case, so the timing does distinguish
+    them — but /register already discloses exactly the same fact outright, by
+    design, so hiding it here would cost a dummy hash on every failed login and
+    conceal nothing. What is genuinely missing is rate limiting: this is a password
+    oracle open to whoever can reach it, slowed only by bcrypt's own cost. See §9.
+    """
+    try:
+        user_id = _directory.authenticate(req.email, req.password)
+    except ValueError:
+        # Deliberately not echoing the reason: it distinguishes an unknown address
+        # from a wrong password to anyone reading the response body.
+        logger.warning("Login failed")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    except Exception as e:
+        logger.error(f"Unexpected error during login: {e}")
+        raise HTTPException(status_code=500, detail="Login failed")
+
+    logger.info(f"Login: user_id={user_id}")
+    return {"user_id": user_id, "session_token": mint_session_token(user_id)}
+
+
+@app.get("/me")
+def whoami(authorization: Optional[str] = Header(default=None)):
+    """
+    Resolve a session token to its user. The portal's "am I still logged in?".
+
+    Also the smallest possible consumer of _require_session, which every
+    account-scoped endpoint added after this one will use the same way.
+    """
+    return {"user_id": _require_session(authorization)}
 
 
 @app.post("/session/{flight_id}/alert")
