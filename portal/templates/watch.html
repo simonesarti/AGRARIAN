@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Live — AGRARIAN{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="cardhead">
+    <h1>Live flight</h1>
+    <a href="/">← All slots</a>
+  </div>
+
+  <p id="status" class="muted">Connecting…</p>
+
+  <div class="watch">
+    <div class="video">
+      {# The video never passes through the portal. This frame points straight at
+         MediaMTX, which is where the WebRTC negotiation happens and where the
+         media (DTLS-SRTP over UDP) actually flows. The portal's only role was
+         composing the URL and putting a flight-scoped token in it. #}
+      <iframe id="player" allow="autoplay; fullscreen" allowfullscreen title="Annotated live video"></iframe>
+      <p class="muted small">
+        Video not playing? <a id="hls" href="#" hidden>Open the HLS stream instead</a> —
+        some browsers and networks cannot use WebRTC.
+      </p>
+    </div>
+
+    <aside class="alerts">
+      <h2>Alerts</h2>
+      <p id="alert-status" class="muted small">Waiting for the alert stream…</p>
+      <ul id="alert-list"></ul>
+    </aside>
+  </div>
+</div>
+
+{# The token is fetched by the script, not rendered here: a credential in the
+   HTML is a credential in whatever cached that HTML. #}
+<script src="/static/watch.js" data-stream-id="{{ stream_id if stream_id is not none else '' }}"></script>
+{% endblock %}

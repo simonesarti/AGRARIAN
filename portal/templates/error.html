@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}{{ status }} — AGRARIAN{% endblock %}
+
+{% block content %}
+<div class="card narrow">
+  <h1>{{ status }}</h1>
+  <p class="error">{{ message }}</p>
+  <p><a href="/">Back to your streams</a></p>
+</div>
+{% endblock %}

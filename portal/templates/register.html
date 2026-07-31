@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Create an account — AGRARIAN{% endblock %}
+
+{% block content %}
+<div class="card narrow">
+  <h1>Create an account</h1>
+
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+  <form method="post" action="/register" class="stack">
+    <label>Email
+      <input type="email" name="email" value="{{ form_email or '' }}" required autofocus autocomplete="username">
+    </label>
+    <label>Password
+      <input type="password" name="password" required minlength="8" autocomplete="new-password">
+      {# Mirrors MIN_PASSWORD_LENGTH in db-writer, which is what actually enforces
+         it. This attribute is a courtesy to the typist, not a check. #}
+      <small class="muted">At least 8 characters.</small>
+    </label>
+    <button type="submit" class="primary">Create account</button>
+  </form>
+
+  <p class="muted">Already registered? <a href="/login">Sign in</a>.</p>
+</div>
+{% endblock %}

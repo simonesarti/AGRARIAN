@@ -128,6 +128,15 @@ check("the list carries the key back (it must be retypable)",
 st, _ = call(DBW1, "/streams", {"label": "x" * 129}, token=alice_token)
 check("an over-long label is 400", st == 400, str(st))
 
+# /flights is what the portal marks "live" from. Account-scoped like the rest:
+# the answer comes from the session claim, so there is no flight_id or user_id in
+# the request to tamper with.
+st, body = call(DBW1, "/flights", token=alice_token, method="GET")
+check("a user with nothing in the air has no active flights",
+      st == 200 and body.get("flights") == [], str(body))
+st, _ = call(DBW1, "/flights", method="GET")
+check("/flights 401s without a session token", st == 401, str(st))
+
 # ── unauthenticated and cross-tenant access ──────────────────────────────────
 for path, method, label in (
         ("/streams", "GET", "list"),

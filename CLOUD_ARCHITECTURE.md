@@ -375,7 +375,7 @@ until it bites:
 | Redis | Shared | Channel per flight (`flight:{id}`) | **[built]** |
 | Recorder | Shared | Segment → flight_id resolved via `recordings` table | upload **[built]**, per-tenant prefix **[open]** |
 | Orchestrator | Shared | Spawns/stops app containers | **[built]** |
-| Portal | Shared, replicated on load | Session token → `user_id`, read from the claim not the URL | credential **[built]**, routes **[designed]**, front-end **[designed]** |
+| Portal | Shared, replicated on load | Session token → `user_id`, read from the claim not the URL | **[built]** |
 
 A single MediaMTX serves every drone publishing and every viewer watching; a single
 Mosquitto carries every publisher's telemetry. They are separated by path regex, credentials
@@ -551,7 +551,7 @@ reuses its existing publisher token to subscribe, the same token already authori
 video ingest read, the annotated-output publish, and writing alerts. See §9 for what was
 verified and the caveat that the upstream plugin project is now archived.
 
-### Portal **[designed]**
+### Portal **[built]**
 
 "The portal" is two things that land in different places, and conflating them is the
 easiest way to get this wrong:
@@ -559,7 +559,7 @@ easiest way to get this wrong:
 | Half | What it is | Where it goes |
 | --- | --- | --- |
 | **User API** — register, login, list/add/rotate/revoke streams, issue viewer token | HTTP over the `users` and `streams` tables | **db-writer.** New routes on an existing service, not a new one |
-| **Web front-end** — the pages a human clicks | HTML/JS, holds the session cookie | **A new hub service.** This is the only genuinely new deployment |
+| **Web front-end** — the pages a human clicks | HTML/JS, holds the session cookie | **A new hub service** (`portal/`). This is the only genuinely new deployment |
 
 The API half belongs in db-writer because db-writer already owns that schema.
 `UserDirectory.create_stream` / `list_streams` / `revoke_stream` / `rotate_stream_key`
@@ -579,6 +579,44 @@ confirm the existence of a row the caller has no business knowing about.
 
 `POST /viewer/token` is authorised the same way — by the session token, not by a
 password (§3) — so `POST /login` is the only route in the system that takes one.
+
+`GET /flights` completes the set: the caller's currently airborne flights, which is what
+the dashboard marks *live* and what decides whether a Watch button exists at all. It
+returns exactly what `/viewer/token` disambiguates over, deliberately — the page that
+offers the button and the call that authorises pressing it must agree on what is active,
+and two different queries would eventually disagree.
+
+#### The front-end
+
+Server-rendered HTML from a small FastAPI service, no build step and no framework. The
+whole surface is four pages — sign in, register, slots, watch — and a toolchain would be
+more moving parts than the pages themselves.
+
+| Page | What it does |
+| --- | --- |
+| `/login`, `/register` | The only forms that carry a password. Registration signs the new account straight in |
+| `/` | Slots, each with the full `rtmps://` ingest URL to retype, plus New key / Retire, and a Watch button on whatever is live |
+| `/watch` | The annotated video and the alert feed for one flight |
+
+Three things about it are load-bearing rather than incidental:
+
+- **The session token never reaches the page.** It lives in an `httpOnly`, `Secure`,
+  `SameSite=strict` cookie, and the rendered HTML is asserted not to contain it (§9).
+  Printing it into the document would give back exactly what `httpOnly` was for.
+- **The watch page holds only a downgrade.** It fetches a viewer token from the portal
+  at load time rather than having one baked into the HTML, so the credential is never in
+  a document a proxy or browser might cache. The portal composes the WebRTC, HLS and
+  WebSocket URLs from the flight's `output_path` and the public hostnames — and is then
+  not in the path of any of them: video is browser-to-MediaMTX end to end.
+- **State-changing requests are checked twice.** `SameSite=strict` stops the browser
+  attaching the cookie to a cross-site request, and an `Origin`/`Referer` check refuses
+  it server-side. They fail independently, and what they guard is real: a cross-site
+  POST to `/streams/{id}/revoke` would take a tenant's ingest key out of service.
+
+Tenant-supplied text — slot labels, alert messages — is escaped on the way into the DOM
+in both directions: Jinja autoescaping server-side, `textContent` rather than `innerHTML`
+in the alert renderer. A label is the one field a tenant controls that the portal renders
+back to them.
 
 #### Adding a stream is the endpoint that spends money
 
@@ -615,8 +653,14 @@ something is the portal.
 #### It must be stateless, for a reason already learned once
 
 The session lives in the signed cookie, **not in portal memory**. Any replica can then
-serve any request by validating a signature offline, exactly as ws-server validates
-viewer tokens (§3).
+serve any request, because everything it needs arrived with the request.
+
+Note what the portal does *not* do with that cookie: validate it. It cannot — it does not
+hold `SESSION_JWT_SECRET` (§7) — so it forwards the value and treats db-writer's 401 as
+the answer. That is one extra hop per request, and it buys the signing key of every
+credential in the system being absent from the tier facing the internet. Verified rather
+than asserted: the replicas in `run_portal.sh` are started with no `SESSION_JWT_SECRET`
+and no database variables at all, and serve every page in the test.
 
 The failure mode being avoided is one this system has already hit: in-memory sessions
 mean user 3's session exists on replica 1 and replica 2 has never heard of them — which
@@ -689,17 +733,15 @@ existing ones.
 
 ## 6. Flight lifecycle
 
-**Every step is now [built] on the API side.** What steps 1, 2 and 7 wait on is only the
-front-end that calls them — the db-writer routes behind all three exist and are tested.
-Step 6 is verified for `health_monitoring` mode; `danger_detection` has never run end to
-end — see §9.
+**Every step is now [built], end to end.** Step 6 is verified for `health_monitoring`
+mode; `danger_detection` has never run end to end — see §9.
 
 1. User registers on the portal → row in `users`, and logs in for a session token.
-   Registration is open to anyone. **[built]** — `POST /register` and `POST /login`
-   on db-writer; only the front-end calling them is missing.
+   Registration is open to anyone. **[built]** — the portal's `/register` and `/login`
+   pages over db-writer's routes of the same names.
 2. User adds a stream → row in `streams` with a generated `stream_key`. The portal
    offers rotate and retire. **[built]** — `GET/POST /streams`, `/rotate`, `/revoke`
-   on db-writer, capped per user (§4); only the front-end calling them is missing.
+   on db-writer, capped per user (§4), driven from the slots page.
    The key is *not* shown once and then hidden: `list_streams` returns it every time,
    because the operator has to retype the ingest URL before every flight.
 3. Operator types `rtmps://ingest.<host>:1936/in/<key>` into the controller.
@@ -715,8 +757,9 @@ end — see §9.
 7. Viewer opens the portal and — holding a session token from step 1 — calls
    `POST /viewer/token`, receiving a JWT scoped to that one flight, which it presents for
    the WebRTC/HLS read and the WebSocket connection alike. MediaMTX validates it through
-   the same auth endpoint with `action: "read"`. **[built]** — with more than one flight
-   active the call must name a `stream_id` rather than being guessed for.
+   the same auth endpoint with `action: "read"`. **[built]** — the watch page fetches it
+   at load; with more than one flight active the call must name a `stream_id` rather than
+   being guessed for.
 8. Publisher disconnects. `runOnUnavailable` → container stopped, `end_time` stamped.
 
 **The app container never sees end-user credentials.** It used to call `/session/start`
@@ -812,6 +855,13 @@ Externally reachable:
 | 1883 / 8883 | MQTT (fallback) / MQTTS | Mosquitto |
 | 443 | HTTPS + WSS — includes the portal | Traefik |
 
+In compose the portal is published on **8003** and speaks plain HTTP; 443 and the
+certificate are Traefik's in a real deployment. Two variables exist for the gap between
+those worlds, `PORTAL_COOKIE_SECURE` and `PORTAL_PUBLIC_TLS`, and both default to on.
+Turning them off is a local-HTTP affordance and nothing else: a `Secure` cookie is simply
+not returned over `http://`, so the symptom of leaving one off in production is not an
+error but a login that appears to work and then forgets the user.
+
 Internal only — **must never be routed from outside**: ws-server's alert-write API port,
 db-writer, Redis, the recorder, and the orchestrator.
 
@@ -845,6 +895,35 @@ simpler by one hop and would break this line.
 
 ### Built and tested
 
+- **The portal front-end** (§4). The service in `portal/`, and with it the last piece of
+  the flight lifecycle: every step in §6 now has something that calls it. Verified by 69
+  assertions in `run_portal.sh`, driving it the way a browser does — form posts, a session
+  cookie, an `Origin` header — against a real db-writer and real PostgreSQL, on **two
+  portal replicas**.
+
+  Three of those assertions are the ones worth naming, because each pins a claim made
+  elsewhere in this document:
+
+  - **The rendered HTML never contains the session token.** Searched for on the dashboard
+    and the watch page. `httpOnly` buys nothing if the token is also printed into the
+    document it protects.
+  - **What the watch page receives cannot act as a session.** The token in the video URL
+    is checked to differ from the cookie's, then spent against db-writer and refused —
+    both as a session and as a request for another viewer token. The downgrade in §3 with
+    no path back, tested from the far end.
+  - **The replicas hold no secret and no database credentials.** They are started with
+    neither `SESSION_JWT_SECRET` nor any `DB_*` variable and still serve every page, which
+    is how §7's claim is falsifiable rather than merely stated.
+
+  Also pinned: a cookie issued by one replica is accepted by the other (statelessness,
+  the property this design keeps re-earning); cross-site POSTs to add, revoke and login
+  are refused, as is one carrying neither `Origin` nor `Referer`, and the refusals are
+  shown to have created nothing; a slot labelled `<script>alert(1)</script>` comes back
+  escaped; and a rotated key vanishes from the page in the same request that replaces it.
+
+  Not covered: whether video actually plays. That is WebRTC between the browser and
+  MediaMTX, and the portal composes a URL rather than sitting in the path — the URL's
+  shape is asserted, the picture is not.
 - **`/viewer/token` takes a session token, not a password** (§3). The last route outside
   `/login` that accepted one, so a password now reaches exactly one endpoint in the whole
   system. Verified inside `run_mediamtx_auth.sh` (27/27, up from 22): email and password
@@ -1055,29 +1134,16 @@ list nearly empty. Everything here that mattered was portal work.
 ### Designed, not built
 
 - Kubernetes `FlightRuntime` backend (create Job, delete Job)
-- **Portal** (§3 session tokens, §4 Portal). The shape is decided — a `session` scope on
-  the existing JWT mechanism, user-facing routes on db-writer, a stateless front-end
-  service holding an `httpOnly` cookie, and the browser never reaching db-writer
-  directly. In order:
-  1. ~~`UserDirectory.create_user`~~ — **[built]**, see §3
-  2. ~~`POST /register`, `POST /login` → session token~~ — **[built]**, plus `GET /me`
-  3. ~~Stream CRUD routes taking `user_id` from the claim~~ — **[built]**, see §4
-  4. ~~`/viewer/token` accepts a session token~~ — **[built]**, see §3
-  5. The front-end itself
-
-  **All of the db-writer work is done.** `_require_session` in `db_writer/main.py` is
-  the helper every account-scoped route uses, and the API the front-end needs is
-  complete: `/register`, `/login`, `/me`, `GET/POST /streams`,
-  `POST /streams/{id}/rotate`, `POST /streams/{id}/revoke`, `POST /viewer/token`.
-  What remains is the front-end and the service that serves it.
 
 ### Open
 
-- **`/login` is an unrated password oracle.** It is reachable by anything that can
-  reach db-writer and is slowed only by bcrypt's own cost — there is no lockout, no
-  backoff and no attempt counter. The blast radius is currently small (db-writer is
-  internal-only, and the portal in front of it does not exist yet), but this endpoint
-  is the reason rate limiting has to land *with* the portal rather than after it.
+- **`/login` is an unrated password oracle, and it now has a door onto the internet.**
+  There is no lockout, no backoff and no attempt counter; the only brake is bcrypt's own
+  cost. This was tolerable while db-writer was internal-only and nothing public reached
+  it. The portal changes that — `POST /login` on the portal is anonymous by construction,
+  since a login form cannot require a session — so this is **the one thing that should
+  land next**, and it belongs on the portal rather than db-writer: the portal is where
+  the client IP is still visible, and it is the tier that has to survive being pointed at.
   Deliberately not addressed by equalising response time between "no such user" and
   "wrong password": `/register` already discloses exactly that fact by design, so a
   dummy hash on every failed login would cost real time and conceal nothing.
@@ -1091,6 +1157,23 @@ list nearly empty. Everything here that mattered was portal work.
   hours: ten slots flying all day is within the cap. Quota and billing are the answer,
   and neither exists — this only becomes pressing once the Kubernetes node pool in §2
   can create machines on demand.
+- **Signing out drops the cookie; it does not revoke the token.** A session token stays
+  valid for its full eight hours whatever the user clicks, because there is no
+  revocation list — that is the price of a stateless session and the reason the lifetime
+  is hours rather than weeks. It covers logging out on a shared machine and does not
+  cover a token already copied. A deny-list in Redis would fix it and would put a
+  server-side lookup back on every request, which is the thing §4 is careful not to do;
+  worth revisiting only if a real reason to force logout appears.
+- **Browser playback is unverified.** `run_portal.sh` asserts the shape of the WebRTC and
+  HLS URLs but no browser has opened one, and the watch page embeds MediaMTX's own reader
+  page rather than negotiating WHEP itself — which assumes MediaMTX forwards the `?jwt=`
+  query on to its WHEP request. That assumption is the one thing on the page that a test
+  here cannot reach; it needs a human with a browser and a live flight, which is the same
+  session that would finally run `danger_detection` end to end.
+- **No flight history.** The portal shows what is airborne now and nothing that has
+  landed, so recordings and past alerts are in the database and unreachable from the UI.
+  Every row needed is already there (`flights`, `alerts`, `recordings`); what is missing
+  is a paged read route and a page, and neither is on the path of anything else.
 - Recorder per-tenant upload prefixes
 - TLS certificate issue and renewal
 - **Auth-endpoint caching and db-writer replica count.** Every publish and every read

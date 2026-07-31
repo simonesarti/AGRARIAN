@@ -20,6 +20,7 @@ from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 
 from auth import (
@@ -287,8 +288,14 @@ def whoami(authorization: Optional[str] = Header(default=None)):
 
     Also the smallest possible consumer of _require_session, which every
     account-scoped endpoint added after this one will use the same way.
+
+    The email comes back too, so the portal can name the signed-in account
+    without keeping a copy of it anywhere the browser could edit. A token whose
+    user row has since been deleted resolves to null rather than 404: the token
+    is still validly signed, and this endpoint reports what it says.
     """
-    return {"user_id": _require_session(authorization)}
+    user_id = _require_session(authorization)
+    return {"user_id": user_id, "email": _directory.user_email(user_id)}
 
 
 # ------------------------------------------------------------------ #
@@ -400,6 +407,24 @@ def revoke_stream(
         logger.error(f"Unexpected error revoking stream {stream_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to revoke stream")
     return {"ok": True}
+
+
+@app.get("/flights")
+def list_active_flights(authorization: Optional[str] = Header(default=None)):
+    """
+    The caller's currently airborne flights — what the portal marks "live".
+
+    Read-only and scoped by the session claim like every route above it. It
+    returns exactly what /viewer/token disambiguates over, which is deliberate:
+    the page that offers a Watch button and the call that authorises watching
+    must agree on what is active, and two different queries would eventually
+    disagree.
+
+    No flight *history* here. That is a separate question with separate paging
+    and a separate cost, and nothing in the portal asks it yet.
+    """
+    user_id = _require_session(authorization)
+    return {"flights": _directory.active_flights(user_id)}
 
 
 @app.post("/session/{flight_id}/alert")
@@ -631,20 +656,28 @@ def issue_viewer_token(
             # or simply has nothing active: the caller already owns every row in
             # `active`, so distinguishing the two would only leak which is true.
             raise HTTPException(status_code=404, detail="No active flight on that stream")
-        flight_id = matches[0]["flight_id"]
+        flight = matches[0]
     elif len(active) == 1:
-        flight_id = active[0]["flight_id"]
+        flight = active[0]
     elif len(active) == 0:
         raise HTTPException(status_code=404, detail="No active flight for this user")
     else:
+        # jsonable_encoder because this is an HTTPException detail, which FastAPI
+        # serialises with plain json.dumps rather than the response encoder — a
+        # datetime in here is a 500, not a 409, and the rows carry start_time.
         raise HTTPException(status_code=409, detail={
             "message": "More than one flight is active; specify stream_id",
-            "active_flights": active,
+            "active_flights": jsonable_encoder(active),
         })
 
+    flight_id = flight["flight_id"]
     logger.info(f"Viewer token issued: flight_id={flight_id}, user_id={user_id}")
     return {
         "flight_id": flight_id,
+        # What the token is good for. The portal needs both to build a playable
+        # URL, and returning them together means it never has to ask a second
+        # question about a flight it was just authorised for.
+        "output_path": flight["output_path"],
         "viewer_token": mint_viewer_token(flight_id, user_id),
     }
 

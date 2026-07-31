@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}AGRARIAN{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">AGRARIAN</a>
+    {% if email %}
+      <div class="who">
+        <span class="email">{{ email }}</span>
+        {# A form, not a link: signing out changes state, and the Origin check
+           only runs on POST. A GET /logout would also be followable by anything
+           that can put an image tag on a page. #}
+        <form method="post" action="/logout"><button type="submit" class="linkish">Sign out</button></form>
+      </div>
+    {% endif %}
+  </header>
+
+  <main class="page">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

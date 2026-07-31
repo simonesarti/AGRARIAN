@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}Your streams — AGRARIAN{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="cardhead">
+    <h1>Stream slots</h1>
+    <span class="muted">{{ streams|length }} active{% if live_count %} · {{ live_count }} flying now{% endif %}</span>
+  </div>
+
+  <p class="muted">
+    A slot is one feed you can publish at a time — not a particular aircraft. Add
+    slots as the number of simultaneous flights grows, retire them when it shrinks.
+  </p>
+
+  {% if streams %}
+  <table class="slots">
+    <thead>
+      <tr><th>Slot</th><th>Ingest URL</th><th>Status</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for s in streams %}
+      <tr>
+        <td>
+          <strong>{{ s.label or "Untitled slot" }}</strong>
+          <div class="muted small">added {{ (s.created_at or "")[:10] }}</div>
+        </td>
+        <td>
+          {# Shown in full, every time. The key is recoverable by design: the
+             operator retypes this URL into the controller before every flight,
+             so a key the portal would only show once is a key they would have to
+             rotate in order to use. #}
+          <code class="key">{{ s.ingest_url }}</code>
+        </td>
+        <td>
+          {% if s.live %}
+            <span class="badge live">Live</span>
+            <div class="muted small">since {{ (s.live.start_time or "")[:19]|replace("T", " ") }}</div>
+          {% else %}
+            <span class="badge idle">Idle</span>
+          {% endif %}
+        </td>
+        <td class="actions">
+          {% if s.live %}
+            <a class="button primary" href="/watch?stream_id={{ s.stream_id }}">Watch</a>
+          {% endif %}
+          <form method="post" action="/streams/{{ s.stream_id }}/rotate">
+            <button type="submit" title="Issue a new key and kill the old one immediately">New key</button>
+          </form>
+          <form method="post" action="/streams/{{ s.stream_id }}/revoke"
+                onsubmit="return confirm('Retire this slot? The key stops working immediately. Past flights and alerts are kept.')">
+            <button type="submit" class="danger">Retire</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="empty">No slots yet. Add one to get an ingest URL for a drone.</p>
+  {% endif %}
+
+  <form method="post" action="/streams" class="row addslot">
+    <input type="text" name="label" placeholder="Label (optional) — e.g. north field" maxlength="128">
+    <button type="submit" class="primary">Add slot</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Flying a slot</h2>
+  <ol class="steps">
+    <li>Type the slot's ingest URL into the drone controller's RTMP settings.</li>
+    <li>Start streaming. Processing starts on its own — nothing to press here.</li>
+    <li>The slot turns <span class="badge live">Live</span> and a <strong>Watch</strong> button appears.</li>
+  </ol>
+  <p class="muted small">
+    Lost a key, or typed it somewhere you should not have? <strong>New key</strong>
+    replaces it immediately; a flight already in the air is unaffected and keeps
+    running until it lands.
+  </p>
+</div>
+{% endblock %}

@@ -15,6 +15,7 @@
 #   8889  — MediaMTX WebRTC (WHEP signalling)
 #   8189  — MediaMTX WebRTC (ICE/media UDP)
 #   ${WS_PORT} — WebSocket alert stream
+#   8003  — portal (HTTPS on 443 behind Traefik in a real deployment)
 #
 # Recording: MediaMTX records the annotated stream to the 'recordings' volume.
 #            The recorder sidecar uploads each segment on completion.
@@ -122,6 +123,48 @@ services:
       SESSION_JWT_SECRET:    ${SESSION_JWT_SECRET:?set SESSION_JWT_SECRET in .env}
       VIEWER_TOKEN_TTL_S:    ${VIEWER_TOKEN_TTL_S:-43200}
       PUBLISHER_TOKEN_TTL_S: ${PUBLISHER_TOKEN_TTL_S:-86400}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # ── Portal ────────────────────────────────────────────────────────────────────
+  # The account pages, and the only new service on the public side. It is what keeps
+  # db-writer off it: the browser talks to the portal, the portal talks to db-writer
+  # over comms-net.
+  #
+  # Note what is NOT here: SESSION_JWT_SECRET and every DB_* variable. The portal
+  # mints nothing, validates nothing and reads no table — it forwards the session
+  # cookie and lets db-writer answer. That is deliberate (§7), so adding either of
+  # those here would undo it.
+  portal:
+    build:
+      context: portal
+    restart: unless-stopped
+    networks: [comms-net]
+    depends_on:
+      db-writer:
+        condition: service_healthy
+    ports:
+      - "8003:8000"     # Traefik terminates HTTPS on 443 and forwards here
+    environment:
+      DB_WRITER_URL: http://db-writer:8000
+      # Hostnames the BROWSER dials, not ones this container dials. Video and
+      # alerts go straight from the browser to MediaMTX and ws-server; the portal
+      # only composes the URLs.
+      # Required, but guarded in the portal rather than with ${VAR:?} here: a
+      # compose interpolation error aborts the whole file, so the guard that
+      # belongs to one service would stop every service from starting.
+      MEDIA_PUBLIC_HOST: ${MEDIAMTX_HOST}
+      WS_PUBLIC_HOST:    ${WS_PUBLIC_HOST:-}
+      WS_PORT:           ${WS_PORT:-8765}
+      # Both must stay true wherever the browser reaches this over HTTPS. A Secure
+      # cookie is simply not sent over http://, so turning it off for a local test
+      # and forgetting looks like a login that works and then forgets you.
+      COOKIE_SECURE:     ${PORTAL_COOKIE_SECURE:-true}
+      PUBLIC_TLS:        ${PORTAL_PUBLIC_TLS:-true}
+      PORTAL_ALLOWED_ORIGIN_HOSTS: ${PORTAL_ALLOWED_ORIGIN_HOSTS:-}
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 5s

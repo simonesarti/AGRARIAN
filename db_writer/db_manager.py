@@ -418,6 +418,17 @@ class UserDirectory:
                 raise ValueError("Authentication failed: Invalid credentials.")
             return user.user_id
 
+    def user_email(self, user_id: int) -> Optional[str]:
+        """
+        The address on an account, for /me to answer "who am I" with something a
+        human recognises. Takes a user_id resolved from a session claim, never one
+        supplied by a caller.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            user = session.query(User).filter_by(user_id=user_id).first()
+            return user.email if user else None
+
     # ── Stream management ─────────────────────────────────────────────────────
 
     def resolve_stream_key(self, stream_key: str) -> Optional[dict]:
@@ -714,7 +725,16 @@ class UserDirectory:
                 .all()
             )
             return [
-                {"flight_id": f.flight_id, "stream_id": s.stream_id, "label": s.label}
+                {
+                    "flight_id": f.flight_id,
+                    "stream_id": s.stream_id,
+                    "label": s.label,
+                    # The portal builds the viewer-facing URL from this plus the
+                    # public media hostname, which is why the path is stored rather
+                    # than a URL — see the note on Flight.output_path.
+                    "output_path": f.output_path,
+                    "start_time": f.start_time,
+                }
                 for f, s in rows
             ]
 

@@ -30,6 +30,7 @@ try to run these directly with `python3`.
 | `run_recording_upload.sh` | MediaMTX + recorder + db-writer + Postgres, host `ffmpeg` | `./run_recording_upload.sh` |
 | `run_mqtt_auth.sh` | mosquitto-go-auth + db-writer + Postgres | `./run_mqtt_auth.sh` |
 | `run_portal_auth.sh` | Postgres + 2 db-writer replicas | `./run_portal_auth.sh` |
+| `run_portal.sh` | Postgres + db-writer + 2 portal replicas | `./run_portal.sh` |
 | `run_orchestrator_recovery.sh` | the same as `run_orchestrator.sh` | `./run_orchestrator_recovery.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
@@ -98,7 +99,8 @@ docker run --rm -v "$PWD/db_writer:/dbw" -v "$PWD/tests/comms:/tests:ro" \
 ```bash
 ./run_db_replication.sh      # 7 + 20×2 assertions, real PostgreSQL
 ./run_redis_failure.sh       # 3 + 7 assertions, Redis restarted mid-test
-./run_portal_auth.sh         # 49 assertions, portal API across 2 replicas
+./run_portal_auth.sh         # 51 assertions, portal API across 2 replicas
+./run_portal.sh              # 69 assertions, the portal driven as a browser
 ./run_mediamtx_auth.sh       # 27 assertions, real MediaMTX + ffmpeg publishes
 ./run_orchestrator.sh        # 21 assertions, real containers spawned and torn down
 ./run_orchestrator_real_app.sh  # 7 assertions, the real GPU app, not the stub
@@ -189,6 +191,40 @@ constraint rather than a prior `SELECT` (check-then-insert is a race across repl
 and passwords are bounded at bcrypt's 72-**byte** limit measured in bytes — one emoji
 is four — because bcrypt 5.x raises past it and an unguarded long passphrase would be
 a 500 rather than a clear rejection.
+
+**`run_portal.sh` / `test_portal.py`** — the portal itself, driven the way a browser
+drives it: form posts, a session cookie and an `Origin` header, against a real db-writer
+and real PostgreSQL. **Two portal replicas**, for the reason above: a cookie issued by
+replica 1 must be accepted by replica 2, and a server-side session would pass every
+other assertion here and fail that one.
+
+The replicas are started with **no `SESSION_JWT_SECRET` and no `DB_*` variables**, which
+turns §7's claim into something the test can falsify: if the portal can still serve every
+page, it validates nothing and reads no table itself. They also run with the production
+cookie defaults (`Secure`, `SameSite=strict`, `HttpOnly`) even though the test speaks
+plain HTTP — a browser would refuse to return a `Secure` cookie over `http://`, this
+client does not, so the attributes can be asserted rather than quietly relaxed.
+
+What it guards beyond the happy path:
+
+- **The session token never reaches the page.** Asserted by searching the rendered HTML
+  of the dashboard and the watch page for the cookie's value. The whole point of
+  `httpOnly` is lost if the token is also printed into the document.
+- **The viewer token is a downgrade.** What the watch page receives is checked to be a
+  *different* token, and then spent against db-writer to prove it cannot act as a
+  session or mint another viewer token — there is no path back up.
+- **Cross-site request forgery**, four ways: a foreign `Origin` on add, sign-out and
+  login are all refused, as is a state-changing POST carrying neither `Origin` nor
+  `Referer`; a same-site `Referer` with no `Origin` is accepted. The refusals are then
+  shown to have created nothing.
+- **Label markup is escaped.** A slot labelled `<script>alert(1)</script>` must come
+  back escaped: labels are tenant input rendered into HTML, and Jinja's autoescaping is
+  the only thing between that and script execution in the owner's own tab.
+- **The composed URLs**, since the portal is the only thing that knows how to build
+  them: the WebRTC and HLS URLs point at the public media host and the flight's own
+  `out/<public_uuid>` path, and the alert URL at ws-server. Whether video *plays* is not
+  covered — that is WebRTC between the browser and MediaMTX, and the portal is not in
+  the middle of it.
 
 **`test_tokens.py`** — viewer and publisher tokens are signed with the same secret, so
 the `scope` claim is the only thing separating them. Checked in both directions, plus
