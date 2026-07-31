@@ -34,6 +34,7 @@ try to run these directly with `python3`.
 | `run_orchestrator_recovery.sh` | the same as `run_orchestrator.sh` | `./run_orchestrator_recovery.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
+| `run_watch_live.sh` | **not a test** — the whole product plus a browser | `./run_watch_live.sh [host]` |
 
 The `run_*.sh` scripts build images, stand everything up, run the assertions, print the
 resulting database rows where relevant, and **clean up after themselves on exit** —

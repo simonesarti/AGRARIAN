@@ -1047,6 +1047,54 @@ simpler by one hop and would break this line.
 > everything runs in throwaway containers — except `run_mediamtx_auth.sh`, which needs
 > `ffmpeg` and `curl` on the host to drive real publishes and reads.
 
+### Where to pick up next
+
+The rest of this section is a ledger, ordered by subject rather than by urgency. This is the
+ordering — what to do next and why that one first. It is the entry point for anyone, human
+or otherwise, arriving without the history.
+
+**Two asks with lead time, worth starting before anything else because everything below
+waits on them and neither is work:**
+
+1. **A hostname and control of its DNS.** Let's Encrypt will not issue a certificate for an
+   IP address, and `MEDIAMTX_HOST` is an IP today. Nothing in the ingress tier can be built
+   until a name resolves to this deployment.
+2. **A DEM raster covering the operating area** (`dem/dem.tif`, `dem/dem_mask.tif`). Slope
+   and no-data analysis are skipped without it, so a real part of `danger_detection` has
+   never executed.
+
+**Then, in order:**
+
+1. **The ingress tier** (§7, *Designed, not built*). The largest gap between this document
+   and the branch: every public credential — stream keys, session cookies, viewer tokens,
+   MQTT passwords — crosses the wire in the clear right now, and the portal's own defaults
+   (`COOKIE_SECURE`, `PUBLIC_TLS`) describe a deployment that does not exist. Four concrete
+   pieces: a `traefik` service with routers for the portal, HLS and WHEP; `encryption` plus
+   cert paths on MediaMTX's RTMP/RTSP listeners; Mosquitto's commented-out MQTTS listener;
+   and an issuer. Do it in that order — Traefik first, because it is the only one of the
+   four that terminates for a protocol already being used by a browser.
+2. **Load the watch page in a real browser** (`run_watch_live.sh`). The cheapest open item
+   by a wide margin: it needs a person and twenty minutes, no new code, and it is the only
+   thing standing between "the protocol is verified" and "the product works". The page
+   changed after the last run — the HLS button is gone and ICE-TCP is on — so the previous
+   look does not count. Autoplay policy on the `<video>` element is the specific risk.
+3. **Certificate renewal for MediaMTX** (§9, *Open*). Sequenced here rather than lower
+   because the answer must be known **before** the first certificate is issued, not before
+   it expires: if MediaMTX does not reread a changed cert from disk, renewal means
+   restarting the media server, which drops every flight in the air. Ninety days of not
+   knowing is the expensive way to find out.
+4. **The Kubernetes `FlightRuntime` backend** (§2). Mechanical — the interface exists and
+   the Docker backend is the reference — and it retires the orchestrator's hold on the
+   Docker socket, which is the strongest standing argument for making the move.
+5. **Flight history in the portal** (§9, *Open*). The first thing a user will ask for that
+   the system already has the data for. Every row exists; what is missing is a paged read
+   route and a page.
+
+Everything else in *Open* is either genuinely conditional (MediaMTX sharding, TURN over 443,
+auth-endpoint caching — all of which want a measurement or a user complaint first) or paired
+with a feature that does not exist yet (email verification with password reset, quota with
+billing).
+
 ### Built and tested
 
 - **Rate limiting on `/login` and `/register`** (§4). The two endpoints anyone on the
@@ -1329,6 +1377,8 @@ simpler by one hop and would break this line.
   27/27 total): the one-flight case still just works, a second concurrent flight
   makes the plain request 409 rather than pick one, `stream_id` resolves each flight
   correctly, and a user cannot use `stream_id` to reach another tenant's flight.
+
+### Known weaknesses in what exists
 
 Distinct from the section below: these are live weaknesses on this branch right now, not
 work that has yet to start.
