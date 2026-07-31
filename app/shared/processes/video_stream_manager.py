@@ -15,6 +15,7 @@ from app.shared.processes.constants import (
     VIDEO_OUT_STREAM_STARTUP_TIMEOUT,           # 2.0
     VIDEO_OUT_STREAM_SHUTDOWN_TIMEOUT,           # 10.0
 )
+from app.shared.processes.logging_config import worker_log_level
 
 # ================================================================
 # Two dedicated loggers, one per sink, each writing to its own file so the
@@ -24,14 +25,14 @@ if not stream_logger.handlers:
     _h = logging.FileHandler('./logs/video_out_stream.log', mode='w')
     _h.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     stream_logger.addHandler(_h)
-    stream_logger.setLevel(logging.WARNING)
+    stream_logger.setLevel(worker_log_level())
 
 file_logger = logging.getLogger("main.video_out.file")
 if not file_logger.handlers:
     _h = logging.FileHandler('./logs/video_out_file.log', mode='w')
     _h.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     file_logger.addHandler(_h)
-    file_logger.setLevel(logging.WARNING)
+    file_logger.setLevel(worker_log_level())
 # ================================================================
 
 

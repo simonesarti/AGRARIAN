@@ -18,6 +18,7 @@ from app.shared.processes.constants import (
     PIPELINE_QUEUE_TIMEOUT,
     VIDEO_STREAM_READER_PROCESSING_SHAPE,
 )
+from app.shared.processes.logging_config import worker_log_level
 
 
 # ================================================================
@@ -28,7 +29,7 @@ if not logger.handlers:
     _handler = logging.FileHandler('./logs/hm_anomaly.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
-    logger.setLevel(logging.WARNING)
+    logger.setLevel(worker_log_level())
 
 # ================================================================
 

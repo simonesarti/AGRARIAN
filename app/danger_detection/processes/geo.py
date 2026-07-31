@@ -28,6 +28,7 @@ from app.shared.processes.constants import (
     GEO_DEM_CACHE_BUFFER_SCALE,
     PIPELINE_QUEUE_TIMEOUT,
 )
+from app.shared.processes.logging_config import worker_log_level
 
 
 # ================================================================
@@ -38,7 +39,7 @@ if not logger.handlers:  # Avoid duplicate handlers
     _handler = logging.FileHandler('./logs/danger_geo.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
-    logger.setLevel(logging.WARNING)
+    logger.setLevel(worker_log_level())
 
 # ================================================================
 

@@ -26,7 +26,7 @@ try to run these directly with `python3`.
 | `test_redis_outage.py` | same | `./run_redis_failure.sh` |
 | `run_mediamtx_auth.sh` | MediaMTX + db-writer + Postgres, host `ffmpeg` | `./run_mediamtx_auth.sh` |
 | `run_orchestrator.sh` | the above + Docker socket, host `ffmpeg` | `./run_orchestrator.sh` |
-| `run_orchestrator_real_app.sh` | the above + a GPU, `nvidia-container-toolkit`, `checkpoints/*.pt` | `./run_orchestrator_real_app.sh` |
+| `run_orchestrator_real_app.sh` | the above + a GPU, `nvidia-container-toolkit`, `checkpoints/*`, Mosquitto | `./run_orchestrator_real_app.sh [mode]` |
 | `run_recording_upload.sh` | MediaMTX + recorder + db-writer + Postgres, host `ffmpeg` | `./run_recording_upload.sh` |
 | `run_mqtt_auth.sh` | mosquitto-go-auth + db-writer + Postgres | `./run_mqtt_auth.sh` |
 | `run_portal_auth.sh` | Postgres + 2 db-writer replicas | `./run_portal_auth.sh` |
@@ -103,7 +103,8 @@ docker run --rm -v "$PWD/db_writer:/dbw" -v "$PWD/tests/comms:/tests:ro" \
 ./run_portal.sh              # 87 + 2 assertions, the portal driven as a browser
 ./run_mediamtx_auth.sh       # 27 assertions, real MediaMTX + ffmpeg publishes
 ./run_orchestrator.sh        # 21 assertions, real containers spawned and torn down
-./run_orchestrator_real_app.sh  # 7 assertions, the real GPU app, not the stub
+./run_orchestrator_real_app.sh                    # 15 assertions, the real GPU app in danger_detection
+./run_orchestrator_real_app.sh health_monitoring  #  9 assertions, the same lifecycle in the other mode
 ./run_recording_upload.sh    # 8 assertions, real segment upload + DB traceability
 ./run_mqtt_auth.sh           # 9 assertions, real mosquitto-go-auth broker
 ./run_orchestrator_recovery.sh  # 13 assertions, real crash + restart
@@ -347,15 +348,44 @@ the exited one out in PostgreSQL and remove it, and — the recovered flight isn
 present in a health-check, it still lands normally — tear it down cleanly once the
 drone actually disconnects, same as any flight the orchestrator opened itself.
 
-**`run_orchestrator_real_app.sh`** — the same lifecycle, but the container the
-orchestrator spawns is the actual GPU app image (`APP_MODE=health_monitoring`,
-`APP_GPUS=all`), with real ws-server, Redis, db-writer, MediaMTX and PostgreSQL behind
-it. Proves what no other test here can: that the app, given only the orchestrator's
-injected `FLIGHT_ID`/`PUBLISHER_TOKEN`/paths, actually reads `in/<key>`, runs its
-pipeline on the GPU, and publishes to `out/<public_uuid>`. Needs
-`nvidia-container-toolkit` and the `.pt` checkpoints already on disk (gitignored — see
-`checkpoints/.gitkeep`). `danger_detection` mode is not covered: it requires a
-TensorRT `.engine` built for the target GPU, which does not exist yet.
+**`run_orchestrator_real_app.sh [mode]`** — the same lifecycle, but the container the
+orchestrator spawns is the actual GPU app image (`APP_GPUS=all`), with real ws-server,
+Redis, db-writer, Mosquitto, MediaMTX and PostgreSQL behind it. Proves what no other
+test here can: that the app, given only the orchestrator's injected
+`FLIGHT_ID`/`PUBLISHER_TOKEN`/paths, actually reads `in/<key>`, runs its pipeline on the
+GPU, and publishes to `out/<public_uuid>`. Needs `nvidia-container-toolkit` and the
+checkpoints already on disk (gitignored — see `checkpoints/.gitkeep`).
+
+**Both modes run.** The mode is the first argument and defaults to `danger_detection`.
+This file used to hardcode `health_monitoring`, so the primary product mode had never
+executed once; the note that used to sit here — that `danger_detection` needs a TensorRT
+`.engine` built for the target GPU — was **wrong**. `danger_detection_stream.py` falls
+back to the `.pt` detector and `.onnx` segmenter when no engine is present, and that is
+the path this test takes. An engine is an accelerator, not a prerequisite.
+
+`danger_detection` additionally starts **Mosquitto with the real `mosquitto.conf` and the
+real db-writer ACL endpoint**, plus `telemetry_publisher.py` authenticating as the drone
+with its stream key. That combination is what finally makes the telemetry plane carry a
+message from the real app: `run_mqtt_auth.sh` proves who may publish where, but nothing
+before this proved that a subscriber on the far side ever receives anything.
+
+The load-bearing assertion is *"telemetry is reaching the combiner"*, and it is not
+decoration. `FRAMETELCOMB_MAX_TIME_DIFF` is 150 ms, so a publisher can connect,
+authenticate, be admitted by the ACL, and deliver every message on time — and still leave
+every frame unmatched if it publishes below ~7 Hz. Verified by falsification: dropping the
+publisher to 1 Hz leaves all fourteen other assertions green and fails only this one
+(192 starved matches in the last 200 log lines). `health_monitoring` skips this whole
+group because it never instantiates `FrameTelemetryCombiner`.
+
+Assertions read `/app/logs/*.log` copied out of the flight container, not `docker logs` —
+`app/main.py` configures no `StreamHandler`, so the container's stdout carries almost
+nothing and the old `docker logs | grep CRITICAL` check could never fail. The runner sets
+`APP_ENV_LOG_LEVEL=INFO`, without which the worker loggers sit at WARNING and every line
+these assertions look for is dropped before reaching a handler.
+
+`dem/dem.tif` is gitignored and usually absent; `open_dem_tifs()` returns `None` and the
+GeoWorker skips slope and no-data analysis. Geofencing and the safety radius still run.
+The script says which of the two it got, so a green run is not read as full geo coverage.
 
 **`run_recording_upload.sh`** — the recording upload path, which the auth section above
 explains was silently broken from the start (no `wget` on the default MediaMTX image).
@@ -406,9 +436,13 @@ is not — the listener block in `configs/mosquitto/mosquitto.conf` is commented
 unexercised. See `CLOUD_ARCHITECTURE.md` §9 for current status.
 
 `run_orchestrator_real_app.sh` drives the real GPU app tier through the orchestrator in
-`health_monitoring` mode — ingest read, pipeline, and annotated-output publish are all
-verified. `danger_detection` mode is not: it needs a TensorRT `.engine` built for the
-target GPU, and none exists yet.
+**both** modes — ingest read, pipeline, and annotated-output publish are verified for
+each. `danger_detection` additionally verifies the telemetry plane end to end, against a
+real broker enforcing the real ACLs.
+
+What that still does not cover: **no browser has opened the annotated stream.** The test
+asserts MediaMTX logged the publish to `out/<uuid>`; whether a viewer's WebRTC or HLS
+request plays it, with a `?jwt=` viewer token attached, needs a human and a browser.
 
 The recording upload path is verified for the `local` storage backend
 (`run_recording_upload.sh`). The `azure` and `aws` backends in `recorder/main.py` are

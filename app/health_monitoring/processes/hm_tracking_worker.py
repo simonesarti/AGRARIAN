@@ -13,6 +13,7 @@ from app.shared.processes.messages import FrameSlotMetadata
 from app.shared.processes.frame_buffer import FrameBuffer
 from app.shared.processes.signals import reset_child_signal_handlers
 from app.shared.processes.constants import PIPELINE_QUEUE_TIMEOUT
+from app.shared.processes.logging_config import worker_log_level
 
 
 # ================================================================
@@ -23,7 +24,7 @@ if not logger.handlers:
     _handler = logging.FileHandler('./logs/hm_tracking.log', mode='w')
     _handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(_handler)
-    logger.setLevel(logging.WARNING)
+    logger.setLevel(worker_log_level())
 
 # ================================================================
 

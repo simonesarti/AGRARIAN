@@ -380,7 +380,7 @@ until it bites:
 
 | Component | Instances | Tenancy mechanism | State |
 | --- | --- | --- | --- |
-| **GPU app** | **One per active flight** | Sole occupant — no internal tenancy needed | container **[built]**, lifecycle **[built]**, paths **[verified]** for `health_monitoring`; `danger_detection` needs a TensorRT engine |
+| **GPU app** | **One per active flight** | Sole occupant — no internal tenancy needed | container **[built]**, lifecycle **[built]**, paths **[verified]** against a real GPU in **both** modes |
 | MediaMTX | Shared, replicated on load | Regex paths + HTTP auth hook | **[built]** |
 | Mosquitto | Shared, replicated on load | Per-stream credentials + topic ACLs | **[built]** |
 | ws-server | Shared, replicated on load | Per-flight JWT (view + publish scopes); Redis pub/sub fan-out | **[built]** |
@@ -810,8 +810,8 @@ existing ones.
 
 ## 6. Flight lifecycle
 
-**Every step is now [built], end to end.** Step 6 is verified for `health_monitoring`
-mode; `danger_detection` has never run end to end — see §9.
+**Every step is now [built], end to end.** Step 6 is verified against a real GPU in both
+modes. What no test reaches is the viewer's browser at the end of it — see §9.
 
 1. User registers on the portal → row in `users`, and logs in for a session token.
    Registration is open to anyone. **[built]** — the portal's `/register` and `/login`
@@ -829,8 +829,9 @@ mode; `danger_detection` has never run end to end — see §9.
    token, then spawns the container with `flight_id`, ingest path, output path and token
    injected as environment.
 6. App reads `in/<key>`, publishes annotated video to `out/<public_uuid>`, POSTs alerts to
-   ws-server and db-writer. **[verified for `health_monitoring` mode against a real GPU
-   container — see §9; `danger_detection` mode still needs a TensorRT engine]**
+   ws-server and db-writer. **[verified against a real GPU container in both modes — see
+   §9. `danger_detection` additionally consumes live telemetry over Mosquitto, which
+   `health_monitoring` never does]**
 7. Viewer opens the portal and — holding a session token from step 1 — calls
    `POST /viewer/token`, receiving a JWT scoped to that one flight, which it presents for
    the WebRTC/HLS read and the WebSocket connection alike. MediaMTX validates it through
@@ -1168,17 +1169,57 @@ simpler by one hop and would break this line.
   reached the database, and 40 interleaved alerts across two concurrent flights and both
   replicas persisted with no loss and no cross-contamination. Auth held across replicas
   throughout.
-- **The real app tier, driven by the orchestrator, in `health_monitoring` mode.**
+- **The real app tier, driven by the orchestrator, in BOTH modes.**
   `run_orchestrator_real_app.sh` builds the actual GPU app image (not the sleeping stub)
   and runs it with `--gpus all` behind the orchestrator: a live publish spawns it with
   the injected `FLIGHT_ID`/`PUBLISHER_TOKEN`/paths, it reads `in/<key>`, runs the full
-  tracking → anomaly → interpolation → annotation pipeline on the GPU with zero
-  `CRITICAL` log lines, publishes annotated video to its own `out/<uuid>` (confirmed by
-  MediaMTX's own "is publishing to path" log line), and is torn down cleanly on landing
-  with the flight row closed. 7/7 assertions, real MediaMTX/db-writer/ws-server/Redis/
-  Postgres throughout. No alert was expected or produced: the input is an ffmpeg
-  `testsrc` pattern with no trajectories to flag. `danger_detection` mode remains
-  unverified — see the gap above.
+  pipeline on the GPU with zero `CRITICAL` log lines, publishes annotated video to its
+  own `out/<uuid>` (confirmed by MediaMTX's own "is publishing to path" log line), and is
+  torn down cleanly on landing with the flight row closed. `danger_detection` 15/15,
+  `health_monitoring` 9/9, real MediaMTX/Mosquitto/db-writer/ws-server/Redis/Postgres
+  throughout. No alert was expected or produced in either: the input is an ffmpeg
+  `testsrc` pattern with nothing in it to flag.
+
+  The mode is now the runner's first argument and **defaults to `danger_detection`**. It
+  was hardcoded to `health_monitoring`, which is the whole reason the primary product mode
+  had never executed once. Three things had to be true before that could be fixed, and
+  only the first was known:
+
+  - **The TensorRT claim was wrong twice over.** This document already corrected the
+    first half; the run settles it. `danger_detection_stream.py` resolves each model by
+    looking for an `engine/<stem>.engine` and falling back to the `.pt` detector and
+    `.onnx` segmenter named in `configs/danger_detection/*.yaml`. That fallback is the
+    path the test takes. An engine is an accelerator, never a prerequisite.
+  - **Nothing the workers log was observable.** Fifteen modules ended their logger setup
+    with a hardcoded `setLevel(logging.WARNING)`, and `app/main.py` installs no
+    `StreamHandler` at all — so `docker logs` on a flight container is near-empty and the
+    old `docker logs | grep -c CRITICAL` assertion could not fail under any circumstance.
+    Assertions now read `/app/logs/*.log` copied out of the live container, and the level
+    comes from `LOG_LEVEL` (default `WARNING`, so production is unchanged; the harness
+    sets `INFO`). An operator could not previously turn on the diagnostics the workers
+    were already writing.
+  - **The telemetry plane needed a real publisher.** See below.
+- **The telemetry plane carries a real message from the real app.** `run_mqtt_auth.sh`
+  proves Mosquitto's authorisation — who may publish where, and that one flight cannot
+  read another's topics — but it proves nothing about the plane as a *pipe*, because no
+  app is listening at the other end. `danger_detection` is the only mode that consumes
+  telemetry (`health_monitoring` instantiates no `FrameTelemetryCombiner`), so until this
+  run, §4's Mosquitto work, the `TELEMETRY_LISTENER_STREAM_KEY` the orchestrator injects,
+  and the app's reuse of its publisher token as an MQTT username had been exercised only
+  by synthetic clients.
+
+  The harness now starts the broker with the **real `mosquitto.conf` against the real
+  db-writer ACL endpoint**, plus `tests/comms/telemetry_publisher.py` authenticating as
+  the drone with its stream key — two different credentials admitted to the same topics
+  from opposite directions, which is the arrangement §3 describes.
+
+  **The load-bearing assertion is that telemetry reaches the combiner, and it was checked
+  by breaking it.** `FRAMETELCOMB_MAX_TIME_DIFF` is 150 ms, so a publisher can connect,
+  authenticate, be admitted, and deliver every message on time — and still leave every
+  frame unmatched if it publishes below ~7 Hz. Dropping the publisher to 1 Hz leaves all
+  fourteen other assertions green and fails only this one, with 192 starved matches in the
+  last 200 log lines. That is the failure an authorisation test cannot see: a plane that
+  is correctly secured and carries nothing.
 - **The recording upload path, end to end, with database traceability.**
   `runOnRecordSegmentComplete` pointed at the recorder sidecar from the start but never
   fired until the `-ffmpeg` tag fix (see the auth section above); until now nothing had
@@ -1254,26 +1295,13 @@ simpler by one hop and would break this line.
 Distinct from the section below: these are live weaknesses on this branch right now, not
 work that has yet to start.
 
-- **`danger_detection` mode has never run end to end** — and the blocker is not what
-  this section previously claimed. It said the mode needed a TensorRT `.engine` built
-  for the target GPU and that none existed. Both halves were wrong: `engine/` holds
-  `segmentation_1280_720.engine` and `best_model_segunified_1280_720.engine`, and
-  `segmentation.py` dispatches on the checkpoint's extension — `.engine` loads through
-  `_TrtSession`, anything else through an onnxruntime CUDA session — so the ONNX path
-  that `configs/danger_detection/segmenter.yaml` actually points at runs without any
-  engine at all. `device="cuda"` is hardcoded, but that only means "needs a GPU", which
-  the real-app harness already provides via `--gpus all`.
-
-  What actually blocks it: `run_orchestrator_real_app.sh` hardcodes
-  `APP_ENV_APP_MODE=health_monitoring`, so nothing has ever driven the other mode.
-  **This is also why the telemetry plane is unverified against the real app.**
-  `danger_detection` is the only mode that consumes telemetry — `health_monitoring`
-  builds no `FrameTelemetryCombiner` — so §4's Mosquitto work, the
-  `TELEMETRY_LISTENER_STREAM_KEY` the orchestrator injects, and the app's reuse of its
-  publisher token as an MQTT username have been exercised only by synthetic test
-  clients in `run_mqtt_auth.sh`, never by the container that will really do it.
-  Parameterising the runner and giving the harness a telemetry publisher closes the
-  second mode and the last unexercised plane together.
+- **The DEM is absent, so part of the geo stage is untested.** `dem/dem.tif` and
+  `dem/dem_mask.tif` are gitignored and not on any machine here, and `open_dem_tifs()`
+  returns `None` for a missing raster, so `danger_detection` runs with slope and no-data
+  analysis skipped. Geofencing and the safety radius do run and are exercised. This is a
+  supported degraded mode rather than a fault — the harness reports which of the two it
+  got — but no test has yet driven a real elevation raster through `extract_dem_window`
+  and the window cache.
 - **The orchestrator holds the Docker socket.** Anything that can reach its port can
   start containers on the host. Its port is internal-only, but this is the strongest
   argument for the Kubernetes backend, where the equivalent is a scoped service account.
@@ -1339,8 +1367,9 @@ list nearly empty. Everything here that mattered was portal work.
   HLS URLs but no browser has opened one, and the watch page embeds MediaMTX's own reader
   page rather than negotiating WHEP itself — which assumes MediaMTX forwards the `?jwt=`
   query on to its WHEP request. That assumption is the one thing on the page that a test
-  here cannot reach; it needs a human with a browser and a live flight, which is the same
-  session that would finally run `danger_detection` end to end.
+  here cannot reach; it needs a human with a browser and a live flight. This is now the
+  **only** remaining part of the end-to-end product path that has never been exercised —
+  `danger_detection` and the telemetry plane came off this list below.
 - **No flight history.** The portal shows what is airborne now and nothing that has
   landed, so recordings and past alerts are in the database and unreachable from the UI.
   Every row needed is already there (`flights`, `alerts`, `recordings`); what is missing

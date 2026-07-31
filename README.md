@@ -156,7 +156,6 @@ Read by `docker-compose.yml` for variable substitution. Edit on the comms machin
 | `DB_WORKER_PASSWORD` | — | Database password (required) |
 | `DB_SERVICE` | `postgresql` | Database engine |
 | `WS_PORT` | `8765` | External port for the WebSocket alert stream |
-| `ACME_EMAIL` | — | Email for Let's Encrypt certificate registration (required for WSS in production) |
 | `RECORDING_STORE_SERVICE` | `local` | Recording upload backend: `local`, `azure`, or `aws` |
 | `RECORDING_DELETE_LOCAL_ON_SUCCESS` | `false` | Delete the local segment file after a successful remote upload |
 | `RECORDING_AZURE_*` | — | Azure Blob Storage credentials (required when service=azure) |
@@ -173,6 +172,7 @@ Read by `docker run --env-file app/.env`. Edit on the app machine before startin
 | `VIDEO_OUT_STREAM_HOST` | `localhost` | Comms host IP or hostname (MediaMTX RTMP) |
 | `WS_SERVER_URL` | `http://localhost:8001` | ws-server HTTP API endpoint |
 | `DB_WRITER_URL` | `http://localhost:8002` | db-writer HTTP API endpoint |
+| `LOG_LEVEL` | `WARNING` | Pipeline worker log level. `INFO` turns on the per-stage diagnostics (MQTT subscriptions, telemetry matching, geo setup) that WARNING drops |
 
 All three `HOST` variables and the two URLs must point to the comms machine. For local testing (both stacks on the same machine) the `localhost` defaults work as-is.
 

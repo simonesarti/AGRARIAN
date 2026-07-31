@@ -22,6 +22,7 @@ from app.shared.processes.constants import (
     VIDEO_OUT_STREAM_STARTUP_TIMEOUT,
     VIDEO_OUT_STREAM_SHUTDOWN_TIMEOUT,
 )
+from app.shared.processes.logging_config import worker_log_level
 
 
 # ================================================================
@@ -32,7 +33,7 @@ if not logger.handlers:  # Avoid duplicate handlers
     video_handler = logging.FileHandler('./logs/video_out.log', mode='w')
     video_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(video_handler)
-    logger.setLevel(logging.WARNING)
+    logger.setLevel(worker_log_level())
 
 # ================================================================
 
