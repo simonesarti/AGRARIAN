@@ -22,10 +22,15 @@
          the internal user roster that authMethod: http replaced — so no
          credential could ever have opened it. #}
       <video id="player" autoplay muted playsinline controls title="Annotated live video"></video>
+      {# Not a link to the .m3u8. Chrome, Firefox and Edge have no native HLS
+         support, so navigating to a playlist gives a blank page — which is what
+         this used to do. The button switches the player above instead, and says
+         so plainly when the browser cannot do it either. #}
       <p class="muted small">
-        Video not playing? <a id="hls" href="#" hidden>Open the HLS stream instead</a> —
-        some browsers and networks cannot use WebRTC.
+        Video not playing? <button id="hls" type="button" class="linkish" hidden>Play via HLS instead</button>
+        — WebRTC needs UDP, which some networks block.
       </p>
+      <p id="hls-note" class="muted small" hidden></p>
     </div>
 
     <aside class="alerts">
