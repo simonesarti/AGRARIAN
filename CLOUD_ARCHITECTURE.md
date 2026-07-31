@@ -66,6 +66,11 @@ question (§9): `/auth/mediamtx` sits on the critical path of every publish and 
 read, while `/streams` does not. Sizing follows the auth endpoint; the portal's routes
 ride along on capacity that already had to exist.
 
+Redis now serves both planes too — alert fan-out for ws-server, rate-limit counters for
+the portal (§4) — on separate logical databases. Neither use is authoritative for
+anything: losing the whole instance drops in-flight fan-out and resets some counters, and
+the portal is built to keep signing people in through exactly that.
+
 ### The application — scales by concurrent flight
 
 The GPU application is **one container per active flight**. It is not multi-tenant and
@@ -372,7 +377,7 @@ until it bites:
 | Mosquitto | Shared, replicated on load | Per-stream credentials + topic ACLs | **[built]** |
 | ws-server | Shared, replicated on load | Per-flight JWT (view + publish scopes); Redis pub/sub fan-out | **[built]** |
 | db-writer | Shared, replicated on load | Stateless per request; bcrypt user auth | **[built]** |
-| Redis | Shared | Channel per flight (`flight:{id}`) | **[built]** |
+| Redis | Shared | Channel per flight (`flight:{id}`); rate-limit counters on db 1 | **[built]** |
 | Recorder | Shared | Segment → flight_id resolved via `recordings` table | upload **[built]**, per-tenant prefix **[open]** |
 | Orchestrator | Shared | Spawns/stops app containers | **[built]** |
 | Portal | Shared, replicated on load | Session token → `user_id`, read from the claim not the URL | **[built]** |
@@ -617,6 +622,69 @@ Tenant-supplied text — slot labels, alert messages — is escaped on the way i
 in both directions: Jinja autoescaping server-side, `textContent` rather than `innerHTML`
 in the alert renderer. A label is the one field a tenant controls that the portal renders
 back to them.
+
+#### Rate limiting the two anonymous endpoints **[built]**
+
+`/login` and `/register` are the only endpoints in the system that anyone on the internet
+can reach without a credential — and they cannot be given one, since a sign-in form is
+what a caller uses *before* it has anything. Counting is the only brake available, and
+until it existed the sole limit on password guessing was bcrypt's own cost.
+
+The counters live in **Redis, not process memory.** This is the same statelessness
+argument the session makes, arriving at the opposite answer: a session can live in a
+signed cookie because the client can be trusted to carry it, and a rate limit cannot,
+because the client is the thing being limited. N replicas each holding their own counter
+is a limit of N × whatever is written down.
+
+| Endpoint | Counted per | Default | Counting |
+| --- | --- | --- | --- |
+| `/login` | account (hashed email) | 10 / 15 min | failures only; cleared by a success |
+| `/login` | source address | 30 / 15 min | failures only; **not** cleared by a success |
+| `/register` | source address | 20 / hour | every attempt, successful or not |
+
+Every line of that table is a way the limit would otherwise be walked past:
+
+- **Two counters on login, because neither bound implies the other.** Per-address alone
+  is evaded by a botnet — a thousand hosts trying ten passwords each. Per-account alone
+  is evaded by spraying one common password across a thousand accounts from one host.
+- **Failures count, successes do not**, so a busy legitimate user is never locked out by
+  their own activity. A success clears the *account's* counter and deliberately leaves
+  the address's: an attacker who holds one valid account would otherwise reset their own
+  budget whenever they liked.
+- **The account key is the normalised address**, hashed. Normalised because otherwise
+  `Alice@` and `alice@` are two buckets for one account and the limit is bypassed by
+  pressing shift; hashed because those keys are the only place the portal would hold a
+  list of user email addresses, and it has no reason to hold one.
+- **Registration counts attempts, not accounts.** A 409 on a taken address is an
+  account-existence oracle whether or not a row is created.
+
+The check happens **before** db-writer is called, so an over-limit attempt costs no bcrypt
+verification — otherwise the limiter becomes the cheapest known way to load the database
+with expensive work.
+
+##### Which address is "the source"
+
+`X-Forwarded-For` is appended to by each proxy, so the client is the entry
+`TRUSTED_PROXY_HOPS` from the **right**; everything further left was supplied by the
+client and is forgeable. Taking the leftmost entry — the common shortcut — lets a client
+name its own bucket, and that is not merely evasion: it lets one client push another
+client's bucket to the limit and lock them out. The default is 0, which trusts nothing and
+uses the peer address; behind Traefik alone it is 1. **Setting it higher than the truth is
+the dangerous direction**, and both configurations are tested against each other (§9).
+
+##### It fails open
+
+If Redis cannot be reached the request is allowed and the failure logged. A rate limiter
+that turns a Redis outage into "nobody can sign in" has become a worse outage than the
+attack it prevents. `REDIS_URL` is nonetheless *required* at startup — an unreachable
+Redis is an incident, while an unset variable is a portal that was never rate limited at
+all and never said so.
+
+Fixed windows, not sliding, and check-then-increment rather than a lock: a burst can
+exceed the limit slightly at a window boundary or under concurrency. Both are accepted,
+because the purpose here is to turn an unbounded guessing rate into a bounded one and 21
+attempts instead of 20 changes nothing. Contrast the stream cap in §4, which *does* take a
+row lock — there an overshoot is a GPU container somebody pays for.
 
 #### Adding a stream is the endpoint that spends money
 
@@ -895,6 +963,32 @@ simpler by one hop and would break this line.
 
 ### Built and tested
 
+- **Rate limiting on `/login` and `/register`** (§4). The two endpoints anyone on the
+  internet can reach without a credential, and until now the only brake on guessing a
+  password was bcrypt's own cost. Verified by 25 assertions inside `run_portal.sh`.
+
+  Three of them were checked by breaking the thing they test, because a rate-limit
+  assertion that passes for the wrong reason is worse than none:
+
+  - **The counters are shared across replicas.** Confirmed non-vacuous by pointing the
+    two replicas at different Redis databases — that assertion, and only that one, then
+    fails. This is what an in-process counter would look like: a limit of N × the number
+    written down.
+  - **A forged `X-Forwarded-For` mints no fresh bucket** where no proxy is trusted, while
+    the same header is believed by the replica configured for one hop. The two replicas
+    run with different trust settings on purpose. Confirmed non-vacuous by setting both
+    to trust one hop and watching the first half fail.
+  - **The limiter fails open.** With Redis stopped, a correct sign-in still returns 303
+    and a wrong one still returns 401 rather than 500 — asserted in the runner, since it
+    has to stop a container.
+
+  Also pinned: the per-account and per-address limits are genuinely separate in both
+  directions (one locked-out account does not lock out its neighbours on the same NAT;
+  twelve *different* accounts sprayed from one address are still refused); a success
+  clears the account's counter but not the address's; registration counts eight
+  *malformed* attempts, since a 409 on a taken address is an existence oracle whether or
+  not a row is created; and the 429 carries a `Retry-After` a client can obey alongside a
+  wait a person can read.
 - **The portal front-end** (§4). The service in `portal/`, and with it the last piece of
   the flight lifecycle: every step in §6 now has something that calls it. Verified by 69
   assertions in `run_portal.sh`, driving it the way a browser does — form posts, a session
@@ -1137,16 +1231,17 @@ list nearly empty. Everything here that mattered was portal work.
 
 ### Open
 
-- **`/login` is an unrated password oracle, and it now has a door onto the internet.**
-  There is no lockout, no backoff and no attempt counter; the only brake is bcrypt's own
-  cost. This was tolerable while db-writer was internal-only and nothing public reached
-  it. The portal changes that — `POST /login` on the portal is anonymous by construction,
-  since a login form cannot require a session — so this is **the one thing that should
-  land next**, and it belongs on the portal rather than db-writer: the portal is where
-  the client IP is still visible, and it is the tier that has to survive being pointed at.
-  Deliberately not addressed by equalising response time between "no such user" and
-  "wrong password": `/register` already discloses exactly that fact by design, so a
-  dummy hash on every failed login would cost real time and conceal nothing.
+- **db-writer's own `/login` is still unrated.** The public door is now bounded (§4),
+  but the endpoint behind it is not: anything that can reach db-writer directly can still
+  guess passwords at bcrypt's pace. That is internal-only by §8 and so is not currently
+  reachable, which is the whole reason this is a note rather than a hole — it becomes one
+  the moment something else on the private network is compromised, or the day db-writer is
+  routed anywhere it should not be.
+
+  Still deliberately not addressed, at either layer: the response time of `/login`
+  distinguishes "no such user" from "wrong password", because bcrypt runs only in the
+  second case. `/register` discloses exactly the same fact outright by design, so a dummy
+  hash on every failed login would cost real time and conceal nothing.
 - **No email verification.** Registration accepts any syntactically valid address
   without proving the registrant controls it, so an account can be created against
   somebody else's address. Little is at stake while nothing is emailed — no password

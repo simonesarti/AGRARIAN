@@ -146,10 +146,22 @@ services:
     depends_on:
       db-writer:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     ports:
       - "8003:8000"     # Traefik terminates HTTPS on 443 and forwards here
     environment:
       DB_WRITER_URL: http://db-writer:8000
+      # Backs the rate limits on /login and /register — the two endpoints anyone
+      # on the internet can reach. Database 1, not ws-server's 0: nothing would
+      # collide (INCR keys against pub/sub channels), but a FLUSHDB aimed at one
+      # should not reach the other.
+      REDIS_URL: redis://redis:6379/1
+      # How many proxies sit in front. It decides which X-Forwarded-For entry is
+      # believed, so it must match reality: too high and a client picks its own
+      # rate-limit bucket, or pushes somebody else's to the limit. 0 = trust
+      # nothing, which is right when the portal is reached directly.
+      TRUSTED_PROXY_HOPS: ${PORTAL_TRUSTED_PROXY_HOPS:-0}
       # Hostnames the BROWSER dials, not ones this container dials. Video and
       # alerts go straight from the browser to MediaMTX and ws-server; the portal
       # only composes the URLs.

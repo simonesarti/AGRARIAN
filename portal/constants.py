@@ -25,6 +25,32 @@ WEBRTC_PORT = 8889     # MediaMTX WHEP signalling and its built-in reader page
 HLS_PORT = 8888        # MediaMTX HLS, the fallback for browsers that need it
 WS_PORT = 8765         # ws-server's viewer WebSocket
 
+# ── Rate limits ───────────────────────────────────────────────────────────────
+#
+# The two anonymous endpoints, and the only two that cannot be protected by a
+# credential. See rate_limit.py for why login is counted twice.
+#
+# All three limits are per fixed window. Chosen to be invisible to a person and
+# ruinous to a script: a real user mistypes a password three or four times, not
+# ten, and nobody signs up twenty times an hour.
+
+RATE_LIMIT_WINDOW_S = 15 * 60
+
+# Per account, across every source. What credential stuffing runs into — one
+# account tried from a thousand hosts is still one account.
+LOGIN_MAX_FAILURES_PER_ACCOUNT = 10
+
+# Per source address, across every account. What password spraying runs into —
+# one common password tried against a thousand accounts is still one source.
+# Higher than the per-account limit because an office behind one NAT shares it.
+LOGIN_MAX_FAILURES_PER_IP = 30
+
+# Registration counts every attempt, not just successes: an endpoint that says
+# "already registered" is an account-existence oracle whether or not it creates
+# anything.
+REGISTER_MAX_PER_IP = 20
+REGISTER_WINDOW_S = 60 * 60
+
 # ── Ingest path naming ────────────────────────────────────────────────────────
 #
 # `in/<stream_key>` is decided in db-writer (/flight/open derives it there); this

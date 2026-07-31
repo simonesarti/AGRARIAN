@@ -31,6 +31,7 @@ in a URL and the first is not.
 
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -46,6 +47,11 @@ from constants import (
     API_PORT,
     HLS_PORT,
     INGEST_PATH_PREFIX,
+    LOGIN_MAX_FAILURES_PER_ACCOUNT,
+    LOGIN_MAX_FAILURES_PER_IP,
+    RATE_LIMIT_WINDOW_S,
+    REGISTER_MAX_PER_IP,
+    REGISTER_WINDOW_S,
     RTMPS_PORT,
     SESSION_COOKIE,
     SESSION_COOKIE_MAX_AGE_S,
@@ -58,6 +64,7 @@ from db_writer_client import (
     SessionExpired,
     UpstreamRejected,
 )
+from rate_limit import RateLimiter, account_key, client_ip, ip_key, retry_message
 
 logging.basicConfig(
     level=logging.INFO,
@@ -104,12 +111,45 @@ _ALLOWED_ORIGIN_HOSTS = {
     if h.strip()
 }
 
+# How many proxies stand between the client and this process. It decides which
+# entry of X-Forwarded-For is believed, and believing the wrong one lets a client
+# choose its own rate-limit bucket — or push somebody else's to the limit. 0
+# trusts nothing and uses the peer address; behind Traefik alone it is 1.
+_TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "0"))
+
+# Required rather than optional, though the limiter fails open at request time.
+# Those are different failures: an unreachable Redis is an incident, an unset
+# variable is a portal that was never rate limited at all and says nothing about
+# it. The first is survivable; the second is the open item this closes.
+_REDIS_URL = os.environ.get("REDIS_URL", "").strip()
+if not _REDIS_URL:
+    raise RuntimeError(
+        "REDIS_URL is required: it backs the rate limits on /login and /register, "
+        "which are the only endpoints here that anyone on the internet can reach.")
+
+_LOGIN_PER_ACCOUNT = int(os.environ.get("LOGIN_RATE_LIMIT_PER_ACCOUNT", LOGIN_MAX_FAILURES_PER_ACCOUNT))
+_LOGIN_PER_IP = int(os.environ.get("LOGIN_RATE_LIMIT_PER_IP", LOGIN_MAX_FAILURES_PER_IP))
+_REGISTER_PER_IP = int(os.environ.get("REGISTER_RATE_LIMIT_PER_IP", REGISTER_MAX_PER_IP))
+
 _db = DbWriterClient(_DB_WRITER_URL)
+_login_limiter = RateLimiter(_REDIS_URL, int(os.environ.get("RATE_LIMIT_WINDOW_S", RATE_LIMIT_WINDOW_S)))
+_register_limiter = RateLimiter(_REDIS_URL, int(os.environ.get("REGISTER_RATE_WINDOW_S", REGISTER_WINDOW_S)))
 
 _HERE = Path(__file__).parent
 templates = Jinja2Templates(directory=str(_HERE / "templates"))
 
-app = FastAPI(title="AGRARIAN portal")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(
+        f"portal ready — db-writer at {_DB_WRITER_URL}, "
+        f"rate limits {_LOGIN_PER_ACCOUNT}/account and {_LOGIN_PER_IP}/address on login, "
+        f"{_REGISTER_PER_IP}/address on registration, trusting {_TRUSTED_PROXY_HOPS} proxy hop(s)")
+    yield
+    await _login_limiter.close()
+    await _register_limiter.close()
+
+
+app = FastAPI(title="AGRARIAN portal", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
 
 # ── Session cookie ────────────────────────────────────────────────────────────
@@ -305,26 +345,64 @@ def login_page(request: Request, expired: Optional[str] = Query(default=None)):
         {"error": "Your session expired — please sign in again." if expired else None})
 
 
+def _too_many(request: Request, template: str, wait_s: int, email: Optional[str] = None):
+    """
+    429, with how long to wait — in the header for a client and in the page for a
+    person. The wording is the same whatever was limited: telling a caller which
+    of the two counters it hit would tell it which one to work around.
+    """
+    return templates.TemplateResponse(
+        request, template, {"error": retry_message(wait_s), "form_email": email},
+        status_code=429, headers={"Retry-After": str(wait_s)})
+
+
 @app.post("/login")
 async def login(request: Request, email: str = Form(...), password: str = Form(...)):
     """
     The one place a password is typed, and the last place it exists: it is sent
     to db-writer, exchanged for a session token, and never stored on either side
     of this hop.
+
+    Also the one place an attacker can guess one. Two counters bound that (see
+    rate_limit.py) and they are consulted BEFORE db-writer is called: an attempt
+    that is over the limit must not cost a bcrypt verification, or the limiter
+    becomes the cheapest way to load the database with expensive work.
     """
     _check_origin(request)
+
+    source = client_ip(request.client.host if request.client else None,
+                       request.headers.get("x-forwarded-for"), _TRUSTED_PROXY_HOPS)
+    acct_bucket = account_key(email)
+    ip_bucket = ip_key("login", source)
+
+    wait = await _login_limiter.blocked_for(
+        [(acct_bucket, _LOGIN_PER_ACCOUNT), (ip_bucket, _LOGIN_PER_IP)])
+    if wait is not None:
+        logger.warning(f"Login refused by rate limit from {source}")
+        return _too_many(request, "login.html", wait, email)
+
     try:
         result = await _db.login(email, password)
     except SessionExpired:
         # db-writer answers 401 for bad credentials, which is not an expired
         # session — redirecting to /login from /login would loop. Caught here so
         # the global handler never sees it.
+        #
+        # Counted here rather than above, so only failures count: a busy user
+        # signing in from three devices is not an attack, and locking them out
+        # for it would be a self-inflicted outage.
+        await _login_limiter.record(acct_bucket, ip_bucket)
         return templates.TemplateResponse(
             request, "login.html", {"error": "Invalid email or password.", "form_email": email},
             status_code=401)
     except UpstreamRejected as e:
         return templates.TemplateResponse(
             request, "login.html", {"error": e.detail, "form_email": email}, status_code=e.status)
+
+    # The account's counter clears, the source's does not. Someone who holds one
+    # valid account would otherwise reset their own IP budget at will, which is
+    # exactly the position a credential-stuffing run is in.
+    await _login_limiter.forget(acct_bucket)
 
     response = _redirect("/")
     _set_session(response, result["session_token"])
@@ -346,8 +424,25 @@ async def register(request: Request, email: str = Form(...), password: str = For
     anyone can succeed at. It signs the new account straight in — the password
     was proven in the same request, and bouncing to a login form would only ask
     for it a second time.
+
+    Rate limited per source address, counting every attempt rather than every
+    success: a 409 on a taken address makes this an account-existence oracle
+    whether or not it creates anything, and that is worth bounding on its own.
+    Being open is also what makes the count the only brake there is — there is no
+    invitation to run out of.
     """
     _check_origin(request)
+
+    source = client_ip(request.client.host if request.client else None,
+                       request.headers.get("x-forwarded-for"), _TRUSTED_PROXY_HOPS)
+    bucket = ip_key("register", source)
+
+    wait = await _register_limiter.blocked_for([(bucket, _REGISTER_PER_IP)])
+    if wait is not None:
+        logger.warning(f"Registration refused by rate limit from {source}")
+        return _too_many(request, "register.html", wait, email)
+    await _register_limiter.record(bucket)
+
     try:
         result = await _db.register(email, password)
     except UpstreamRejected as e:

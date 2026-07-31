@@ -370,6 +370,119 @@ check("another tenant asking for a token gets nothing to watch", r.status == 404
 r = call(PORTAL1, f"/api/viewer-token?stream_id={alice_slot['stream_id']}", form={}, cookie=mallory)
 check("naming alice's stream explicitly does not help them", r.status == 404, str(r.status))
 
+# ── Rate limiting ────────────────────────────────────────────────────────────
+#
+# Last in the file, because exhausting a bucket is not undoable inside the
+# window. The runner starts pt-1 trusting no proxy and pt-2 trusting one, so a
+# scenario can claim a clean bucket by presenting an X-Forwarded-For to pt-2 —
+# and the fact that pt-1 ignores exactly the same header is itself asserted
+# below, since that is the difference between a rate limiter and a rate
+# suggester.
+
+
+def as_ip(ip):
+    return {"X-Forwarded-For": ip}
+
+
+def fail_login(base, email, ip=None):
+    return call(base, "/login", form={"email": email, "password": "wrong"},
+                headers=as_ip(ip) if ip else None)
+
+
+# Dedicated accounts on their own registration bucket, so the scenarios below
+# start from a known count rather than inheriting one.
+made = [call(PORTAL2, "/register", form={"email": f"{n}@test.io", "password": PW},
+             headers=as_ip("203.0.113.99")).status for n in ("ratelimit-a", "ratelimit-b")]
+check("two accounts for the rate-limit scenarios register cleanly", made == [303, 303], str(made))
+
+# ── the per-account limit: one account tried from anywhere ───────────────────
+codes = [fail_login(PORTAL2, "ratelimit-a@test.io", "203.0.113.10").status for _ in range(5)]
+check("the first five failures for an account are answered normally",
+      codes == [401] * 5, str(codes))
+
+r = fail_login(PORTAL2, "ratelimit-a@test.io", "203.0.113.10")
+check("the sixth is refused with 429, not another password check", r.status == 429, str(r.status))
+check("...with a Retry-After a client can obey",
+      r.headers.get("Retry-After", "0").isdigit() and int(r.headers["Retry-After"]) > 0,
+      r.headers.get("Retry-After"))
+check("...and a wait a person can read", "Try again in about" in r.body)
+
+# The account bucket must be the account's, not the address's — otherwise one
+# locked-out account would take every other account on that NAT down with it.
+r = fail_login(PORTAL2, "someone-else@test.io", "203.0.113.10")
+check("a different account from the same address still gets its attempt",
+      r.status == 401, str(r.status))
+
+# ── a success clears it ──────────────────────────────────────────────────────
+codes = [fail_login(PORTAL2, "ratelimit-b@test.io", "203.0.113.11").status for _ in range(4)]
+r = call(PORTAL2, "/login", form={"email": "ratelimit-b@test.io", "password": PW},
+         headers=as_ip("203.0.113.11"))
+check("signing in correctly succeeds with failures already on the counter",
+      codes == [401] * 4 and r.status == 303, f"{codes} {r.status}")
+
+codes = [fail_login(PORTAL2, "ratelimit-b@test.io", "203.0.113.11").status for _ in range(5)]
+check("a success clears the account's counter — the next five failures are not refused",
+      codes == [401] * 5, str(codes))
+
+# ── the per-address limit: many accounts tried from one source ───────────────
+codes = [fail_login(PORTAL2, f"spray{i}@test.io", "203.0.113.12").status for i in range(12)]
+r = fail_login(PORTAL2, "spray-last@test.io", "203.0.113.12")
+check("spraying twelve different accounts from one address is allowed to the limit",
+      codes == [401] * 12, str(codes))
+check("...and then refused, even though no single account was tried twice",
+      r.status == 429, str(r.status))
+
+r = fail_login(PORTAL2, "spray0@test.io", "203.0.113.13")
+check("another address is unaffected — the limit is per source, not global",
+      r.status == 401, str(r.status))
+
+# ── the counters are shared, so replicas cannot be dealt around ──────────────
+# No X-Forwarded-For here: both replicas then count against the peer address,
+# which is the same for both, so this is the cross-replica property and nothing
+# else. Filled by loop rather than by arithmetic because earlier sections of
+# this file already put a couple of failures in this bucket.
+attempts, refused = 0, False
+for i in range(20):
+    attempts += 1
+    if fail_login(PORTAL1, f"shared{i}@test.io").status == 429:
+        refused = True
+        break
+check("one replica eventually refuses on its own", refused, f"after {attempts} attempts")
+
+r = fail_login(PORTAL2, "shared-elsewhere@test.io")
+check("the OTHER replica refuses immediately — the counters are in Redis, not memory",
+      r.status == 429, f"{r.status} after {attempts} on replica 1")
+
+# ── a forged X-Forwarded-For buys nothing where no proxy is trusted ──────────
+# pt-1 runs with TRUSTED_PROXY_HOPS=0. Its bucket is exhausted; a client that
+# invents a header must not thereby invent a fresh bucket.
+r = fail_login(PORTAL1, "forged@test.io", "198.51.100.7")
+check("a forged X-Forwarded-For does not mint a clean bucket where none is trusted",
+      r.status == 429, str(r.status))
+
+# The same header on the replica that IS behind a proxy is believed — which is
+# the whole reason the setting exists, and why setting it wrongly is dangerous.
+r = fail_login(PORTAL2, "forged@test.io", "198.51.100.7")
+check("the same header is believed by the replica configured to trust one hop",
+      r.status == 401, str(r.status))
+
+# ── registration counts every attempt, not every account ─────────────────────
+# All eight are malformed, so nothing is created and no password is hashed. An
+# attempt that fails still tells the caller whether an address is taken, so it
+# is the attempts that have to be bounded.
+codes = [call(PORTAL2, "/register", form={"email": f"nope{i}", "password": PW},
+              headers=as_ip("203.0.113.20")).status for i in range(8)]
+r = call(PORTAL2, "/register", form={"email": "alice@test.io", "password": PW},
+         headers=as_ip("203.0.113.20"))
+check("eight registration attempts that all failed are still counted",
+      codes == [400] * 8, str(codes))
+check("...and the ninth is refused before db-writer is asked anything",
+      r.status == 429, str(r.status))
+
+r = call(PORTAL2, "/register", form={"email": "fresh@test.io", "password": PW},
+         headers=as_ip("203.0.113.21"))
+check("registration from another address is unaffected", r.status == 303, str(r.status))
+
 # ── Signing out ──────────────────────────────────────────────────────────────
 
 r = call(PORTAL1, "/logout", form={}, cookie=alice)

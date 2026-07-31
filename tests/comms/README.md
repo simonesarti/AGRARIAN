@@ -30,7 +30,7 @@ try to run these directly with `python3`.
 | `run_recording_upload.sh` | MediaMTX + recorder + db-writer + Postgres, host `ffmpeg` | `./run_recording_upload.sh` |
 | `run_mqtt_auth.sh` | mosquitto-go-auth + db-writer + Postgres | `./run_mqtt_auth.sh` |
 | `run_portal_auth.sh` | Postgres + 2 db-writer replicas | `./run_portal_auth.sh` |
-| `run_portal.sh` | Postgres + db-writer + 2 portal replicas | `./run_portal.sh` |
+| `run_portal.sh` | Postgres + Redis + db-writer + 2 portal replicas | `./run_portal.sh` |
 | `run_orchestrator_recovery.sh` | the same as `run_orchestrator.sh` | `./run_orchestrator_recovery.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
@@ -100,7 +100,7 @@ docker run --rm -v "$PWD/db_writer:/dbw" -v "$PWD/tests/comms:/tests:ro" \
 ./run_db_replication.sh      # 7 + 20×2 assertions, real PostgreSQL
 ./run_redis_failure.sh       # 3 + 7 assertions, Redis restarted mid-test
 ./run_portal_auth.sh         # 51 assertions, portal API across 2 replicas
-./run_portal.sh              # 69 assertions, the portal driven as a browser
+./run_portal.sh              # 87 + 2 assertions, the portal driven as a browser
 ./run_mediamtx_auth.sh       # 27 assertions, real MediaMTX + ffmpeg publishes
 ./run_orchestrator.sh        # 21 assertions, real containers spawned and torn down
 ./run_orchestrator_real_app.sh  # 7 assertions, the real GPU app, not the stub
@@ -225,6 +225,40 @@ What it guards beyond the happy path:
   `out/<public_uuid>` path, and the alert URL at ws-server. Whether video *plays* is not
   covered — that is WebRTC between the browser and MediaMTX, and the portal is not in
   the middle of it.
+
+**Rate limiting** is the last section of the file, because exhausting a bucket cannot be
+undone inside the window. The two replicas are started with **different proxy trust** —
+`pt-1` trusts none, `pt-2` trusts one hop — which is the pair of configurations that
+needs proving and also how each scenario claims a clean bucket: present an
+`X-Forwarded-For` to `pt-2` and it is believed.
+
+Five properties, each one a way the limit could be evaded if it were built the obvious
+way:
+
+- **Per account and per address are separate limits.** One account locked out does not
+  lock out the next account from the same address (or a shared office NAT would take
+  itself down), and twelve *different* accounts tried from one address are still refused
+  (or spraying would walk straight past a per-account limit).
+- **A success clears the account's counter, not the address's.** Four failures then a
+  correct password then five more failures are all answered — otherwise a user who
+  finally remembers their password stays locked out. The address counter deliberately
+  survives, or an attacker holding one valid account could reset their own budget.
+- **The counters are shared.** A bucket filled on replica 1 refuses on replica 2.
+  Confirmed non-vacuous by pointing the replicas at different Redis databases and
+  watching this assertion — and only this one — fail.
+- **A forged `X-Forwarded-For` mints nothing** where no proxy is trusted, while the same
+  header is believed by the replica configured for one hop. Confirmed non-vacuous by
+  setting both replicas to trust one hop and watching the first half fail: the client
+  then names its own bucket, which is not merely evasion — it is how one client locks
+  another out.
+- **Registration counts attempts, not accounts.** Eight *malformed* registrations still
+  fill the bucket, because a 409 on a taken address is an existence oracle whether or not
+  a row is created.
+
+Two more assertions live in the runner rather than the Python file, because they need to
+stop a container: with Redis stopped, a correct sign-in still returns 303 and a wrong one
+still returns 401. **The limiter fails open on purpose** — one that turns a Redis outage
+into "nobody can sign in" has become a worse outage than the attack it prevents.
 
 **`test_tokens.py`** — viewer and publisher tokens are signed with the same secret, so
 the `scope` claim is the only thing separating them. Checked in both directions, plus
