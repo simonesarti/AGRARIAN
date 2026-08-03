@@ -32,6 +32,7 @@ try to run these directly with `python3`.
 | `run_portal_auth.sh` | Postgres + 2 db-writer replicas | `./run_portal_auth.sh` |
 | `run_portal.sh` | Postgres + Redis + db-writer + 2 portal replicas | `./run_portal.sh` |
 | `run_traefik_tls.sh` | the above + ws-server + MediaMTX behind a real Traefik | `./run_traefik_tls.sh` |
+| `run_ingress_tls.sh` | MediaMTX + mosquitto-go-auth + db-writer + Postgres | `./run_ingress_tls.sh` |
 | `run_orchestrator_recovery.sh` | the same as `run_orchestrator.sh` | `./run_orchestrator_recovery.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
@@ -40,6 +41,13 @@ try to run these directly with `python3`.
 The `run_*.sh` scripts build images, stand everything up, run the assertions, print the
 resulting database rows where relevant, and **clean up after themselves on exit** —
 including on failure.
+
+Every runner that mounts the real `mediamtx.yaml` or `mosquitto.conf` also issues a
+throwaway certificate first, into a temporary directory rather than into
+`certificates/` — whose CA may already be installed in a browser. That is not optional
+politeness: both services now terminate their own TLS (§7), and MediaMTX **exits at
+startup** if the certificate its config names is not on disk. Without it a runner fails
+as a wall of connection errors that look like a networking problem.
 
 ---
 
@@ -110,7 +118,8 @@ docker run --rm -v "$PWD/db_writer:/dbw" -v "$PWD/tests/comms:/tests:ro" \
 ./run_recording_upload.sh    # 8 assertions, real segment upload + DB traceability
 ./run_mqtt_auth.sh           # 9 assertions, real mosquitto-go-auth broker
 ./run_orchestrator_recovery.sh  # 13 assertions, real crash + restart
-./run_traefik_tls.sh         # 22 + 8 assertions, the ingress tier over real TLS
+./run_traefik_tls.sh         # 22 + 9 assertions, the browser's half of the ingress tier
+./run_ingress_tls.sh         # 42 assertions, the drone's half — RTMPS, RTSPS, MQTTS
 ```
 
 `run_traefik_tls.sh` is the only runner that speaks HTTPS rather than working around
@@ -122,6 +131,21 @@ ws-server and MediaMTX, and drives the whole thing through the proxy.
 
 `PORTAL_HOPS=0 ./run_traefik_tls.sh` fails exactly one assertion — the two-client
 rate-limit bucket — and is how that assertion is kept honest.
+
+`run_ingress_tls.sh` is its counterpart on the drone side: MediaMTX terminating
+RTMPS and RTSPS and Mosquitto terminating MQTTS, with the same locally issued leaf.
+It asserts two independent things, and the second is the one a transport change is
+most likely to break quietly — that **authorisation is unchanged by the move**. A
+revoked key must still be refused, another tenant's telemetry must still be
+unreachable, and the plaintext fallback listeners must still work, because §7 keeps
+them for drone firmware that cannot do TLS.
+
+Its TLS-floor assertions use an OpenSSL old enough to still send a TLS 1.1
+ClientHello, with a control that proves it can. Written with modern curl or OpenSSL
+3 the same assertion passes against a server that happily *accepts* TLS 1.1, because
+those clients refuse to offer one — it measures the client and not the server. That
+was a live defect in `run_traefik_tls.sh`, found while writing this one and fixed
+there too.
 
 `run_mediamtx_auth.sh` needs `ffmpeg` and `curl` **on the host** and binds host ports
 11935/18888/18002 so it cannot collide with a running compose stack. If a previous run

@@ -24,6 +24,18 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# MediaMTX terminates its own TLS now (§7), and it EXITS at startup if the
+# certificate its config points at is not on disk — "open /certs/server.crt: no
+# such file or directory", then "[RTSP] closing". So every runner that mounts the
+# real mediamtx.yaml has to supply one, whether or not it tests TLS: without it
+# this whole file fails as a wall of connection errors that look like networking.
+#
+# Issued into a throwaway directory rather than into certificates/, whose CA may
+# already be installed in somebody's browser.
+CERTS="$(mktemp -d)"
+CERT_DIR="$CERTS" "$REPO/scripts/generate_local_certs.sh" >/dev/null \
+  || { echo "could not issue a local certificate for MediaMTX"; exit 1; }
 NET=orchrec-net
 DBW_IMAGE=orchrec-dbw
 ORC_IMAGE=orchrec-orchestrator
@@ -33,6 +45,7 @@ API=http://localhost:61802
 GRACE=5
 
 cleanup() {
+  rm -rf "$CERTS"
   docker rm -f orchrec-mediamtx orchestrator db-writer orchrec-pg >/dev/null 2>&1 || true
   docker ps -aq --filter "label=agrarian.flight_id" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
@@ -104,6 +117,7 @@ docker run -d --name db-writer --network "$NET" -p 61802:8000 "${ENVV[@]}" "$DBW
 start_orchestrator || { echo "orchestrator failed to start"; exit 1; }
 docker run -d --name orchrec-mediamtx --network "$NET" -p 61935:1935 \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
+  -v "$CERTS/server:/certs:ro" \
   bluenviron/mediamtx:latest-ffmpeg >/dev/null \
   || { echo "mediamtx failed to start (is a previous run still holding 61935?)"; exit 1; }
 sleep 6

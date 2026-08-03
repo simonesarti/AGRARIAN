@@ -887,13 +887,22 @@ looking live forever.
 | App ↔ hub | Cloud virtual network | Not separately encrypted — see below |
 | Hub → database | Private | Worker credentials, least privilege |
 
-The four public rows describe the target. The transport half of each — RTMPS, MQTTS,
-HTTPS/WSS — is **not deployed today**; the credential half (stream keys, per-stream MQTT
-users and ACLs, per-flight JWTs, the session cookie) is built and tested. So every public
-credential in the system currently crosses the internet in the clear, which is the single
-largest gap between this section and the running stack.
+The four public rows now describe the running stack rather than the target. Both halves
+of each are built: the credential half (stream keys, per-stream MQTT users and ACLs,
+per-flight JWTs, the session cookie) and the transport half (HTTPS/WSS through Traefik,
+RTMPS/RTSPS on MediaMTX, MQTTS on Mosquitto). **No public credential in this system has
+to cross the internet in the clear any more**, which was the largest gap between this
+section and the running stack and is now closed.
 
-### TLS termination **[Traefik built; MediaMTX and Mosquitto designed]**
+"Has to" is doing real work in that sentence, and it is the honest residual: the
+plaintext listeners are still published, because the same rows above keep them as a
+narrow fallback for drone firmware that cannot do TLS at all. Nothing *forces* a drone
+onto the encrypted port. What changed is that the encrypted port exists and the portal
+prints its URL — before this, the `rtmps://…:1936` address on the slots page named a
+listener that was not running, so the only ingest URL the product ever showed an
+operator was one nothing would answer.
+
+### TLS termination **[built]**
 
 Two layers, split by protocol.
 
@@ -944,18 +953,39 @@ leaving cert-manager to be run anyway for the other two: two issuance mechanisms
 would do. cert-manager writing into Secrets that all three services mount is that one
 mechanism.
 
-**The browser-facing half of this subsection now exists; the drone-facing half does
-not.** Traefik is in `docker-compose.yml` with its configuration in `configs/traefik/`,
-terminating HTTPS and WSS for the portal, HLS, WHEP signalling and the viewer
-WebSocket — the four services a browser touches. `PORTAL_COOKIE_SECURE` and
-`PORTAL_PUBLIC_TLS` therefore describe a deployment that exists, which closes the
-"no working configuration" corollary in §8.
+**All three terminators now exist.** Traefik is in `docker-compose.yml` with its
+configuration in `configs/traefik/`, terminating HTTPS and WSS for the portal, HLS,
+WHEP signalling and the viewer WebSocket — the four services a browser touches.
+`PORTAL_COOKIE_SECURE` and `PORTAL_PUBLIC_TLS` therefore describe a deployment that
+exists, which closes the "no working configuration" corollary in §8.
 
-Still in the clear: `configs/mediamtx/mediamtx.yaml` configures no encryption on the
-RTMP or RTSP listener, and Mosquitto's MQTTS block is still commented out. Those are
-the two terminators that handle their own TLS, and they carry the drone's credentials
-— a stream key on the video plane and the same key as an MQTT password on the
-telemetry one. **A stream key still crosses the internet in plain text.** See §9.
+The drone's three followed: `rtmpEncryption`/`rtspEncryption: optional` with cert
+paths in `configs/mediamtx/mediamtx.yaml` opens RTMPS on 1936 and RTSPS on 8322, and
+Mosquitto's MQTTS listener on 8883 is no longer commented out. Both read the same leaf
+Traefik does. **A stream key no longer has to cross the internet in plain text** —
+which mattered more than one line suggests, since that key is the ingest path as well
+as the credential, is typed into a controller before every flight, and never expires.
+
+`optional` rather than `strict`, on both MediaMTX listeners and by keeping Mosquitto's
+1883 listener, is the fallback these boundaries always described. The cost of that
+choice is stated plainly: a drone pointed at `rtmp://` still gets a working connection
+and no warning. Switching to `strict` and deleting the 1883 listener is a two-line
+change the day no drone needs it, and nothing else moves.
+
+Two consequences of self-termination that are easy to meet by surprise:
+
+- **MediaMTX exits at startup if the certificate file is absent.** Not a warning and
+  not a disabled listener — `open /certs/server.crt: no such file or directory`, then
+  `[RTSP] closing`. So `scripts/generate_local_certs.sh` is now a prerequisite of
+  `docker compose up` rather than a nicety, and every test runner that mounts the real
+  config had to start issuing one.
+- **The TLS floor is 1.2 on all three drone-facing listeners**, matching Traefik's
+  configured `minVersion` — but it comes from the Go and OpenSSL builds underneath
+  rather than from a setting, because neither MediaMTX nor Mosquitto exposes one that
+  works. Mosquitto's `tls_version` is deliberately left unset: in this build it caps
+  the version rather than flooring it, so setting `tlsv1.2` would refuse the 1.3
+  clients it should prefer and admit nothing new below. Measured rather than assumed —
+  see §9.
 
 #### Certificates before a hostname exists **[built]**
 
@@ -969,7 +999,9 @@ there is not one of those yet.
 plus one wildcard leaf covering `<domain>`, `*.<domain>`, `localhost` and the host's
 own IP, since `MEDIAMTX_HOST` holds an IP today. One leaf serves all three
 terminators, and it is named `server.crt`/`server.key` because that is what
-`mosquitto.conf`'s commented-out block already expects.
+`mosquitto.conf` already expected — which is now what it actually reads, along with
+MediaMTX and Traefik. The single-leaf choice was made before there was a second
+consumer and cost nothing when the second and third arrived.
 
 Two details are deliberate rather than convenient. The leaf lasts **397 days**, the
 browser maximum, rather than the decade a throwaway local certificate usually gets: a
@@ -1017,23 +1049,31 @@ which is not yet the target — see the TLS item in §9.
 | Port | Protocol | Terminated by | Today |
 | --- | --- | --- | --- |
 | 1935 | RTMP (fallback only) | MediaMTX | published, in the clear |
-| 1936 | RTMPS | MediaMTX | **not configured** |
+| 1936 | RTMPS | MediaMTX | **published, TLS terminated by MediaMTX** |
 | 8554 | RTSP (fallback only) | MediaMTX | published, in the clear |
-| 8322 | RTSPS | MediaMTX | **not configured** |
+| 8322 | RTSPS | MediaMTX | **published, TLS terminated by MediaMTX** |
 | 8888 | HLS | Traefik | **HTTPS through Traefik** |
 | 8889 | WebRTC / WHEP signalling | Traefik | **HTTPS through Traefik** |
 | 8189/udp | WebRTC media | End-to-end DTLS-SRTP — **must not be proxied** | published direct |
 | 8189/tcp | WebRTC media over ICE-TCP | End-to-end DTLS-SRTP — **must not be proxied** | published direct |
 | 8765 | WSS — the viewer's alert WebSocket | Traefik | **WSS through Traefik** |
 | 1883 | MQTT (fallback only) | Mosquitto | published, in the clear |
-| 8883 | MQTTS | Mosquitto | **commented out** in `mosquitto.conf` |
+| 8883 | MQTTS | Mosquitto | **published, TLS terminated by Mosquitto** |
 | 443 | HTTPS — the portal | Traefik | **HTTPS through Traefik** |
 
 The plain-text ports are labelled *fallback only* because that is their designed role —
-drones without TLS support (§7). Today they are not a fallback but the only path, since no
-encrypted listener is configured on any of the three. **This is now the whole of the
-remaining gap**: the browser reaches everything over TLS, and the drone reaches nothing
-over it.
+drones without TLS support (§7) — and they are now genuinely that rather than the only
+path: every row above has an encrypted sibling that is published and working. The
+browser reaches everything over TLS and so can the drone.
+
+What remains is not a missing listener but a missing *compulsion*. Nothing rejects a
+drone that dials 1935, and nothing tells its operator they are sending a permanent
+credential in the clear. That is deliberate — the fallback would not be one otherwise —
+and it is the reason the plain rows stay in this table rather than being deleted.
+
+The app tier also still reaches MediaMTX and Mosquitto over the plaintext ports inside
+`comms-net`, which is the in-cloud scoping decision in §7 rather than an oversight, and
+is why removing those listeners is not purely a drone-side question.
 
 Traefik publishes the four ports its upstreams used to publish themselves, and those
 four no longer publish at all — the portal, HLS, WHEP and the viewer WebSocket are
@@ -1089,10 +1129,14 @@ simpler by one hop and would break this line.
 ## 9. Outstanding work
 
 > Tests backing the claims below live in **`tests/comms/`**, with a README covering what
-> each one guards and how to run it. Three shell runners stand up the required containers
+> each one guards and how to run it. The shell runners stand up the required containers
 > and clean up after themselves. The host interpreter has none of the dependencies, so
 > everything runs in throwaway containers — except `run_mediamtx_auth.sh`, which needs
 > `ffmpeg` and `curl` on the host to drive real publishes and reads.
+>
+> Every runner that mounts the real `mediamtx.yaml` or `mosquitto.conf` now issues a
+> throwaway certificate first, because both services terminate their own TLS and
+> MediaMTX will not start without one.
 
 ### Where to pick up next
 
@@ -1116,32 +1160,36 @@ waits on them and neither is work:**
    and no-data analysis are skipped without it, so a real part of `danger_detection` has
    never executed.
 
+**The ingress tier is finished** — all three terminators, browser side and drone side.
+What follows is what that promotes to the top.
+
 **Then, in order:**
 
-1. **Finish the ingress tier** (§7). Traefik is built and the browser now reaches
-   everything over TLS; the drone reaches nothing over it. Two pieces remain, and they
-   are the two terminators that handle their own TLS: `encryption` plus cert paths on
-   MediaMTX's RTMP/RTSP listeners, and Mosquitto's commented-out MQTTS listener. Both
-   read the leaf `scripts/generate_local_certs.sh` already writes, so neither waits on a
-   hostname either. **A stream key is still typed into a drone controller and sent in
-   plain text**, which is now the largest single gap between this document and the
-   branch. MediaMTX first — it carries the credential that is also the ingest path.
-2. **Load the watch page in a real browser** (`run_watch_live.sh`). The cheapest open item
-   by a wide margin: it needs a person and twenty minutes, no new code, and it is the only
-   thing standing between "the protocol is verified" and "the product works". The page
-   changed after the last run — the HLS button is gone and ICE-TCP is on — so the previous
-   look does not count. Autoplay policy on the `<video>` element is the specific risk.
-3. **Certificate renewal for MediaMTX** (§9, *Open*). Sequenced here rather than lower
-   because the answer must be known **before** the first certificate is issued, not before
-   it expires: if MediaMTX does not reread a changed cert from disk, renewal means
-   restarting the media server, which drops every flight in the air. Ninety days of not
-   knowing is the expensive way to find out.
-4. **The Kubernetes `FlightRuntime` backend** (§2). Mechanical — the interface exists and
+1. **Load the watch page in a real browser** (`run_watch_live.sh`). Now the cheapest
+   open item by a wide margin *and* the oldest: it needs a person and twenty minutes,
+   no new code, and it is the only thing standing between "the protocol is verified"
+   and "the product works". The page changed after the last run — the HLS button is
+   gone and ICE-TCP is on — so the previous look does not count. Autoplay policy on the
+   `<video>` element is the specific risk.
+2. **Certificate renewal for MediaMTX** (§9, *Open*). Sequenced second and no longer
+   hypothetical: three services now read a certificate from disk and one of them
+   (MediaMTX) has never been shown to reread it. The answer must be known **before** the
+   first real certificate is issued, not before it expires — if MediaMTX does not reload,
+   renewal means restarting the media server, which drops every flight in the air.
+   `--renew-leaf` exists precisely to make this a ten-minute experiment while the local
+   CA is fresh. Ninety days of not knowing is the expensive way to find out.
+3. **The Kubernetes `FlightRuntime` backend** (§2). Mechanical — the interface exists and
    the Docker backend is the reference — and it retires the orchestrator's hold on the
    Docker socket, which is the strongest standing argument for making the move.
-5. **Flight history in the portal** (§9, *Open*). The first thing a user will ask for that
+4. **Flight history in the portal** (§9, *Open*). The first thing a user will ask for that
    the system already has the data for. Every row exists; what is missing is a paged read
    route and a page.
+
+Not on that list, and worth saying why: **making TLS compulsory on the drone side.**
+Every encrypted listener now exists, and the plaintext ones remain by design (§7, §8).
+Turning `optional` into `strict` is a two-line change, and the thing gating it is not
+work — it is knowing whether any drone that will actually fly here needs the fallback.
+That is a question for whoever owns the aircraft, not a task.
 
 Everything else in *Open* is either genuinely conditional (MediaMTX sharding, TURN over 443,
 auth-endpoint caching — all of which want a measurement or a user complaint first) or paired
@@ -1150,6 +1198,49 @@ billing).
 
 ### Built and tested
 
+- **RTMPS, RTSPS and MQTTS — the drone-facing half of the ingress tier** (§7, §8).
+  MediaMTX and Mosquitto terminate their own TLS, reading the same leaf Traefik does,
+  so a stream key no longer has to cross the internet in plain text. That key is the
+  ingest path as well as the credential, is typed into a controller before every
+  flight, and never expires, which is why it was the last thing worth encrypting.
+
+  Verified by **42 assertions** in `run_ingress_tls.sh`, against the repo's own
+  `mediamtx.yaml` and `mosquitto.conf` with a real db-writer and PostgreSQL behind
+  them, two tenants throughout. The assertions split into two independent claims, and
+  the second is the one a transport change is most likely to break quietly:
+
+  - **The transport.** Each of the three listeners serves the leaf this run issued,
+    refuses a client that does not hold the CA, and floors at TLS 1.2 — 1.0 and 1.1
+    refused, 1.2 and 1.3 accepted. ffmpeg publishing with a *different* run's CA is
+    refused, and the identical publish with the right CA succeeds, so the refusal is a
+    statement about the certificate rather than about anything else in that container.
+  - **Authorisation is unchanged by it.** A revoked key cannot publish over RTMPS or
+    RTSPS, an unknown one cannot either, a publish to another flight's output path is
+    still refused, and over MQTTS the drone still cannot publish under another tenant's
+    key nor the app subscribe to another tenant's telemetry. Encrypted and authorised
+    are independent properties, and it is entirely possible to gain one while silently
+    losing the other.
+  - **The plaintext fallback still works**, on both planes, which §7 requires — a change
+    that broke it would ground exactly the drones the fallback exists for.
+
+  Two things the work turned up, both about tests rather than about TLS.
+
+  **The TLS-floor assertion in `run_traefik_tls.sh` was vacuous, and is fixed.** It
+  drove `curl --tlsv1.1` and asserted the failure — but modern curl refuses to *send*
+  a TLS 1.1 ClientHello, so that assertion fails identically against a server that
+  happily accepts TLS 1.1. It measured the client. Both runners now use an OpenSSL old
+  enough to still offer it, with a control that proves so against a server pinned to
+  1.1 in the same container; without that control it would be the same vacuous
+  assertion with a different binary. The reading is handshake-completed rather than
+  reported version, because OpenSSL's `New, TLSv1.x` line names the era of the
+  negotiated *cipher* and not the protocol — a TLS 1.1 connection can print `TLSv1.0`.
+
+  **MediaMTX exits at startup when its certificate file is missing**, rather than
+  starting without the encrypted listener. Six other runners mount the real
+  `mediamtx.yaml` and none of them supplied a certificate, so this change broke all of
+  them at once — caught because `run_traefik_tls.sh` went from 30 passing to two 502s.
+  They now issue a throwaway leaf each, into a temporary directory rather than into
+  `certificates/`, whose CA may already be installed in a browser.
 - **Traefik, terminating TLS for everything a browser touches** (§7, §8). The portal,
   HLS, WHEP signalling and the viewer WebSocket are now reachable only over HTTPS/WSS
   through `configs/traefik/`, and the four upstreams no longer publish a port of their
@@ -1161,7 +1252,7 @@ billing).
   that is what made the work possible before the hostname arrives: all three terminators
   read a key from disk and none asks who signed it.
 
-  Verified by 30 assertions in `run_traefik_tls.sh` — the repo's own Traefik
+  Verified by 31 assertions in `run_traefik_tls.sh` — the repo's own Traefik
   configuration in front of a real portal, ws-server, MediaMTX, db-writer and
   PostgreSQL. Three are worth naming:
 
@@ -1178,7 +1269,8 @@ billing).
     bucket.
   - **A client without the CA is refused.** Asserted alongside the successful one, since
     a TLS test that passes against any certificate is asserting nothing. The TLS floor is
-    pinned the same way: 1.2 and 1.3 accepted, 1.1 refused.
+    pinned the same way — 1.2 and 1.3 accepted, 1.1 refused — though that half of it was
+    asserting nothing until the drone-side work above found and fixed it.
 
   Two assertions failed on the first run and both were the test's fault, in ways the
   document had already warned about. HLS answered 302 because MediaMTX redirects to
@@ -1507,15 +1599,12 @@ list nearly empty. Everything here that mattered was portal work.
 ### Designed, not built
 
 - Kubernetes `FlightRuntime` backend (create Job, delete Job)
-- **The drone-facing half of the ingress tier (§7).** Traefik is built (see below), so
-  what remains is the two terminators that handle their own TLS: `encryption` and cert
-  paths on MediaMTX's RTMP/RTSP listeners, and Mosquitto's commented-out MQTTS listener.
-  Both read the leaf the local CA already issues, so neither is blocked. Until they land,
-  a stream key — which is also the ingest path, and is typed into a controller before
-  every flight — crosses the internet in plain text.
 - **The cloud L4 load balancer and cert-manager (§7).** Deployment-time pieces with
   nothing to build locally: the LB is a managed resource and cert-manager replaces
   `scripts/generate_local_certs.sh` when a hostname resolves here.
+
+The ingress tier itself has left this list. Both halves are built and tested — see
+above — which is why §8's port table no longer has a "not configured" cell in it.
 
 ### Open
 
@@ -1568,8 +1657,9 @@ list nearly empty. Everything here that mattered was portal work.
   fallback rather than vendoring a second player. What it does not handle is a network
   where nothing but 443 leaves at all: port 8189 is as blocked as 8189/udp was. The real
   answers there are TURN over 443 or HLS proxied through the ingress tier on 443 (§8
-  already routes HLS through it). Both are infrastructure, both wait for the ingress tier,
-  and neither is worth building before a real user reports being unable to watch.
+  already routes HLS through it). The ingress tier they were waiting on now exists, so
+  what is left gating them is a reason: neither is worth building before a real user
+  reports being unable to watch.
 - **No browser has loaded the finished watch page.** The playback path itself is now
   verified — see the entry below — but by a WHEP client and `ffprobe`, not by Chrome or
   Firefox. What remains unproven is the page around it: autoplay policy on a `<video>`
@@ -1580,13 +1670,20 @@ list nearly empty. Everything here that mattered was portal work.
   Every row needed is already there (`flights`, `alerts`, `recordings`); what is missing
   is a paged read route and a page, and neither is on the path of anything else.
 - Recorder per-tenant upload prefixes
-- **TLS certificate issue and renewal.** Distinct from the ingress tier above, which is a
-  deployment task: this is the ongoing one. cert-manager answers issue and renewal for
-  Traefik directly, but MediaMTX and Mosquitto read a certificate from disk, so a renewed
-  Secret has to reach a running process. Mosquitto rereads its certificates on `SIGHUP`;
-  MediaMTX's behaviour on a changed cert file has not been checked, and if it does not
-  reload, renewal means restarting the media server — which drops every flight in the air.
-  Verify that before the first certificate expires rather than after.
+- **TLS certificate issue and renewal.** Distinct from the ingress tier, which is now
+  built: this is the ongoing one, and the tier landing is what makes it concrete rather
+  than hypothetical. cert-manager answers issue and renewal for Traefik directly, but
+  MediaMTX and Mosquitto read a certificate from disk, so a renewed Secret has to reach
+  a running process. Traefik picks up a changed file through its watched file provider.
+  Mosquitto rereads its certificates on `SIGHUP`. **MediaMTX's behaviour on a changed
+  cert file has still not been checked**, and if it does not reload, renewal means
+  restarting the media server — which drops every flight in the air.
+
+  It is now the second item in *Where to pick up next* rather than a note down here,
+  because it is a ten-minute experiment while the local CA is fresh
+  (`generate_local_certs.sh --renew-leaf` performs exactly the file swap in question)
+  and the answer is needed before the first real certificate is issued, not before it
+  expires.
 - **Auth-endpoint caching and db-writer replica count.** Every publish and every read
   now costs one indexed lookup here. A short-TTL cache is the obvious fix and the wrong
   one to reach for blindly: it delays revocation of a credential that has no expiry.

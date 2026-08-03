@@ -15,6 +15,18 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# MediaMTX terminates its own TLS now (§7), and it EXITS at startup if the
+# certificate its config points at is not on disk — "open /certs/server.crt: no
+# such file or directory", then "[RTSP] closing". So every runner that mounts the
+# real mediamtx.yaml has to supply one, whether or not it tests TLS: without it
+# this whole file fails as a wall of connection errors that look like networking.
+#
+# Issued into a throwaway directory rather than into certificates/, whose CA may
+# already be installed in somebody's browser.
+CERTS="$(mktemp -d)"
+CERT_DIR="$CERTS" "$REPO/scripts/generate_local_certs.sh" >/dev/null \
+  || { echo "could not issue a local certificate for MediaMTX"; exit 1; }
 NET=mtxauth-net
 IMAGE=dbw-mtxauthtest
 RTMP=localhost:11935
@@ -22,6 +34,7 @@ HLS=http://localhost:18888
 API=http://localhost:18002
 
 cleanup() {
+  rm -rf "$CERTS"
   docker rm -f mtxa-mediamtx db-writer mtxa-pg >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   docker rmi "$IMAGE" >/dev/null 2>&1 || true
@@ -89,6 +102,7 @@ docker run -d --name db-writer --network "$NET" -p 18002:8000 "${ENVV[@]}" "$IMA
 docker run -d --name mtxa-mediamtx --network "$NET" \
   -p 11935:1935 -p 18888:8888 \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
+  -v "$CERTS/server:/certs:ro" \
   bluenviron/mediamtx:latest-ffmpeg >/dev/null \
   || { echo "mediamtx failed to start (is a previous run still holding 11935/18888?)"; exit 1; }
 sleep 6

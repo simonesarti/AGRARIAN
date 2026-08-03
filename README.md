@@ -257,13 +257,16 @@ The app detects engine files at startup and switches to engine mode automaticall
 
 | Port | Protocol | Direction | Purpose |
 | ---- | -------- | --------- | ------- |
-| 8554 | RTSP | inbound | MediaMTX: drone video publish + app raw stream pull |
-| 1935 | RTMP | inbound | MediaMTX: app annotated stream push |
+| 1936 | RTMPS | inbound | MediaMTX: drone video publish — **the URL the portal prints** |
+| 8322 | RTSPS | inbound | MediaMTX: drone video publish, encrypted |
+| 8883 | MQTTS | inbound | Mosquitto: drone telemetry, encrypted |
+| 8554 | RTSP | inbound | MediaMTX: plaintext fallback + app raw stream pull |
+| 1935 | RTMP | inbound | MediaMTX: plaintext fallback + app annotated stream push |
+| 1883 | MQTT | inbound | Mosquitto: plaintext fallback + app subscription |
 | 8888 | HTTPS | inbound | Traefik → MediaMTX: HLS playback |
 | 8889 | HTTPS | inbound | Traefik → MediaMTX: WebRTC/WHEP signalling |
 | 8189 | UDP | inbound | MediaMTX: WebRTC media (DTLS-SRTP, never proxied) |
 | 8189 | TCP | inbound | MediaMTX: WebRTC media over ICE-TCP, for networks that block UDP |
-| 1883 | MQTT | inbound | Mosquitto: drone telemetry + app subscription |
 | 443 | HTTPS | inbound | Traefik → portal: the account pages |
 | `WS_PORT` | WSS | inbound | Traefik → ws-server: WebSocket alert stream |
 | 8001 | HTTP | inbound | ws-server HTTP API (app POSTs alerts here) |
@@ -272,13 +275,20 @@ The app detects engine files at startup and switches to engine mode automaticall
 8001 and 8002 are internal-only in the target topology; they are published here for the
 split deployment below, where the app runs on a separate machine.
 
-**Run `./scripts/generate_local_certs.sh` once before `docker compose up`.** Traefik
-terminates TLS for the portal, HLS, WHEP and the WebSocket, and it needs a certificate;
-that script issues one from a local CA, which stands in for cert-manager until a real
-hostname exists. Trust `certificates/ca/ca.crt` in the browser to avoid a warning page.
+**Run `./scripts/generate_local_certs.sh` once before `docker compose up`.** Three
+services terminate TLS and all three read the leaf it writes: Traefik for the portal,
+HLS, WHEP and the WebSocket; MediaMTX for RTMPS and RTSPS; Mosquitto for MQTTS. It
+issues them from a local CA, which stands in for cert-manager until a real hostname
+exists. Trust `certificates/ca/ca.crt` in the browser to avoid a warning page.
 
-The drone-facing ports — RTSP 8554, RTMP 1935 and MQTT 1883 — are **still in the clear**.
-RTMPS, RTSPS and MQTTS are the next piece of the ingress tier.
+This is a prerequisite rather than a nicety: **MediaMTX exits at startup if the
+certificate is missing**, so the video plane is down and not merely unencrypted.
+
+The plaintext ports stay published on purpose, as a narrow fallback for drone firmware
+that cannot do TLS — and the app tier reaches MediaMTX and Mosquitto over them inside
+`comms-net`. Nothing forces a drone onto the encrypted port, so point every one that
+can at the `rtmps://` URL the portal prints: the stream key it carries is both the
+credential and the path, and it never expires.
 
 ### Access URLs
 

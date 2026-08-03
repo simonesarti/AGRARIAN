@@ -51,6 +51,18 @@ case "$MODE" in
 esac
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# MediaMTX terminates its own TLS now (§7), and it EXITS at startup if the
+# certificate its config points at is not on disk — "open /certs/server.crt: no
+# such file or directory", then "[RTSP] closing". So every runner that mounts the
+# real mediamtx.yaml has to supply one, whether or not it tests TLS: without it
+# this whole file fails as a wall of connection errors that look like networking.
+#
+# Issued into a throwaway directory rather than into certificates/, whose CA may
+# already be installed in somebody's browser.
+CERTS="$(mktemp -d)"
+CERT_DIR="$CERTS" "$REPO/scripts/generate_local_certs.sh" >/dev/null \
+  || { echo "could not issue a local certificate for MediaMTX"; exit 1; }
 NET=orchreal-net
 APP_IMAGE=orchreal-app
 DBW_IMAGE=orchreal-dbw
@@ -63,6 +75,7 @@ GRACE=10
 LOGDIR=$(mktemp -d)
 
 cleanup() {
+  rm -rf "$CERTS"
   docker rm -f orchreal-mediamtx orchreal-mosquitto orchreal-telemetry \
                 orchestrator db-writer ws-server redis orchreal-pg >/dev/null 2>&1 || true
   docker ps -aq --filter "label=agrarian.flight_id" | xargs -r docker rm -f >/dev/null 2>&1 || true
@@ -175,10 +188,12 @@ docker run -d --name orchestrator --network "$NET" \
 # are the ones enforced here.
 docker run -d --name orchreal-mosquitto --network "$NET" \
   -v "$REPO/configs/mosquitto/mosquitto.conf:/etc/mosquitto/mosquitto.conf:ro" \
+  -v "$CERTS/server:/mosquitto/certs:ro" \
   "$MOSQ_IMAGE" >/dev/null || { echo "mosquitto failed to start"; exit 1; }
 
 docker run -d --name orchreal-mediamtx --network "$NET" -p 41935:1935 \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
+  -v "$CERTS/server:/certs:ro" \
   bluenviron/mediamtx:latest-ffmpeg >/dev/null \
   || { echo "mediamtx failed to start (is a previous run still holding 41935?)"; exit 1; }
 sleep 6

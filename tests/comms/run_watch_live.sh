@@ -31,6 +31,18 @@ set -uo pipefail
 
 HOST="${1:-127.0.0.1}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# MediaMTX terminates its own TLS now (§7), and it EXITS at startup if the
+# certificate its config points at is not on disk — "open /certs/server.crt: no
+# such file or directory", then "[RTSP] closing". So every runner that mounts the
+# real mediamtx.yaml has to supply one, whether or not it tests TLS: without it
+# this whole file fails as a wall of connection errors that look like networking.
+#
+# Issued into a throwaway directory rather than into certificates/, whose CA may
+# already be installed in somebody's browser.
+CERTS="$(mktemp -d)"
+CERT_DIR="$CERTS" "$REPO/scripts/generate_local_certs.sh" >/dev/null \
+  || { echo "could not issue a local certificate for MediaMTX"; exit 1; }
 NET=watch-net
 APP_IMAGE=watch-app
 DBW_IMAGE=watch-dbw
@@ -42,6 +54,7 @@ EMAIL=pilot@test.io
 PASSWORD=pw12345678
 
 cleanup() {
+  rm -rf "$CERTS"
   echo
   echo "==> cleaning up"
   kill "${FFPID:-}" >/dev/null 2>&1
@@ -107,6 +120,7 @@ docker run -d --name watch-wss --network "$NET" --network-alias ws-server \
   -e SESSION_JWT_SECRET="$SECRET" "$WSS_IMAGE" >/dev/null || { echo "ws-server failed"; exit 1; }
 docker run -d --name watch-mosquitto --network "$NET" \
   -v "$REPO/configs/mosquitto/mosquitto.conf:/etc/mosquitto/mosquitto.conf:ro" \
+  -v "$CERTS/server:/mosquitto/certs:ro" \
   "$MOSQ_IMAGE" >/dev/null || { echo "mosquitto failed"; exit 1; }
 
 # The affordance §8 calls local-only. Without these two the login below succeeds
@@ -137,6 +151,7 @@ docker run -d --name watch-mediamtx --network "$NET" \
   -p 1935:1935 -p 8888:8888 -p 8889:8889 -p 8189:8189/udp -p 8189:8189/tcp \
   -e MTX_WEBRTCICEHOSTNAT1TO1IPS="$HOST" \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
+  -v "$CERTS/server:/certs:ro" \
   bluenviron/mediamtx:latest-ffmpeg >/dev/null || { echo "mediamtx failed"; exit 1; }
 sleep 6
 
@@ -151,6 +166,13 @@ docker run -d --name watch-telemetry --network "$NET" \
   --entrypoint python3 "$APP_IMAGE" \
   /telemetry_publisher.py --host watch-mosquitto --stream-key "$KEY" --hz 10 >/dev/null
 
+# Plain RTMP, not the rtmps:// URL the portal now prints on the slots page. Both
+# listeners are live (§7), and the encrypted one is what a real drone should use —
+# this harness deliberately drives the plaintext fallback because it publishes
+# from the host rather than from the test network, and pointing host ffmpeg at a
+# locally-issued certificate is one more thing that can fail in the one test whose
+# whole purpose is a person looking at a browser. run_ingress_tls.sh covers the
+# encrypted path properly, with authorisation, from inside the network.
 echo "==> taking off (a one-hour test pattern on rtmp://$HOST:1935/in/$KEY)"
 ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=1920x1080:rate=30 \
   -t 3600 -c:v libx264 -preset ultrafast -tune zerolatency -g 30 \

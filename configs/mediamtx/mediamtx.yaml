@@ -12,12 +12,48 @@
 # based and provides busybox wget, which sends the form-encoded body these
 # endpoints expect. The tag is chosen for the shell, not for ffmpeg.
 
+# ── The drone-facing listeners, and their TLS ─────────────────────────────────
+# MediaMTX terminates its own TLS rather than sitting behind Traefik, and that is
+# a decision rather than a limitation (§7): Traefik can route TCP with SNI, but
+# terminating here preserves the client identity the auth hook below depends on,
+# and RTMP and RTSP are arbitrary TCP that an L7 proxy has nothing useful to say
+# about anyway.
+#
+# The certificate is the same leaf Traefik and Mosquitto read — one file for all
+# three terminators, written by scripts/generate_local_certs.sh today and by
+# cert-manager into a Secret later. None of the three knows or cares who signed
+# it, which is why this could be built before a hostname exists.
+#
+# encryption: optional, NOT strict. §7 keeps the plaintext listeners as a narrow
+# fallback for drones whose firmware cannot do TLS at all, and a controller that
+# cannot be pointed at rtmps:// is otherwise a controller that cannot fly. Every
+# drone that CAN should be given the rtmps:// URL the portal prints, because the
+# stream key is both the credential and the path — in the clear it is readable by
+# anyone on the wire, and it does not expire.
+#
+# Switch both to "strict" the day no drone needs the fallback. Nothing else has
+# to change: the plaintext listeners simply stop existing.
+
 rtsp: yes
 rtspAddress: :8554
+rtspsAddress: :8322
+rtspEncryption: optional
+rtspServerCert: /certs/server.crt
+rtspServerKey: /certs/server.key
+# The handshake is TCP either way; this is the media transport. Encryption adds
+# UDP listeners for SRTP/SRTCP (:8004 and :8005) beside the RTP/RTCP pair (:8000,
+# :8001) that "udp" already opened — neither pair is published in compose, and
+# the app pulls its raw feed over TCP (rtsp_transport;tcp in stream_video_reader).
+# They are listed here so that stays a decision rather than a discovery, which is
+# the same objection the srt/moq lines below record.
 rtspTransports: [tcp, udp]
 
 rtmp: yes
 rtmpAddress: :1935
+rtmpsAddress: :1936
+rtmpEncryption: optional
+rtmpServerCert: /certs/server.crt
+rtmpServerKey: /certs/server.key
 
 webrtc: yes
 webrtcAddress: :8889

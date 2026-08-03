@@ -29,12 +29,22 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Mosquitto terminates its own TLS now (§7), and it fails to start the 8883
+# listener if the certificate mosquitto.conf points at is not on disk. So every
+# runner that mounts the real mosquitto.conf has to supply one, whether or not it
+# tests TLS. Issued into a throwaway directory rather than into certificates/,
+# whose CA may already be installed in somebody's browser.
+CERTS="$(mktemp -d)"
+CERT_DIR="$CERTS" "$REPO/scripts/generate_local_certs.sh" >/dev/null \
+  || { echo "could not issue a local certificate for Mosquitto"; exit 1; }
 NET=mqttauth-net
 IMAGE=dbw-mqttauthtest
 MOSQ_IMAGE=iegomez/mosquitto-go-auth:2.1.0-mosquitto_2.0.15
 API=http://localhost:28002
 
 cleanup() {
+  rm -rf "$CERTS"
   docker rm -f mqtta-mosquitto db-writer mqtta-pg >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   docker rmi "$IMAGE" >/dev/null 2>&1 || true
@@ -98,6 +108,7 @@ docker run -d --name db-writer --network "$NET" -p 28002:8000 "${ENVV[@]}" "$IMA
   || { echo "db-writer failed to start"; exit 1; }
 docker run -d --name mqtta-mosquitto --network "$NET" -p 21883:1883 \
   -v "$REPO/configs/mosquitto/mosquitto.conf:/etc/mosquitto/mosquitto.conf:ro" \
+  -v "$CERTS/server:/mosquitto/certs:ro" \
   "$MOSQ_IMAGE" >/dev/null \
   || { echo "mosquitto failed to start (is a previous run still holding 21883?)"; exit 1; }
 sleep 4

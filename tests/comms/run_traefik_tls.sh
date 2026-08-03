@@ -114,6 +114,7 @@ docker run -d --name tt-portal --network "$NET" --network-alias portal \
 echo "==> starting mediamtx (the real config, so the auth hook is the real one)"
 docker run -d --name tt-mediamtx --network "$NET" --network-alias mediamtx \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
+  -v "$CERTS/server:/certs:ro" \
   bluenviron/mediamtx:latest-ffmpeg >/dev/null
 
 echo "==> waiting for /health"
@@ -169,9 +170,31 @@ tls_check "TLS 1.2 is accepted" \
 tls_check "TLS 1.3 is accepted" \
   "docker run --rm --network $NET -v $CERTS/server:/certs:ro curlimages/curl:latest \
      -sf --tlsv1.3 --cacert /certs/ca.crt https://portal.$DOMAIN/health"
+
+# The refusal cannot be tested with curl, and this used to be: `curl --tlsv1.1`
+# fails with an SSL error against a server that ACCEPTS TLS 1.1, because modern
+# curl will not send a 1.1 ClientHello at all. The assertion passed by measuring
+# the client, which is the shape of vacuous test this file exists to avoid.
+#
+# alpine:3.9 carries an OpenSSL old enough to still offer it. The control proves
+# so in the same container, against a server pinned to 1.1 — without that, this is
+# the old assertion again with a different binary.
+TLS11=$(docker run --rm --network "$NET" -v "$CERTS/server:/certs:ro" alpine:3.9 sh -c "
+  apk add -q openssl >/dev/null 2>&1
+  hs() {
+    r=\$(echo Q | openssl s_client -connect \$1:\$2 -CAfile /certs/ca.crt -tls1_1 2>&1)
+    case \"\$r\" in *'New, (NONE)'*) echo refused ;; *'New, '*) echo ok ;; *) echo unreachable ;; esac
+  }
+  openssl s_server -accept 14433 -cert /certs/server.crt -key /certs/server.key \
+    -min_protocol TLSv1.1 -max_protocol TLSv1.1 -quiet >/dev/null 2>&1 &
+  sleep 1
+  echo \"control \$(hs 127.0.0.1 14433)\"
+  echo \"traefik \$(hs portal.$DOMAIN 443)\"" 2>/dev/null)
+
+tls_check "the probe client can still complete a TLS 1.1 handshake at all" \
+  "[ \"\$(echo '$TLS11' | sed -n 's/^control //p')\" = ok ]"
 tls_check "TLS 1.1 is refused" \
-  "! docker run --rm --network $NET -v $CERTS/server:/certs:ro curlimages/curl:latest \
-     -s --tlsv1.1 --tls-max 1.1 --cacert /certs/ca.crt https://portal.$DOMAIN/health"
+  "[ \"\$(echo '$TLS11' | sed -n 's/^traefik //p')\" = refused ]"
 
 # The wildcard leaf has to actually cover the three names the ingress tier will
 # route on, or the move to Host-based routing breaks on a certificate error.

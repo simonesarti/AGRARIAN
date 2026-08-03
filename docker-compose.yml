@@ -3,6 +3,11 @@
 # Deploy this on the partner VM (or locally alongside the app container).
 # All services restart automatically unless explicitly stopped.
 #
+# Ports exposed to the drone — the encrypted one first, the fallback second:
+#   1936  — MediaMTX RTMPS (drone publishes)          1935 — RTMP,  in the clear
+#   8322  — MediaMTX RTSPS (drone publishes)          8554 — RTSP,  in the clear
+#   8883  — Mosquitto MQTTS (drone publishes telemetry) 1883 — MQTT, in the clear
+#
 # Ports exposed to the app machine:
 #   8554  — MediaMTX RTSP  (app pulls raw drone stream)
 #   1935  — MediaMTX RTMP  (app pushes annotated stream)
@@ -18,17 +23,23 @@
 #   8189  — MediaMTX WebRTC (ICE/media, UDP and TCP) — NOT proxied, end-to-end
 #           DTLS-SRTP between the browser and MediaMTX
 #
-# THE BROWSER-FACING HALF IS NOW ENCRYPTED; THE DRONE-FACING HALF IS NOT.
-# Traefik terminates HTTPS and WSS for the portal, HLS, WHEP and the viewer
-# WebSocket (§7). What is still in the clear is everything a drone touches:
-# RTMP 1935 and RTSP 8554 have no `encryption` block in mediamtx.yaml, and
-# Mosquitto's MQTTS listener is still commented out — so stream keys and
-# telemetry credentials continue to cross the wire in plain text. Those are the
-# next two pieces of the ingress tier. Keep drones on a trusted network.
+# EVERY PUBLIC SURFACE NOW HAS AN ENCRYPTED LISTENER. Traefik terminates HTTPS
+# and WSS for the browser's four; MediaMTX and Mosquitto terminate their own for
+# the drone's three, which is what preserves the client identity their auth hook
+# and ACLs depend on (§7).
+#
+# The plaintext listeners are still published, and deliberately: §7 keeps them as
+# a narrow fallback for drone firmware that cannot do TLS, and the app tier still
+# reaches MediaMTX and Mosquitto over them inside comms-net. What that means in
+# practice is that a drone pointed at rtmp:// rather than rtmps:// gets no warning
+# — the encrypted path is available, not enforced. Point every drone that can at
+# the rtmps:// URL the portal prints, and set encryption to "strict" the day none
+# of them needs the fallback.
 #
 # Certificates come from scripts/generate_local_certs.sh, which stands in for
 # cert-manager until a hostname exists — Let's Encrypt will not issue for an IP,
-# and MEDIAMTX_HOST is one. Run it once before `docker compose up`.
+# and MEDIAMTX_HOST is one. Run it once before `docker compose up`. All three
+# terminators mount the same leaf from certificates/server/.
 #
 # Recording: MediaMTX records the annotated stream to the 'recordings' volume.
 #            The recorder sidecar uploads each segment on completion.
@@ -130,14 +141,20 @@ services:
       orchestrator:
         condition: service_started
     ports:
-      # Still in the clear, and still published directly: these are the drone's
-      # ports, and MediaMTX terminates their TLS itself rather than through
-      # Traefik (§7 — it preserves the client identity the auth hook depends on).
-      # RTMPS 1936 and RTSPS 8322 land when mediamtx.yaml gets an `encryption`
-      # block; until then this is the plaintext path the ingress tier has not
-      # closed yet.
-      - "8554:8554"       # RTSP  — drone publishes + app pulls raw stream
-      - "1935:1935"       # RTMP  — app pushes annotated stream
+      # The drone's ports, published directly rather than through Traefik because
+      # MediaMTX terminates their TLS itself (§7 — it preserves the client
+      # identity the auth hook depends on, and these are arbitrary TCP an L7
+      # proxy has nothing to say about).
+      #
+      # The plaintext pair stays alongside the encrypted one — `encryption:
+      # optional` in mediamtx.yaml — as the narrow fallback §7 describes, for
+      # drone firmware that cannot do TLS at all. Point every drone that can at
+      # the rtmps:// URL the portal prints: the stream key is both the credential
+      # and the path, and it does not expire.
+      - "1936:1936"       # RTMPS — the drone publishes here
+      - "8322:8322"       # RTSPS — the encrypted variant of the below
+      - "8554:8554"       # RTSP  — fallback: drone publishes + app pulls raw stream
+      - "1935:1935"       # RTMP  — fallback
       # HLS (8888) and WHEP signalling (8889) are NOT published here any more.
       # Traefik terminates TLS for both and reaches them over comms-net; a direct
       # publish would be a plaintext route around the terminator.
@@ -151,6 +168,15 @@ services:
       MTX_WEBRTCICEHOSTNAT1TO1IPS: ${MEDIAMTX_HOST}
     volumes:
       - ./configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro
+      # The same leaf Traefik and Mosquitto mount. Written by
+      # scripts/generate_local_certs.sh, replaced by a cert-manager Secret later —
+      # MediaMTX reads a file and does not ask who signed it, which is what let
+      # the whole tier be built before a hostname existed.
+      #
+      # Whether MediaMTX rereads this file when it CHANGES is still unknown, and
+      # it is the open renewal question in §9: if it does not, renewal means
+      # restarting the media server, which drops every flight in the air.
+      - ./certificates/server:/certs:ro
       - recordings:/recordings
 
   # ── MQTT broker ───────────────────────────────────────────────────────────────
@@ -166,13 +192,19 @@ services:
       db-writer:
         condition: service_healthy
     ports:
-      - "1883:1883"     # MQTT  — drone publishes, app subscribes
-      #- "8883:8883"    # MQTTS — uncomment together with the listener block in mosquitto.conf
+      # 8883 is where a drone should publish telemetry: its MQTT password is its
+      # stream key, so plain 1883 puts a non-expiring credential on the wire.
+      # 1883 stays as the same narrow fallback the plaintext RTMP listener is.
+      - "8883:8883"     # MQTTS — drone publishes, app subscribes
+      - "1883:1883"     # MQTT  — fallback for firmware that cannot do TLS
     volumes:
       - ./configs/mosquitto/mosquitto.conf:/etc/mosquitto/mosquitto.conf:ro
       - mosquitto-data:/mosquitto/data
       - mosquitto-log:/mosquitto/log
-      #- ./certificates/mosquitto:/mosquitto/certs:ro   # required for MQTTS
+      # One directory, three files: the leaf, its key, and the CA beside them —
+      # which is why mosquitto.conf can point cafile, certfile and keyfile at the
+      # same mount. Same leaf as MediaMTX and Traefik.
+      - ./certificates/server:/mosquitto/certs:ro
 
   # ── DB writer sidecar ─────────────────────────────────────────────────────────
   db-writer:
