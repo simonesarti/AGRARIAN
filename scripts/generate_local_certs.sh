@@ -25,12 +25,15 @@
 # THE LEAF IS DELIBERATELY SHORT-LIVED
 # ------------------------------------
 # 397 days, the maximum a browser will accept, rather than the ten years a
-# throwaway local cert usually gets. Renewal is a real open item (§9): MediaMTX's
-# behaviour on a changed certificate file is unknown, and if it does not reread
-# one, renewal means restarting the media server and dropping every flight in the
-# air. A leaf that never expires is a way to never find that out. Use --renew-leaf
-# to reissue against the same CA, which is exactly the file swap that experiment
-# needs.
+# throwaway local cert usually gets. A leaf that never expires is a way to never
+# find out what happens when one does.
+#
+# --renew-leaf reissues against the same CA, which is exactly the file swap a
+# renewal performs, and it is what tests/comms/run_cert_renewal.sh drives. The
+# answers are in §7 and they are not symmetric: MediaMTX rereads the file by
+# itself (and does NOT survive a SIGHUP), Mosquitto rereads on SIGHUP, and
+# Traefik notices nothing until a file in its watched dynamic directory is
+# touched. Whatever writes the real renewal hook needs all three.
 #
 # Usage:
 #   ./scripts/generate_local_certs.sh [domain]        # CA + leaf (default: agrarian.local)

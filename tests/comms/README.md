@@ -33,6 +33,7 @@ try to run these directly with `python3`.
 | `run_portal.sh` | Postgres + Redis + db-writer + 2 portal replicas | `./run_portal.sh` |
 | `run_traefik_tls.sh` | the above + ws-server + MediaMTX behind a real Traefik | `./run_traefik_tls.sh` |
 | `run_ingress_tls.sh` | MediaMTX + mosquitto-go-auth + db-writer + Postgres | `./run_ingress_tls.sh` |
+| `run_cert_renewal.sh` | the above + Traefik, host `ffmpeg` | `./run_cert_renewal.sh` |
 | `run_orchestrator_recovery.sh` | the same as `run_orchestrator.sh` | `./run_orchestrator_recovery.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
@@ -120,6 +121,7 @@ docker run --rm -v "$PWD/db_writer:/dbw" -v "$PWD/tests/comms:/tests:ro" \
 ./run_orchestrator_recovery.sh  # 13 assertions, real crash + restart
 ./run_traefik_tls.sh         # 22 + 9 assertions, the browser's half of the ingress tier
 ./run_ingress_tls.sh         # 42 assertions, the drone's half — RTMPS, RTSPS, MQTTS
+./run_cert_renewal.sh        # 15 assertions, what each terminator does on renewal
 ```
 
 `run_traefik_tls.sh` is the only runner that speaks HTTPS rather than working around
@@ -146,6 +148,20 @@ ClientHello, with a control that proves it can. Written with modern curl or Open
 those clients refuse to offer one — it measures the client and not the server. That
 was a live defect in `run_traefik_tls.sh`, found while writing this one and fixed
 there too.
+
+`run_cert_renewal.sh` asks the question a certificate on disk only half answers: what
+each terminator does when that file is replaced under it. It reissues the leaf with
+`--renew-leaf` while a real authorised flight is publishing, then asks each service what
+it serves on a *fresh* connection — established sessions keep whatever they negotiated,
+so reusing one would report a stale answer as a definitive one.
+
+The answers are not symmetric and two of them were assumed wrong before this ran:
+MediaMTX rereads unaided, Mosquitto needs `SIGHUP`, and Traefik needs a `touch` in its
+watched directory because the certificate is mounted outside it. All three are
+properties of somebody else's binary, so an upgrade could move any of them and the
+symptom would arrive sixty days later — which is the whole reason this is a runner and
+not a paragraph. It also pins that **`SIGHUP` kills MediaMTX**, so the symmetry with
+Mosquitto is never reached for.
 
 `run_mediamtx_auth.sh` needs `ffmpeg` and `curl` **on the host** and binds host ports
 11935/18888/18002 so it cannot collide with a running compose stack. If a previous run

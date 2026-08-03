@@ -57,9 +57,19 @@ entryPoints:
 providers:
   file:
     directory: /etc/traefik/dynamic
-    # Routers and certificates can then change without restarting Traefik, which
-    # is the property the certificate-renewal question in §9 turns on. Whether
-    # MediaMTX does the same for its own certificate is still unknown.
+    # Routers can then change without restarting Traefik.
+    #
+    # CERTIFICATES CANNOT, and this line used to claim otherwise. What is watched
+    # is this DIRECTORY; the leaf lives at /etc/traefik/certs, outside it, so
+    # replacing the leaf fires no event and Traefik goes on serving the old one
+    # until something in here changes. `touch` on any file below reloads the
+    # configuration and re-reads the certificate with it — no restart, no dropped
+    # connections — so a renewal hook needs that one extra line.
+    #
+    # Measured in tests/comms/run_cert_renewal.sh, which also settles the other
+    # two: MediaMTX rereads its own certificate unaided, and Mosquitto does so on
+    # SIGHUP. Moving the leaf into this directory would fix it the other way, at
+    # the cost of handing the file provider files it will try to parse as config.
     watch: true
 
 # No dashboard and no API. It would be one more thing listening, and there is

@@ -99,9 +99,18 @@ services:
       - ./configs/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./configs/traefik/dynamic:/etc/traefik/dynamic:ro
       # Written by scripts/generate_local_certs.sh today, mounted from a
-      # cert-manager Secret later. Traefik watches the dynamic directory, so a
-      # renewed leaf is picked up without a restart — the property MediaMTX has
-      # not yet been shown to share (§9).
+      # cert-manager Secret later.
+      #
+      # TRAEFIK DOES NOT NOTICE WHEN THIS FILE CHANGES, and an earlier version of
+      # this comment claimed it did. `watch: true` watches
+      # providers.file.directory — the dynamic/ mount above — and the certificate
+      # is deliberately outside it, so a renewal fires no event and Traefik keeps
+      # serving the expired leaf. Touching any file in dynamic/ reloads the
+      # configuration and the certificate with it, with no restart and no dropped
+      # connections. Measured in tests/comms/run_cert_renewal.sh.
+      #
+      # In Kubernetes this stops being true and stops mattering: cert-manager
+      # writes a Secret and the Kubernetes provider watches it directly.
       - ./certificates/server:/etc/traefik/certs:ro
 
   # ── Alert fan-out bus ─────────────────────────────────────────────────────────
@@ -173,9 +182,11 @@ services:
       # MediaMTX reads a file and does not ask who signed it, which is what let
       # the whole tier be built before a hostname existed.
       #
-      # Whether MediaMTX rereads this file when it CHANGES is still unknown, and
-      # it is the open renewal question in §9: if it does not, renewal means
-      # restarting the media server, which drops every flight in the air.
+      # MediaMTX rereads this file when it changes, unaided and within seconds,
+      # and a flight already in the air is not disturbed — so renewal costs no
+      # restart here, which was the open worry in §9 and is now measured
+      # (tests/comms/run_cert_renewal.sh). Do NOT send it SIGHUP by analogy with
+      # Mosquitto: that kills it, and with it every flight in the air.
       - ./certificates/server:/certs:ro
       - recordings:/recordings
 

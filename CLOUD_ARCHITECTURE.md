@@ -1005,14 +1005,47 @@ consumer and cost nothing when the second and third arrived.
 
 Two details are deliberate rather than convenient. The leaf lasts **397 days**, the
 browser maximum, rather than the decade a throwaway local certificate usually gets: a
-certificate that never expires is a way to never discover the renewal problem below.
-And `--renew-leaf` reissues against the same CA without touching it, which is exactly
-the file swap the MediaMTX reload question needs — the CA stays installed in whatever
-trust store already has it.
+certificate that never expires is a way to never discover the renewal problem. And
+`--renew-leaf` reissues against the same CA without touching it, which is exactly the
+file swap that question needed — the CA stays installed in whatever trust store already
+has it. That is what `run_cert_renewal.sh` drives, and the question is now answered
+rather than open; see below.
 
 When a hostname lands, the ACME block at the foot of `configs/traefik/traefik.yml`
 replaces the script. Nothing else in the stack changes, which is the property that
 made building the tier before owning a domain worth doing.
+
+#### Renewal: what each terminator does when the leaf changes **[verified]**
+
+A certificate on disk is only half an answer. cert-manager will replace that file
+every sixty days or so, and a service that does not reread it turns renewal into a
+restart. The three do three different things, and the two that were *assumed* were
+both assumed wrong:
+
+| Terminator | Notices a replaced leaf? | What makes it |
+| --- | --- | --- |
+| **MediaMTX** | **Yes**, unaided, within seconds | nothing — it reads the file per handshake |
+| **Mosquitto** | No | `SIGHUP` |
+| **Traefik** | **No**, despite `watch: true` | `touch` any file in the watched dynamic directory |
+
+**MediaMTX was the worry and is the good news.** It rereads by itself, and a flight
+already in the air is not disturbed — the established session keeps the certificate it
+negotiated while new connections get the new one. So renewal costs no restart on the
+one service whose restart would drop every flight in the air. **Do not send it
+`SIGHUP`** by analogy with Mosquitto: that kills the process.
+
+**Traefik was assumed to reload and does not.** `watch: true` watches
+`providers.file.directory` — the routing config — and the certificate is deliberately
+mounted outside it, so replacing the leaf fires no event at all and Traefik serves the
+expired one indefinitely. A `touch` on any file in that directory reloads the
+configuration and the certificate with it, with no restart and no dropped connections,
+so the fix is one line in a renewal hook rather than a design change. In Kubernetes it
+stops being true and stops mattering: cert-manager writes a Secret and the Kubernetes
+provider watches it directly.
+
+All three are properties of somebody else's binary, which is why they are pinned by
+`tests/comms/run_cert_renewal.sh` rather than written down here alone — an upgrade
+could change any of them, and the symptom would arrive sixty days later.
 
 ### In-cloud traffic
 
@@ -1151,8 +1184,9 @@ waits on them and neither is work:**
    IP address, and `MEDIAMTX_HOST` is an IP today. What this gates is narrower than it
    first appeared: **only ACME issuance**, not the ingress tier. Traefik, the TLS
    listeners and the renewal question all read a certificate from disk and do not care
-   who signed it, so they were built against a local CA
-   (`scripts/generate_local_certs.sh`) and the handover is one config block. What a real
+   who signed it, so all three were built and the renewal behaviour of all three was
+   measured against a local CA (`scripts/generate_local_certs.sh`); the handover is one
+   config block. That is now the whole of what waits on a name. What a real
    name buys is a browser somebody else controls — which is why it is still worth
    starting now and not urgent to finish. Prefer a registrar whose DNS has an API
    cert-manager supports: the tier wants a wildcard, and a wildcard needs DNS-01.
@@ -1171,19 +1205,17 @@ What follows is what that promotes to the top.
    and "the product works". The page changed after the last run — the HLS button is
    gone and ICE-TCP is on — so the previous look does not count. Autoplay policy on the
    `<video>` element is the specific risk.
-2. **Certificate renewal for MediaMTX** (§9, *Open*). Sequenced second and no longer
-   hypothetical: three services now read a certificate from disk and one of them
-   (MediaMTX) has never been shown to reread it. The answer must be known **before** the
-   first real certificate is issued, not before it expires — if MediaMTX does not reload,
-   renewal means restarting the media server, which drops every flight in the air.
-   `--renew-leaf` exists precisely to make this a ten-minute experiment while the local
-   CA is fresh. Ninety days of not knowing is the expensive way to find out.
-3. **The Kubernetes `FlightRuntime` backend** (§2). Mechanical — the interface exists and
+2. **The Kubernetes `FlightRuntime` backend** (§2). Mechanical — the interface exists and
    the Docker backend is the reference — and it retires the orchestrator's hold on the
    Docker socket, which is the strongest standing argument for making the move.
-4. **Flight history in the portal** (§9, *Open*). The first thing a user will ask for that
+3. **Flight history in the portal** (§9, *Open*). The first thing a user will ask for that
    the system already has the data for. Every row exists; what is missing is a paged read
    route and a page.
+
+Certificate renewal has left this list: it was second and is now answered (§7). The one
+thing it leaves behind is small and belongs with whatever writes the renewal hook —
+**that hook must `touch` a file in Traefik's watched directory**, because Traefik is
+the terminator that does not notice a replaced leaf on its own.
 
 Not on that list, and worth saying why: **making TLS compulsory on the drone side.**
 Every encrypted listener now exists, and the plaintext ones remain by design (§7, §8).
@@ -1198,6 +1230,27 @@ billing).
 
 ### Built and tested
 
+- **Certificate renewal, on all three terminators** (§7). The open item with a deadline
+  attached — the answer was needed before the first real certificate was issued, not
+  before it expired — settled by 15 assertions in `run_cert_renewal.sh`, which issues a
+  leaf, stands the three services up against it, reissues with `--renew-leaf` under a
+  **live authorised flight**, and asks each of them what it is serving on a fresh
+  connection.
+
+  The result was the opposite of what this document assumed, in both directions.
+  **MediaMTX — the service whose restart would drop every flight in the air — rereads
+  the file by itself within seconds, and the flight in the air is undisturbed.**
+  **Traefik, which §7 asserted picks up a changed file, does not**: `watch: true`
+  watches the routing directory and the certificate is mounted outside it, so nothing
+  fires. Mosquitto behaves as documented, on `SIGHUP`.
+
+  Three of the assertions are the ones holding the rest up. The renewal is checked to
+  have issued a *different* serial, without which every later assertion passes while
+  measuring nothing. The publish is checked to have been *authorised* before the
+  renewal, because an earlier version of this ran without db-writer and "the publisher
+  survived" was a statement about ffmpeg retrying a refused connection. And **SIGHUP is
+  asserted to kill MediaMTX**, recorded as a test rather than a warning so that nobody
+  reaches for the obvious symmetry with Mosquitto when writing the renewal hook.
 - **RTMPS, RTSPS and MQTTS — the drone-facing half of the ingress tier** (§7, §8).
   MediaMTX and Mosquitto terminate their own TLS, reading the same leaf Traefik does,
   so a stream key no longer has to cross the internet in plain text. That key is the
@@ -1670,20 +1723,11 @@ above — which is why §8's port table no longer has a "not configured" cell in
   Every row needed is already there (`flights`, `alerts`, `recordings`); what is missing
   is a paged read route and a page, and neither is on the path of anything else.
 - Recorder per-tenant upload prefixes
-- **TLS certificate issue and renewal.** Distinct from the ingress tier, which is now
-  built: this is the ongoing one, and the tier landing is what makes it concrete rather
-  than hypothetical. cert-manager answers issue and renewal for Traefik directly, but
-  MediaMTX and Mosquitto read a certificate from disk, so a renewed Secret has to reach
-  a running process. Traefik picks up a changed file through its watched file provider.
-  Mosquitto rereads its certificates on `SIGHUP`. **MediaMTX's behaviour on a changed
-  cert file has still not been checked**, and if it does not reload, renewal means
-  restarting the media server — which drops every flight in the air.
-
-  It is now the second item in *Where to pick up next* rather than a note down here,
-  because it is a ten-minute experiment while the local CA is fresh
-  (`generate_local_certs.sh --renew-leaf` performs exactly the file swap in question)
-  and the answer is needed before the first real certificate is issued, not before it
-  expires.
+- **TLS certificate issue.** What remains of what used to be "issue and renewal": the
+  issuing half waits on a hostname, since cert-manager cannot ask Let's Encrypt for an
+  IP. Renewal is no longer open — see the reload table in §7 — and the only thing it
+  leaves for the deployment is that a renewal hook must `touch` a file in Traefik's
+  watched dynamic directory, because Traefik alone does not notice a replaced leaf.
 - **Auth-endpoint caching and db-writer replica count.** Every publish and every read
   now costs one indexed lookup here. A short-TTL cache is the obvious fix and the wrong
   one to reach for blindly: it delays revocation of a credential that has no expiry.
