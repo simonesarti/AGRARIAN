@@ -817,7 +817,10 @@ existing ones.
 ## 6. Flight lifecycle
 
 **Every step is now [built], end to end.** Step 6 is verified against a real GPU in both
-modes. What no test reaches is the viewer's browser at the end of it — see §9.
+modes, and step 7 now ends where it was always supposed to: a person signed in, pressed
+Watch, and saw the annotated video play in Chrome and in Firefox. Nothing in this
+lifecycle is unobserved any more — though that last step is a human's report on one
+afternoon rather than an assertion, and §9 says what it does and does not cover.
 
 1. User registers on the portal → row in `users`, and logs in for a session token.
    Registration is open to anyone. **[built]** — the portal's `/register` and `/login`
@@ -1194,28 +1197,32 @@ waits on them and neither is work:**
    and no-data analysis are skipped without it, so a real part of `danger_detection` has
    never executed.
 
-**The ingress tier is finished** — all three terminators, browser side and drone side.
-What follows is what that promotes to the top.
+**The ingress tier is finished, and the product has been watched working in a browser.**
+Between them those closed the three items that stood at the top of this list, so what
+follows is shorter than it has been at any point on this branch — and, for the first
+time, contains nothing that is a *doubt*. Every remaining item is a feature or a
+deployment step, not a question about whether something works.
 
 **Then, in order:**
 
-1. **Load the watch page in a real browser** (`run_watch_live.sh`). Now the cheapest
-   open item by a wide margin *and* the oldest: it needs a person and twenty minutes,
-   no new code, and it is the only thing standing between "the protocol is verified"
-   and "the product works". The page changed after the last run — the HLS button is
-   gone and ICE-TCP is on — so the previous look does not count. Autoplay policy on the
-   `<video>` element is the specific risk.
-2. **The Kubernetes `FlightRuntime` backend** (§2). Mechanical — the interface exists and
+1. **The Kubernetes `FlightRuntime` backend** (§2). Mechanical — the interface exists and
    the Docker backend is the reference — and it retires the orchestrator's hold on the
-   Docker socket, which is the strongest standing argument for making the move.
-3. **Flight history in the portal** (§9, *Open*). The first thing a user will ask for that
+   Docker socket, which is the strongest standing argument for making the move. It is
+   first now mostly because everything ahead of it is done.
+2. **Flight history in the portal** (§9, *Open*). The first thing a user will ask for that
    the system already has the data for. Every row exists; what is missing is a paged read
    route and a page.
 
-Certificate renewal has left this list: it was second and is now answered (§7). The one
-thing it leaves behind is small and belongs with whatever writes the renewal hook —
-**that hook must `touch` a file in Traefik's watched directory**, because Traefik is
-the terminator that does not notice a replaced leaf on its own.
+Three things left this list rather than being completed by it, and the distinction
+matters because each leaves a residue:
+
+- **Certificate renewal** is answered (§7), and leaves one line for whoever writes the
+  deployment hook: **it must `touch` a file in Traefik's watched directory**, because
+  Traefik is the terminator that does not notice a replaced leaf on its own.
+- **The watch page** has been loaded in Chrome and Firefox and the video plays, which
+  was the whole question. It leaves the smaller half of that item behind — see *Open*.
+- **The ingress tier** is built on both sides. It leaves the choice of when to make TLS
+  compulsory, which is below and is not work.
 
 Not on that list, and worth saying why: **making TLS compulsory on the drone side.**
 Every encrypted listener now exists, and the plaintext ones remain by design (§7, §8).
@@ -1230,6 +1237,23 @@ billing).
 
 ### Built and tested
 
+- **A person watched the annotated video play, in Chrome and in Firefox** (§6 step 7,
+  2026-08-03). The oldest open item on this branch, and the only one no automated test
+  could ever reach. `run_watch_live.sh` put a real flight in the air on a real GPU;
+  signing in at the portal and pressing **Watch** produced moving video in both engines.
+
+  This is a **human observation, not an assertion**, and it is listed here rather than
+  quietly folded into the playback entry below because the distinction is the whole
+  point of the item: everything underneath was already verified — WHEP returns 201, a
+  real client decodes 1920×1080, the URL shape is pinned by 88 assertions — and none of
+  that answered whether a browser would show a picture. It now has, once, on one
+  afternoon. Nothing re-checks it, so a change to `watch.js` or the `<video>` element
+  can break it silently; that is the price of the only claim here a machine cannot make.
+
+  What it settles is the specific risk §9 had been carrying: **autoplay policy**. The
+  element is `autoplay muted playsinline`, muted being what makes autoplay legal without
+  a click, and both Blink and Gecko accepted it. What it does not settle is the rest of
+  the page — see *Open*, which is now two corners rather than the whole thing.
 - **Certificate renewal, on all three terminators** (§7). The open item with a deadline
   attached — the answer was needed before the first real certificate was issued, not
   before it expired — settled by 15 assertions in `run_cert_renewal.sh`, which issues a
@@ -1713,11 +1737,14 @@ above — which is why §8's port table no longer has a "not configured" cell in
   already routes HLS through it). The ingress tier they were waiting on now exists, so
   what is left gating them is a reason: neither is worth building before a real user
   reports being unable to watch.
-- **No browser has loaded the finished watch page.** The playback path itself is now
-  verified — see the entry below — but by a WHEP client and `ffprobe`, not by Chrome or
-  Firefox. What remains unproven is the page around it: autoplay policy on a `<video>`
-  element, whether the alert aside renders as intended, and behaviour on a phone. That
-  needs a human and `run_watch_live.sh`, and it is a UI risk rather than a protocol one.
+- **Two corners of the watch page are still unobserved.** The video itself is not one
+  of them any more — it plays in Chrome and in Firefox (see *Built and tested*), which
+  retires autoplay policy as the risk this item was mostly about. What nobody has
+  watched is **the alert aside rendering a real alert in a browser**, and **the page on
+  a phone**. Both are UI rather than protocol: the socket, the fan-out and the escaping
+  are all tested, and `run_portal.sh` asserts the markup, but "asserted" and "looks
+  right at 390px wide" are different claims. `run_watch_live.sh` prints a `redis-cli
+  PUBLISH` line for exactly the first one, so it costs a paste rather than a setup.
 - **No flight history.** The portal shows what is airborne now and nothing that has
   landed, so recordings and past alerts are in the database and unreachable from the UI.
   Every row needed is already there (`flights`, `alerts`, `recordings`); what is missing

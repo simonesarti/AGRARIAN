@@ -495,13 +495,21 @@ real broker enforcing the real ACLs.
 
 Playback is verified too, though not by these scripts. HLS with `?jwt=` serves H.264
 1920×1080 (`ffprobe`), and a real WHEP client (`aiortc`) gets a 201 and decodes 1920×1080
-frames. What that leaves is the *page* rather than the protocol — autoplay policy, the
-alert aside, small screens — which is what `run_watch_live.sh` is for.
+frames. What that leaves is the *page* rather than the protocol — the alert aside and
+small screens — which is what `run_watch_live.sh` is for. Autoplay policy used to be on
+that list and is not any more: the video has been watched playing in Chrome and Firefox
+(2026-08-03).
 
 **`run_watch_live.sh [host]`** — not a test. It stands the whole product up, puts a real
 flight in the air, prints a URL and waits for you to look at it. Use it for anything that
-needs a browser. Note that it runs the portal with `COOKIE_SECURE=false`, which is the
-only way it works at all until the ingress tier exists.
+needs a browser. Nothing it shows you is re-checked afterwards, which is the point and
+also the caveat: a human confirmation does not become a regression test, so a change to
+`watch.js` can break the picture silently.
+
+It runs the portal with `COOKIE_SECURE=false`. That is now a choice rather than a
+necessity — Traefik exists — and the reason is in the runner's own header: a locally
+issued CA the browser does not trust turns "does the video play?" into a click-through
+warning and a WebRTC failure that has nothing to do with the page.
 
 The recording upload path is verified for the `local` storage backend
 (`run_recording_upload.sh`). The `azure` and `aws` backends in `recorder/main.py` are
