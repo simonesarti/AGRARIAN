@@ -31,6 +31,7 @@ try to run these directly with `python3`.
 | `run_mqtt_auth.sh` | mosquitto-go-auth + db-writer + Postgres | `./run_mqtt_auth.sh` |
 | `run_portal_auth.sh` | Postgres + 2 db-writer replicas | `./run_portal_auth.sh` |
 | `run_portal.sh` | Postgres + Redis + db-writer + 2 portal replicas | `./run_portal.sh` |
+| `run_traefik_tls.sh` | the above + ws-server + MediaMTX behind a real Traefik | `./run_traefik_tls.sh` |
 | `run_orchestrator_recovery.sh` | the same as `run_orchestrator.sh` | `./run_orchestrator_recovery.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
@@ -109,7 +110,18 @@ docker run --rm -v "$PWD/db_writer:/dbw" -v "$PWD/tests/comms:/tests:ro" \
 ./run_recording_upload.sh    # 8 assertions, real segment upload + DB traceability
 ./run_mqtt_auth.sh           # 9 assertions, real mosquitto-go-auth broker
 ./run_orchestrator_recovery.sh  # 13 assertions, real crash + restart
+./run_traefik_tls.sh         # 22 + 8 assertions, the ingress tier over real TLS
 ```
+
+`run_traefik_tls.sh` is the only runner that speaks HTTPS rather than working around
+it. Every other one drives the portal over plain HTTP with `COOKIE_SECURE` left on,
+which asserts the cookie's *attributes* but never that a browser would send it back —
+a `Secure` cookie is not returned over `http://`. This one issues a certificate from
+the local CA, puts the repo's own Traefik configuration in front of a real portal,
+ws-server and MediaMTX, and drives the whole thing through the proxy.
+
+`PORTAL_HOPS=0 ./run_traefik_tls.sh` fails exactly one assertion — the two-client
+rate-limit bucket — and is how that assertion is kept honest.
 
 `run_mediamtx_auth.sh` needs `ffmpeg` and `curl` **on the host** and binds host ports
 11935/18888/18002 so it cannot collide with a running compose stack. If a previous run

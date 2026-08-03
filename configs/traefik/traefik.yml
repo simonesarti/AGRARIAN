@@ -1,0 +1,92 @@
+# Traefik — static configuration (read once at startup).
+#
+# The L7 half of the ingress tier in CLOUD_ARCHITECTURE.md §7. It terminates TLS
+# for the HTTP-family services only: the portal, MediaMTX's HLS and WHEP
+# signalling, and ws-server's viewer WebSocket.
+#
+# WHAT IT MUST NOT TOUCH
+# ----------------------
+# WebRTC *media* on 8189 (UDP and TCP alike) is end-to-end DTLS-SRTP between the
+# browser and MediaMTX and must never be proxied — §8 says so in the table and it
+# is not a preference: proxying it would terminate the encryption the media path
+# is built on. 8189 stays published straight from the mediamtx service in
+# docker-compose.yml. Only WHEP *signalling* comes through here.
+#
+# RTMPS (1936) and MQTTS (8883) are likewise not here. Traefik can do TCP routers
+# with SNI, so it could carry them — but MediaMTX and Mosquitto terminate their own
+# TLS deliberately, to preserve the client identity their auth hooks and ACLs depend
+# on (§7). Those are the next two pieces of the ingress tier, not this one.
+#
+# ONE ENTRYPOINT PER UPSTREAM, AND NO Host RULES
+# ----------------------------------------------
+# The obvious design is a single :443 with Host(`portal.example.com`) routing. That
+# is where this ends up, and it is deliberately NOT where it starts: there is no
+# hostname yet — that is the open ask at the top of §9 — and a Host rule cannot be
+# written against a name that does not exist. Dedicated entrypoints route on port
+# alone, so the stack works reachable as https://<ip>/ today, which is what
+# MEDIAMTX_HOST actually holds.
+#
+# The port numbers are also the ones §8 already publishes, so the portal's URL
+# composition needs no change at all: it flips http->https and ws->wss from
+# PUBLIC_TLS and keeps its existing ports.
+#
+# When a hostname lands, add Host rules to the routers in dynamic/routers.yml and
+# collapse the entrypoints onto :443. Nothing else moves.
+
+entryPoints:
+  # The portal. §8's 443 row.
+  websecure:
+    address: ":443"
+
+  # MediaMTX HLS. Kept on its own port rather than merged into 443 because §9's
+  # only-443 item is a separate, later decision that wants the hostname first.
+  hls:
+    address: ":8888"
+
+  # MediaMTX WHEP signalling. The offer/answer exchange only — the media that
+  # follows does not come back through here.
+  whep:
+    address: ":8889"
+
+  # ws-server's viewer WebSocket. §8 puts WSS on 443 alongside the portal; that
+  # needs a second hostname to route on, so it waits for the same thing every
+  # Host rule waits for.
+  wss:
+    address: ":8765"
+
+providers:
+  file:
+    directory: /etc/traefik/dynamic
+    # Routers and certificates can then change without restarting Traefik, which
+    # is the property the certificate-renewal question in §9 turns on. Whether
+    # MediaMTX does the same for its own certificate is still unknown.
+    watch: true
+
+# No dashboard and no API. It would be one more thing listening, and there is
+# nothing here a person needs to click.
+api:
+  dashboard: false
+
+log:
+  level: INFO
+
+# Off, and not by omission. Every viewer token travels in a query string —
+# WebSocket handshakes cannot carry headers (§3) — so an access log here would
+# accumulate live credentials in a file nobody is thinking about. The same
+# reasoning already bounds VIEWER_TOKEN_TTL_S. Turn it on for a specific
+# investigation, with a filter, and turn it off again.
+accessLog: ~
+
+# ACME lands here when a hostname resolves to this deployment. It is deliberately
+# absent rather than commented-in-and-broken: Let's Encrypt will not issue for an
+# IP, so an issuer configured now would fail on every start and teach nothing.
+# Until then certificates come from scripts/generate_local_certs.sh, and the
+# handover is one block here plus one line per router.
+#
+# certificatesResolvers:
+#   letsencrypt:
+#     acme:
+#       email: <ops address>
+#       storage: /etc/traefik/acme/acme.json
+#       dnsChallenge:
+#         provider: <registrar>     # DNS-01, because a wildcard needs it

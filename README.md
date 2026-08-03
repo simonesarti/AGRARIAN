@@ -259,31 +259,39 @@ The app detects engine files at startup and switches to engine mode automaticall
 | ---- | -------- | --------- | ------- |
 | 8554 | RTSP | inbound | MediaMTX: drone video publish + app raw stream pull |
 | 1935 | RTMP | inbound | MediaMTX: app annotated stream push |
-| 8888 | HTTP | inbound | MediaMTX: HLS playback |
-| 8889 | HTTP | inbound | MediaMTX: WebRTC/WHEP signalling |
+| 8888 | HTTPS | inbound | Traefik → MediaMTX: HLS playback |
+| 8889 | HTTPS | inbound | Traefik → MediaMTX: WebRTC/WHEP signalling |
 | 8189 | UDP | inbound | MediaMTX: WebRTC media (DTLS-SRTP, never proxied) |
 | 8189 | TCP | inbound | MediaMTX: WebRTC media over ICE-TCP, for networks that block UDP |
 | 1883 | MQTT | inbound | Mosquitto: drone telemetry + app subscription |
-| 8003 | HTTP | inbound | portal: the account pages |
-| `WS_PORT` | WS | inbound | ws-server: WebSocket alert stream |
+| 443 | HTTPS | inbound | Traefik → portal: the account pages |
+| `WS_PORT` | WSS | inbound | Traefik → ws-server: WebSocket alert stream |
 | 8001 | HTTP | inbound | ws-server HTTP API (app POSTs alerts here) |
 | 8002 | HTTP | inbound | db-writer HTTP API (app POSTs alerts here) |
 
 8001 and 8002 are internal-only in the target topology; they are published here for the
 split deployment below, where the app runs on a separate machine.
 
+**Run `./scripts/generate_local_certs.sh` once before `docker compose up`.** Traefik
+terminates TLS for the portal, HLS, WHEP and the WebSocket, and it needs a certificate;
+that script issues one from a local CA, which stands in for cert-manager until a real
+hostname exists. Trust `certificates/ca/ca.crt` in the browser to avoid a warning page.
+
+The drone-facing ports — RTSP 8554, RTMP 1935 and MQTT 1883 — are **still in the clear**.
+RTMPS, RTSPS and MQTTS are the next piece of the ingress tier.
+
 ### Access URLs
 
 The portal composes the playback URLs itself, with a per-flight token attached — sign in at
-`http://<comms-host>:8003` and use the **Watch** button rather than building these by hand.
+`https://<comms-host>/` and use the **Watch** button rather than building these by hand.
 Listed for debugging:
 
 | Resource | URL |
 | -------- | --- |
-| Portal | `http://<comms-host>:8003` |
-| HLS playback | `http://<comms-host>:8888/<output-path>/index.m3u8?jwt=<viewer-token>` |
-| WebRTC playback | `http://<comms-host>:8889/<output-path>/?jwt=<viewer-token>` |
-| WebSocket alerts | `ws://<comms-host>:${WS_PORT}/?token=<viewer-token>` |
+| Portal | `https://<comms-host>/` |
+| HLS playback | `https://<comms-host>:8888/<output-path>/index.m3u8?jwt=<viewer-token>` |
+| WebRTC playback | `https://<comms-host>:8889/<output-path>/whep?jwt=<viewer-token>` |
+| WebSocket alerts | `wss://<comms-host>:${WS_PORT}/?token=<viewer-token>` |
 
 `<output-path>` is the per-flight path assigned when the flight opens; a viewer token is
 scoped to one flight and expires. Both come from the portal.

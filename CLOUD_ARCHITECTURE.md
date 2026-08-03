@@ -167,7 +167,7 @@ topology and the security model agree.
 
 Kubernetes does **not** reverse-proxy anything itself: `Ingress` and the Gateway API are
 interfaces, and a controller has to be installed to implement them. That controller is
-Traefik here, and it is the same Traefik the compose stack will run, which is why the
+Traefik here, and it is the same Traefik the compose stack already runs, which is why the
 routing config survives the migration rather than being rewritten into a vendor's
 annotations. Nothing in the design depends on Traefik specifically — see §7.
 
@@ -893,7 +893,7 @@ users and ACLs, per-flight JWTs, the session cookie) is built and tested. So eve
 credential in the system currently crosses the internet in the clear, which is the single
 largest gap between this section and the running stack.
 
-### TLS termination **[designed]**
+### TLS termination **[Traefik built; MediaMTX and Mosquitto designed]**
 
 Two layers, split by protocol.
 
@@ -944,11 +944,43 @@ leaving cert-manager to be run anyway for the other two: two issuance mechanisms
 would do. cert-manager writing into Secrets that all three services mount is that one
 mechanism.
 
-**Nothing in this subsection exists yet.** There is no Traefik service in
-`docker-compose.yml`, `configs/mediamtx/mediamtx.yaml` configures no encryption on any
-listener, and Mosquitto's MQTTS block is commented out. Every public-facing protocol in the
-running stack is currently in the clear, and the portal's own `PORTAL_COOKIE_SECURE` /
-`PORTAL_PUBLIC_TLS` defaults assume a terminator that has not been deployed. See §9.
+**The browser-facing half of this subsection now exists; the drone-facing half does
+not.** Traefik is in `docker-compose.yml` with its configuration in `configs/traefik/`,
+terminating HTTPS and WSS for the portal, HLS, WHEP signalling and the viewer
+WebSocket — the four services a browser touches. `PORTAL_COOKIE_SECURE` and
+`PORTAL_PUBLIC_TLS` therefore describe a deployment that exists, which closes the
+"no working configuration" corollary in §8.
+
+Still in the clear: `configs/mediamtx/mediamtx.yaml` configures no encryption on the
+RTMP or RTSP listener, and Mosquitto's MQTTS block is still commented out. Those are
+the two terminators that handle their own TLS, and they carry the drone's credentials
+— a stream key on the video plane and the same key as an MQTT password on the
+telemetry one. **A stream key still crosses the internet in plain text.** See §9.
+
+#### Certificates before a hostname exists **[built]**
+
+cert-manager cannot issue anything until a name resolves here, and that is an
+external ask with lead time (§9). It is not, however, a reason to wait: all three
+terminators read a certificate and a key from disk and none of them knows who signed
+it. Public trust is only worth anything for a browser somebody else controls, and
+there is not one of those yet.
+
+`scripts/generate_local_certs.sh` therefore stands in for cert-manager — a local CA
+plus one wildcard leaf covering `<domain>`, `*.<domain>`, `localhost` and the host's
+own IP, since `MEDIAMTX_HOST` holds an IP today. One leaf serves all three
+terminators, and it is named `server.crt`/`server.key` because that is what
+`mosquitto.conf`'s commented-out block already expects.
+
+Two details are deliberate rather than convenient. The leaf lasts **397 days**, the
+browser maximum, rather than the decade a throwaway local certificate usually gets: a
+certificate that never expires is a way to never discover the renewal problem below.
+And `--renew-leaf` reissues against the same CA without touching it, which is exactly
+the file swap the MediaMTX reload question needs — the CA stays installed in whatever
+trust store already has it.
+
+When a hostname lands, the ACME block at the foot of `configs/traefik/traefik.yml`
+replaces the script. Nothing else in the stack changes, which is the property that
+made building the tier before owning a domain worth doing.
 
 ### In-cloud traffic
 
@@ -988,33 +1020,48 @@ which is not yet the target — see the TLS item in §9.
 | 1936 | RTMPS | MediaMTX | **not configured** |
 | 8554 | RTSP (fallback only) | MediaMTX | published, in the clear |
 | 8322 | RTSPS | MediaMTX | **not configured** |
-| 8888 | HLS | Traefik | published direct, plain HTTP |
-| 8889 | WebRTC / WHEP signalling | Traefik | published direct, plain HTTP |
-| 8189/udp | WebRTC media | End-to-end DTLS-SRTP — **must not be proxied** | published |
-| 8189/tcp | WebRTC media over ICE-TCP | End-to-end DTLS-SRTP — **must not be proxied** | published |
+| 8888 | HLS | Traefik | **HTTPS through Traefik** |
+| 8889 | WebRTC / WHEP signalling | Traefik | **HTTPS through Traefik** |
+| 8189/udp | WebRTC media | End-to-end DTLS-SRTP — **must not be proxied** | published direct |
+| 8189/tcp | WebRTC media over ICE-TCP | End-to-end DTLS-SRTP — **must not be proxied** | published direct |
+| 8765 | WSS — the viewer's alert WebSocket | Traefik | **WSS through Traefik** |
 | 1883 | MQTT (fallback only) | Mosquitto | published, in the clear |
 | 8883 | MQTTS | Mosquitto | **commented out** in `mosquitto.conf` |
-| 443 | HTTPS + WSS — includes the portal | Traefik | **no Traefik service exists** |
+| 443 | HTTPS — the portal | Traefik | **HTTPS through Traefik** |
 
 The plain-text ports are labelled *fallback only* because that is their designed role —
 drones without TLS support (§7). Today they are not a fallback but the only path, since no
-encrypted listener is configured on any of the three.
+encrypted listener is configured on any of the three. **This is now the whole of the
+remaining gap**: the browser reaches everything over TLS, and the drone reaches nothing
+over it.
 
-In compose the portal is published on **8003** and speaks plain HTTP; 443 and the
-certificate are the ingress tier's in a real deployment. Two variables exist for the gap
-between those worlds, `PORTAL_COOKIE_SECURE` and `PORTAL_PUBLIC_TLS`, and both default to
-on. Turning them off is a local-HTTP affordance and nothing else: a `Secure` cookie is
-simply not returned over `http://`, so the symptom of leaving one off in production is not
-an error but a login that appears to work and then forgets the user. The corollary is that
-with the defaults on and no terminator deployed, **the portal has no working configuration
-today** — either the cookie never comes back, or it runs with the local-only affordance
-enabled in production.
+Traefik publishes the four ports its upstreams used to publish themselves, and those
+four no longer publish at all — the portal, HLS, WHEP and the viewer WebSocket are
+reachable only through it. Leaving a direct publish in place would have been a
+plaintext path around the terminator, which is the one thing a terminator cannot
+tolerate. 8189 is the deliberate exception and must stay one.
 
-`PORTAL_TRUSTED_PROXY_HOPS` must count the *real* hops between the browser and the portal,
-which is a deployment fact and not a property of any product name. An L4 load balancer with
-source-IP preservation adds none, so a browser → LB → Traefik → portal path is 1; a cloud
-L7 LB in front of Traefik would make it 2. Counting too high is the dangerous direction —
-the client then names its own rate-limit bucket (§4).
+`PORTAL_COOKIE_SECURE` and `PORTAL_PUBLIC_TLS` both default on and now describe the
+deployment that exists. Turning them off is a local-HTTP affordance and nothing else: a
+`Secure` cookie is simply not returned over `http://`, so the symptom of leaving one off
+in production is not an error but a login that appears to work and then forgets the user.
+That used to leave the portal with **no working configuration at all** — either the
+cookie never came back or the local-only affordance ran in production. The Secure cookie
+is now asserted to survive a real round trip over real TLS (§9).
+
+`PORTAL_TRUSTED_PROXY_HOPS` **defaults to 1 rather than 0** for the same reason, and
+the change is not cosmetic. Traefik is now the peer address the portal sees, so at 0 the
+rate limiter counts every client on the internet into a single bucket and one attacker
+locks out everybody. This is the *low* side of a variable whose documented danger has
+always been the high side, and both directions are now covered: a forged
+`X-Forwarded-For` is ignored, and two clients on different addresses are shown to hold
+separate buckets (§9).
+
+It must count the *real* hops between the browser and the portal, which is a deployment
+fact and not a property of any product name. An L4 load balancer with source-IP
+preservation adds none, so a browser → LB → Traefik → portal path is 1; a cloud L7 LB in
+front of Traefik would make it 2. Counting too high lets the client name its own
+rate-limit bucket (§4); counting too low collapses every client into one.
 
 Internal only — **must never be routed from outside**: ws-server's alert-write API port,
 db-writer, Redis, the recorder, and the orchestrator.
@@ -1057,22 +1104,28 @@ or otherwise, arriving without the history.
 waits on them and neither is work:**
 
 1. **A hostname and control of its DNS.** Let's Encrypt will not issue a certificate for an
-   IP address, and `MEDIAMTX_HOST` is an IP today. Nothing in the ingress tier can be built
-   until a name resolves to this deployment.
+   IP address, and `MEDIAMTX_HOST` is an IP today. What this gates is narrower than it
+   first appeared: **only ACME issuance**, not the ingress tier. Traefik, the TLS
+   listeners and the renewal question all read a certificate from disk and do not care
+   who signed it, so they were built against a local CA
+   (`scripts/generate_local_certs.sh`) and the handover is one config block. What a real
+   name buys is a browser somebody else controls — which is why it is still worth
+   starting now and not urgent to finish. Prefer a registrar whose DNS has an API
+   cert-manager supports: the tier wants a wildcard, and a wildcard needs DNS-01.
 2. **A DEM raster covering the operating area** (`dem/dem.tif`, `dem/dem_mask.tif`). Slope
    and no-data analysis are skipped without it, so a real part of `danger_detection` has
    never executed.
 
 **Then, in order:**
 
-1. **The ingress tier** (§7, *Designed, not built*). The largest gap between this document
-   and the branch: every public credential — stream keys, session cookies, viewer tokens,
-   MQTT passwords — crosses the wire in the clear right now, and the portal's own defaults
-   (`COOKIE_SECURE`, `PUBLIC_TLS`) describe a deployment that does not exist. Four concrete
-   pieces: a `traefik` service with routers for the portal, HLS and WHEP; `encryption` plus
-   cert paths on MediaMTX's RTMP/RTSP listeners; Mosquitto's commented-out MQTTS listener;
-   and an issuer. Do it in that order — Traefik first, because it is the only one of the
-   four that terminates for a protocol already being used by a browser.
+1. **Finish the ingress tier** (§7). Traefik is built and the browser now reaches
+   everything over TLS; the drone reaches nothing over it. Two pieces remain, and they
+   are the two terminators that handle their own TLS: `encryption` plus cert paths on
+   MediaMTX's RTMP/RTSP listeners, and Mosquitto's commented-out MQTTS listener. Both
+   read the leaf `scripts/generate_local_certs.sh` already writes, so neither waits on a
+   hostname either. **A stream key is still typed into a drone controller and sent in
+   plain text**, which is now the largest single gap between this document and the
+   branch. MediaMTX first — it carries the credential that is also the ingest path.
 2. **Load the watch page in a real browser** (`run_watch_live.sh`). The cheapest open item
    by a wide margin: it needs a person and twenty minutes, no new code, and it is the only
    thing standing between "the protocol is verified" and "the product works". The page
@@ -1097,6 +1150,46 @@ billing).
 
 ### Built and tested
 
+- **Traefik, terminating TLS for everything a browser touches** (§7, §8). The portal,
+  HLS, WHEP signalling and the viewer WebSocket are now reachable only over HTTPS/WSS
+  through `configs/traefik/`, and the four upstreams no longer publish a port of their
+  own — a direct publish would have been a plaintext path around the terminator. 8189
+  stays published and unproxied, because WebRTC media is end-to-end DTLS-SRTP and
+  proxying it would terminate the encryption the media path is built on.
+
+  Certificates come from `scripts/generate_local_certs.sh` rather than from ACME, and
+  that is what made the work possible before the hostname arrives: all three terminators
+  read a key from disk and none asks who signed it.
+
+  Verified by 30 assertions in `run_traefik_tls.sh` — the repo's own Traefik
+  configuration in front of a real portal, ws-server, MediaMTX, db-writer and
+  PostgreSQL. Three are worth naming:
+
+  - **The Secure session cookie survives a real round trip.** This is the §8 corollary
+    finally discharged. Every other runner drives the portal over plain HTTP with
+    `COOKIE_SECURE` left on, which asserts the cookie's *attributes* and never that a
+    browser would send it back — and a `Secure` cookie is not returned over `http://`.
+    Here it is set over TLS and accepted on the next request.
+  - **Two clients hold two rate-limit buckets.** `PORTAL_TRUSTED_PROXY_HOPS` had to
+    change from 0 to 1 the moment a proxy landed, because the peer address the portal
+    sees is now always Traefik's. Confirmed non-vacuous by `PORTAL_HOPS=0`, which fails
+    exactly this assertion and nothing else. The existing danger — a hop count set too
+    *high* — is covered separately by a forged `X-Forwarded-For` that mints no fresh
+    bucket.
+  - **A client without the CA is refused.** Asserted alongside the successful one, since
+    a TLS test that passes against any certificate is asserting nothing. The TLS floor is
+    pinned the same way: 1.2 and 1.3 accepted, 1.1 refused.
+
+  Two assertions failed on the first run and both were the test's fault, in ways the
+  document had already warned about. HLS answered 302 because MediaMTX redirects to
+  `?cookieCheck=1` *before* it authenticates (§4) and the client refused redirects —
+  the exact trap that section describes. WHEP answered 400 because MediaMTX checks the
+  content type before the credential, so a POST without `application/sdp` never reaches
+  the hook. Driven properly both return 401 from `/auth/mediamtx`, which is what proves
+  the request crossed Traefik rather than dying in it.
+
+  What this does not cover is whether video plays through the proxy: no stream is
+  published, so HLS and WHEP are driven only as far as the authorization decision.
 - **Rate limiting on `/login` and `/register`** (§4). The two endpoints anyone on the
   internet can reach without a credential, and until now the only brake on guessing a
   password was bcrypt's own cost. Verified by 25 assertions inside `run_portal.sh`.
@@ -1414,12 +1507,15 @@ list nearly empty. Everything here that mattered was portal work.
 ### Designed, not built
 
 - Kubernetes `FlightRuntime` backend (create Job, delete Job)
-- **The ingress tier — cloud L4 load balancer, Traefik, cert-manager (§7).** The shape is
-  decided; none of the three pieces is deployed. Concretely missing: a `traefik` service in
-  `docker-compose.yml` with routers for the portal, HLS and WHEP; `encryption` and cert
-  paths on MediaMTX's RTMP/RTSP listeners; Mosquitto's commented-out MQTTS listener; and
-  an issuer. Until it lands, every public protocol runs in the clear and the portal's own
-  defaults describe a deployment that does not exist.
+- **The drone-facing half of the ingress tier (§7).** Traefik is built (see below), so
+  what remains is the two terminators that handle their own TLS: `encryption` and cert
+  paths on MediaMTX's RTMP/RTSP listeners, and Mosquitto's commented-out MQTTS listener.
+  Both read the leaf the local CA already issues, so neither is blocked. Until they land,
+  a stream key — which is also the ingest path, and is typed into a controller before
+  every flight — crosses the internet in plain text.
+- **The cloud L4 load balancer and cert-manager (§7).** Deployment-time pieces with
+  nothing to build locally: the LB is a managed resource and cert-manager replaces
+  `scripts/generate_local_certs.sh` when a hostname resolves here.
 
 ### Open
 

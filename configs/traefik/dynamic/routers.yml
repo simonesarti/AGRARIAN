@@ -1,0 +1,104 @@
+# Traefik — dynamic configuration (watched; edits apply without a restart).
+#
+# Four routers, one per entrypoint, each with the whole entrypoint to itself. The
+# rules are therefore catch-alls: the port has already decided where the request
+# is going. See configs/traefik/traefik.yml for why there are no Host rules yet.
+
+http:
+  routers:
+
+    # ── The portal ────────────────────────────────────────────────────────────
+    # The only service here a person types a URL for, and the only new thing on
+    # the public side. It is also what keeps db-writer off it (§4): the browser
+    # reaches the portal, the portal reaches db-writer over comms-net, and
+    # db-writer is published to the host for the interim laptop deployment only.
+    portal:
+      rule: "PathPrefix(`/`)"
+      entryPoints: [websecure]
+      service: portal
+      tls: {}
+
+    # ── MediaMTX HLS ──────────────────────────────────────────────────────────
+    # MediaMTX answers the first request with a 302 to ?cookieCheck=1 and only
+    # authenticates the followed one (§4). That redirect passes through here
+    # untouched, and passHostHeader (Traefik's default) is what keeps it pointing
+    # at the name the browser used rather than at `mediamtx`.
+    hls:
+      rule: "PathPrefix(`/`)"
+      entryPoints: [hls]
+      service: mediamtx-hls
+      tls: {}
+
+    # ── MediaMTX WHEP signalling ──────────────────────────────────────────────
+    # POST the offer, receive the answer. watch.js gathers every ICE candidate
+    # before sending, so there is no PATCH to route and no long-lived connection
+    # to hold open. The media that follows is DTLS-SRTP direct to 8189 and does
+    # not come back through Traefik.
+    whep:
+      rule: "PathPrefix(`/`)"
+      entryPoints: [whep]
+      service: mediamtx-whep
+      tls: {}
+
+    # ── ws-server's viewer WebSocket ──────────────────────────────────────────
+    # Traefik carries the Upgrade through without configuration. What matters is
+    # which port this is NOT: ws-server's alert-write API (8000 internally, host
+    # 8001) must never be routed from outside (§8), and it has no router here.
+    wss:
+      rule: "PathPrefix(`/`)"
+      entryPoints: [wss]
+      service: ws-server
+      tls: {}
+
+  services:
+
+    portal:
+      loadBalancer:
+        servers:
+          - url: "http://portal:8000"
+        # Traefik appends the client address to X-Forwarded-For, which is the one
+        # hop PORTAL_TRUSTED_PROXY_HOPS must now count. Left at 0 the portal would
+        # fall back to the peer address — Traefik's own — and every client on the
+        # internet would share a single rate-limit bucket, so one attacker locks
+        # everybody out. See docker-compose.yml.
+        passHostHeader: true
+
+    mediamtx-hls:
+      loadBalancer:
+        servers:
+          - url: "http://mediamtx:8888"
+        passHostHeader: true
+
+    mediamtx-whep:
+      loadBalancer:
+        servers:
+          - url: "http://mediamtx:8889"
+        passHostHeader: true
+
+    ws-server:
+      loadBalancer:
+        servers:
+          # ws-server's WebSocket listener, not its alert-write API on 8000.
+          - url: "http://ws-server:8765"
+        passHostHeader: true
+
+tls:
+  stores:
+    default:
+      # One wildcard leaf serves every entrypoint, since none of them routes on a
+      # hostname yet. scripts/generate_local_certs.sh writes these; cert-manager
+      # writes the same two paths into a Secret when this moves to Kubernetes,
+      # which is why the mount point rather than the issuer is what the config
+      # names.
+      defaultCertificate:
+        certFile: /etc/traefik/certs/server.crt
+        keyFile: /etc/traefik/certs/server.key
+
+  options:
+    default:
+      # 1.2 rather than 1.3: some drone ground-station software is old, and this
+      # floor is what the browser-facing services use. TLS 1.0 and 1.1 are
+      # refused outright — asserted in tests/comms/run_traefik_tls.sh, because a
+      # minimum version that is silently not applied looks exactly like one that is.
+      minVersion: VersionTLS12
+      sniStrict: false

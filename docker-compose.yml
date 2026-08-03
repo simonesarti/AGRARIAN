@@ -10,19 +10,25 @@
 #   8001  — ws-server HTTP API (app POSTs alerts)
 #   8002  — db-writer HTTP API (app POSTs alerts)
 #
-# Ports exposed to the viewer:
-#   8888  — MediaMTX HLS
-#   8889  — MediaMTX WebRTC (WHEP signalling)
-#   8189  — MediaMTX WebRTC (ICE/media, UDP and TCP)
-#   ${WS_PORT} — WebSocket alert stream
-#   8003  — portal
+# Ports exposed to the viewer — all TLS, all through Traefik except the last:
+#   443   — portal (HTTPS)
+#   8888  — MediaMTX HLS (HTTPS)
+#   8889  — MediaMTX WebRTC WHEP signalling (HTTPS)
+#   ${WS_PORT} — WebSocket alert stream (WSS)
+#   8189  — MediaMTX WebRTC (ICE/media, UDP and TCP) — NOT proxied, end-to-end
+#           DTLS-SRTP between the browser and MediaMTX
 #
-# NOTHING HERE IS ENCRYPTED. There is no reverse proxy in this file and no TLS
-# listener on MediaMTX or Mosquitto, so stream keys, telemetry credentials and the
-# session cookie all cross the wire in the clear. The target — a cloud L4 load
-# balancer, Traefik terminating HTTPS/WSS, cert-manager issuing for all three
-# terminators — is §7 of CLOUD_ARCHITECTURE.md and is not built. Run this on a
-# trusted network.
+# THE BROWSER-FACING HALF IS NOW ENCRYPTED; THE DRONE-FACING HALF IS NOT.
+# Traefik terminates HTTPS and WSS for the portal, HLS, WHEP and the viewer
+# WebSocket (§7). What is still in the clear is everything a drone touches:
+# RTMP 1935 and RTSP 8554 have no `encryption` block in mediamtx.yaml, and
+# Mosquitto's MQTTS listener is still commented out — so stream keys and
+# telemetry credentials continue to cross the wire in plain text. Those are the
+# next two pieces of the ingress tier. Keep drones on a trusted network.
+#
+# Certificates come from scripts/generate_local_certs.sh, which stands in for
+# cert-manager until a hostname exists — Let's Encrypt will not issue for an IP,
+# and MEDIAMTX_HOST is one. Run it once before `docker compose up`.
 #
 # Recording: MediaMTX records the annotated stream to the 'recordings' volume.
 #            The recorder sidecar uploads each segment on completion.
@@ -41,6 +47,51 @@ volumes:
   recordings:
 
 services:
+
+  # ── Ingress: TLS termination for the HTTP family ──────────────────────────────
+  # The L7 half of §7's ingress tier. It terminates HTTPS and WSS for the portal,
+  # MediaMTX's HLS and WHEP signalling, and ws-server's viewer WebSocket — and
+  # nothing else.
+  #
+  # It publishes the ports those four services used to publish themselves. They no
+  # longer do: reaching them directly would be a plaintext path around the
+  # terminator, which is the thing this service exists to remove.
+  #
+  # 8189 is NOT here and must never be. WebRTC media is end-to-end DTLS-SRTP
+  # between the browser and MediaMTX; proxying it would terminate the encryption
+  # the media path is built on. It stays published by the mediamtx service below.
+  #
+  # No Docker socket. Traefik's usual compose deployment discovers routes from
+  # container labels, which means mounting /var/run/docker.sock into the one
+  # process facing the internet. Routes come from configs/traefik/dynamic/ instead
+  # — the same file provider Kubernetes will use, and one fewer holder of the
+  # socket the orchestrator is already criticised for holding (§9).
+  traefik:
+    image: traefik:v3.3
+    restart: unless-stopped
+    networks: [comms-net]
+    depends_on:
+      portal:
+        condition: service_healthy
+      ws-server:
+        condition: service_healthy
+    ports:
+      - "443:443"                  # portal
+      - "8888:8888"                # MediaMTX HLS
+      - "8889:8889"                # MediaMTX WHEP signalling
+      # WS_PORT now names the port a VIEWER dials, which is this one. Inside the
+      # network the hop is fixed at 8765 on both sides, because traefik.yml is
+      # static YAML with no variable interpolation — a configurable inner port
+      # would be one that silently disagrees with the entrypoint.
+      - "${WS_PORT:-8765}:8765"    # ws-server viewer WebSocket
+    volumes:
+      - ./configs/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./configs/traefik/dynamic:/etc/traefik/dynamic:ro
+      # Written by scripts/generate_local_certs.sh today, mounted from a
+      # cert-manager Secret later. Traefik watches the dynamic directory, so a
+      # renewed leaf is picked up without a restart — the property MediaMTX has
+      # not yet been shown to share (§9).
+      - ./certificates/server:/etc/traefik/certs:ro
 
   # ── Alert fan-out bus ─────────────────────────────────────────────────────────
   # Carries alerts between ws-server replicas so a viewer connected to one replica
@@ -79,10 +130,21 @@ services:
       orchestrator:
         condition: service_started
     ports:
+      # Still in the clear, and still published directly: these are the drone's
+      # ports, and MediaMTX terminates their TLS itself rather than through
+      # Traefik (§7 — it preserves the client identity the auth hook depends on).
+      # RTMPS 1936 and RTSPS 8322 land when mediamtx.yaml gets an `encryption`
+      # block; until then this is the plaintext path the ingress tier has not
+      # closed yet.
       - "8554:8554"       # RTSP  — drone publishes + app pulls raw stream
       - "1935:1935"       # RTMP  — app pushes annotated stream
-      - "8888:8888"       # HLS
-      - "8889:8889"       # WebRTC signalling (WHEP)
+      # HLS (8888) and WHEP signalling (8889) are NOT published here any more.
+      # Traefik terminates TLS for both and reaches them over comms-net; a direct
+      # publish would be a plaintext route around the terminator.
+      #
+      # 8189 is published here and must stay that way. WebRTC media is end-to-end
+      # DTLS-SRTP between the browser and MediaMTX, so it is the one viewer-facing
+      # port Traefik must never carry.
       - "8189:8189/udp"   # WebRTC ICE — actual media flow
       - "8189:8189/tcp"   # WebRTC ICE over TCP — for networks that pass no UDP
     environment:
@@ -156,8 +218,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    ports:
-      - "8003:8000"     # plain HTTP; the ingress tier would forward 443 here
+    # No host publish. Traefik terminates 443 and forwards here over comms-net,
+    # which is what makes the Secure session cookie work at all: a Secure cookie
+    # is not returned over http://, so the plain-HTTP port this used to publish
+    # was a login that appeared to succeed and then forgot you.
     environment:
       DB_WRITER_URL: http://db-writer:8000
       # Backs the rate limits on /login and /register — the two endpoints anyone
@@ -167,9 +231,15 @@ services:
       REDIS_URL: redis://redis:6379/1
       # How many proxies sit in front. It decides which X-Forwarded-For entry is
       # believed, so it must match reality: too high and a client picks its own
-      # rate-limit bucket, or pushes somebody else's to the limit. 0 = trust
-      # nothing, which is right when the portal is reached directly.
-      TRUSTED_PROXY_HOPS: ${PORTAL_TRUSTED_PROXY_HOPS:-0}
+      # rate-limit bucket, or pushes somebody else's to the limit.
+      #
+      # 1, not 0, since Traefik landed. Traefik appends the client address to
+      # X-Forwarded-For and is now the only way in, so the peer address this
+      # process sees is always Traefik's — and at 0 the limiter would count every
+      # client on the internet into a single bucket, where one attacker locks out
+      # everybody. Add one for each further HTTP proxy; an L4 load balancer that
+      # preserves the source address adds none.
+      TRUSTED_PROXY_HOPS: ${PORTAL_TRUSTED_PROXY_HOPS:-1}
       # Hostnames the BROWSER dials, not ones this container dials. Video and
       # alerts go straight from the browser to MediaMTX and ws-server; the portal
       # only composes the URLs.
@@ -201,10 +271,15 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "${WS_PORT:-8765}:${WS_PORT:-8765}"   # WebSocket — viewers connect here (proxy terminates WSS)
-      - "8001:8000"                             # HTTP API — app POSTs alerts here from outside the comms network
+      # The viewer WebSocket is no longer published here — Traefik terminates WSS
+      # on the host and reaches this listener over comms-net.
+      - "8001:8000"     # HTTP API — app POSTs alerts here from outside the comms network
     environment:
-      WS_PORT: ${WS_PORT:-8765}
+      # Fixed, not ${WS_PORT}. This is the inner hop Traefik dials, and it has to
+      # match the entrypoint in the static traefik.yml, which cannot interpolate.
+      # WS_PORT stays the knob for the port a viewer dials; see the traefik
+      # service above.
+      WS_PORT: 8765
       REDIS_URL: redis://redis:6379/0
       # Shared with db-writer, which mints the tokens this validates. No publisher
       # secret here: app containers present a per-flight token db-writer issued them.
