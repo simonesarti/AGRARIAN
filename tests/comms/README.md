@@ -35,6 +35,7 @@ try to run these directly with `python3`.
 | `run_ingress_tls.sh` | MediaMTX + mosquitto-go-auth + db-writer + Postgres | `./run_ingress_tls.sh` |
 | `run_cert_renewal.sh` | the above + Traefik, host `ffmpeg` | `./run_cert_renewal.sh` |
 | `run_orchestrator_recovery.sh` | the same as `run_orchestrator.sh` | `./run_orchestrator_recovery.sh` |
+| `run_k8s_runtime.sh` | Docker only — it brings its own k3s cluster | `./run_k8s_runtime.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
 | `run_watch_live.sh` | **not a test** — the whole product plus a browser | `./run_watch_live.sh [host]` |
@@ -122,6 +123,7 @@ docker run --rm -v "$PWD/db_writer:/dbw" -v "$PWD/tests/comms:/tests:ro" \
 ./run_traefik_tls.sh         # 22 + 9 assertions, the browser's half of the ingress tier
 ./run_ingress_tls.sh         # 42 assertions, the drone's half — RTMPS, RTSPS, MQTTS
 ./run_cert_renewal.sh        # 15 assertions, what each terminator does on renewal
+./run_k8s_runtime.sh         # 65 assertions, the other FlightRuntime backend on real k3s
 ```
 
 `run_traefik_tls.sh` is the only runner that speaks HTTPS rather than working around
@@ -401,6 +403,36 @@ the exited one out in PostgreSQL and remove it, and — the recovered flight isn
 present in a health-check, it still lands normally — tear it down cleanly once the
 drone actually disconnects, same as any flight the orchestrator opened itself.
 
+**`run_k8s_runtime.sh` + `test_k8s_runtime.py`** — the same `FlightRuntime` contract on
+the other backend, against a **real Kubernetes API server**: the runner brings up k3s in
+a container, so this needs nothing but Docker — no cluster, no cloud account, not even
+`kubectl` on the host.
+
+Two sets of credentials, deliberately. `test_k8s_runtime.py` runs holding the
+orchestrator's **own service-account token**, so all 44 of its assertions are
+simultaneously a test of `configs/k8s/orchestrator-rbac.yaml` — a Role missing a verb
+fails as a 403 instead of passing quietly. The runner's own checks use the admin
+kubeconfig, because the Role grants no access to pods on purpose.
+
+The three checks worth knowing about are the ones that would otherwise pass vacuously:
+
+- **`/dev/shm` is 256 MB in a running flight pod**, with the same image in a Job *without*
+  the `emptyDir` as the control — it gets 64 MB, the value that SIGBUSes the annotation
+  worker. Without the control, that line measures Alpine rather than the volume.
+- **`stop()` takes the pod with it.** Rebuilt with `propagation_policy="Orphan"` to
+  confirm the check fails: the Job vanishes and a pod keeps running, owned by nothing.
+- **The RBAC manifest is load-bearing.** Deleting `list` from the Role was confirmed to
+  break `recover()` with a 403.
+
+The GPU limit, node selector and toleration are checked as **spec**, not as a scheduled
+pod — a cluster with no device plugin cannot place a pod that asks for a GPU. That is the
+one gap here, and it closes on the first real cluster.
+
+The eviction thresholds are lowered on the k3s node for an unglamorous reason: the node's
+filesystem *is* the host's, so a developer machine with a fullish disk puts it under
+`DiskPressure` and every flight pod sits `Pending` with an untolerated taint — which looks
+exactly like a broken Job spec and is not.
+
 **`run_orchestrator_real_app.sh [mode]`** — the same lifecycle, but the container the
 orchestrator spawns is the actual GPU app image (`APP_GPUS=all`), with real ws-server,
 Redis, db-writer, Mosquitto, MediaMTX and PostgreSQL behind it. Proves what no other
@@ -484,9 +516,14 @@ that matters: flight 2's viewer must receive **nothing**.
 
 ## Gaps
 
-Mosquitto authorisation is covered (`test_mqtt_auth.py`, `run_mqtt_auth.sh`); MQTTS/TLS
-is not — the listener block in `configs/mosquitto/mosquitto.conf` is commented out and
-unexercised. See `CLOUD_ARCHITECTURE.md` §9 for current status.
+Mosquitto authorisation is covered (`test_mqtt_auth.py`, `run_mqtt_auth.sh`) and so is
+MQTTS — this paragraph used to say the listener was commented out and unexercised, which
+stopped being true when `run_ingress_tls.sh` landed. See `CLOUD_ARCHITECTURE.md` §9 for
+current status.
+
+What is *not* covered on the Kubernetes backend is a GPU: `run_k8s_runtime.sh` has no
+device plugin, so the `nvidia.com/gpu` limit and the node placement settings are checked
+as Job spec rather than as a scheduled pod.
 
 `run_orchestrator_real_app.sh` drives the real GPU app tier through the orchestrator in
 **both** modes — ingest read, pipeline, and annotated-output publish are verified for

@@ -1,0 +1,92 @@
+# The authority the orchestrator needs to run flights, and nothing else.
+#
+# WHY THIS FILE IS THE POINT OF THE KUBERNETES BACKEND
+# ----------------------------------------------------
+# The Docker backend needs /var/run/docker.sock mounted into the orchestrator. That
+# is root on the host: anything that can reach the orchestrator can start a
+# privileged container, mount the host filesystem and read every secret on the
+# machine. CLOUD_ARCHITECTURE.md §9 lists it as a live weakness, and it is the
+# strongest single argument for moving to a cluster.
+#
+# This replaces it. The orchestrator gets a ServiceAccount whose Role permits
+# exactly the six verbs KubernetesFlightRuntime calls, on exactly one resource, in
+# exactly one namespace.
+#
+# Be precise about what that buys, because it is easy to overclaim: a compromised
+# orchestrator can still start GPU workloads — that is its job, and no amount of RBAC
+# takes it away. What it can no longer do is anything else. It cannot read a Secret,
+# create a privileged pod, touch the hub namespace, or reach the node.
+#
+# TWO NAMESPACES ON PURPOSE
+# -------------------------
+# The hub (`agrarian`) and the flights (`agrarian-flights`) are separate so that the
+# grant above is a grant into a namespace the orchestrator does not otherwise live
+# in. One namespace would mean a Role over the namespace holding db-writer, Redis and
+# Mosquitto — which would quietly undo most of what this file is for.
+#
+#   kubectl apply -f configs/k8s/orchestrator-rbac.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agrarian
+  labels:
+    app.kubernetes.io/part-of: agrarian
+---
+# Every flight Job lands here. Nothing else does, which makes `kubectl get jobs -n
+# agrarian-flights` an accurate answer to "what is flying right now" and makes a
+# ResourceQuota on this namespace a real cap on GPU spend (§9, *Open*).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agrarian-flights
+  labels:
+    app.kubernetes.io/part-of: agrarian
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agrarian-orchestrator
+  namespace: agrarian
+---
+# A Role, not a ClusterRole. The distinction is the whole security argument: a
+# ClusterRole with these same verbs would let the orchestrator create Jobs in
+# kube-system, and a Job is an arbitrary pod.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agrarian-flight-runner
+  namespace: agrarian-flights
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    # create/delete   start() and stop()
+    # get             _delete_if_present, and the wait for a stale name to come free
+    # list            list_managed(), which is how recover() rebuilds its bookkeeping
+    #                 after a crash — see the recover() docstring in flights.py
+    # watch           not used today; granted because list without watch produces a
+    #                 client that silently falls back to polling if this ever becomes
+    #                 an informer, and discovering that in production is worse than
+    #                 one extra verb here
+    verbs: ["create", "delete", "get", "list", "watch"]
+
+  # Deliberately absent: pods and pods/log. Reading a flight's logs through the
+  # orchestrator would be convenient and would also make it a way to read the
+  # annotated output of somebody else's flight. Logs are an operator's job with an
+  # operator's credentials, not a service account's.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agrarian-flight-runner
+  namespace: agrarian-flights
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agrarian-flight-runner
+subjects:
+  # The subject lives in the other namespace. This is what makes the grant explicit
+  # and one-directional: the hub reaches into the flight namespace, never the reverse.
+  - kind: ServiceAccount
+    name: agrarian-orchestrator
+    namespace: agrarian

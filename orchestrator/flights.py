@@ -231,9 +231,10 @@ class FlightOrchestrator:
 
     async def recover(self) -> None:
         """
-        Rebuild `_flights` from Docker after a restart. Called once at startup,
-        before the HTTP server accepts requests, so no online/offline hook can
-        race it.
+        Rebuild `_flights` from the runtime after a restart — from Docker's
+        containers or from Kubernetes' Jobs, which is a difference this function
+        does not see. Called once at startup, before the HTTP server accepts
+        requests, so no online/offline hook can race it.
 
         Flight state normally lives only in this process's memory, and shutdown()
         above is what closes it out cleanly — but that only runs on a graceful
@@ -244,10 +245,11 @@ class FlightOrchestrator:
 
         The fix needs no database: PUBLISHER_TOKEN and the stream paths this
         orchestrator itself injected at start() are still sitting in the
-        container's environment, which is the one piece of state a restart
-        cannot lose. A still-running container IS the flight still being
-        active; one that already exited is closed out here instead of by a
-        teardown that is never coming.
+        container's environment — or in the Job spec, which survives for the
+        same reason — and that is the one piece of state a restart cannot lose.
+        A still-running container IS the flight still being active; one that
+        already exited is closed out here instead of by a teardown that is
+        never coming.
         """
         for entry in await asyncio.to_thread(self._runtime.list_managed):
             env = entry["env"]

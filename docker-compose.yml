@@ -348,10 +348,16 @@ services:
       db-writer:
         condition: service_healthy
     volumes:
-      # The Docker backend's whole privilege. Swapped for a service account when the
-      # Kubernetes backend lands.
+      # The Docker backend's whole privilege, and the reason this service is not
+      # exposed. The Kubernetes backend replaces it with a ServiceAccount that may
+      # create Jobs in one namespace — configs/k8s/orchestrator-rbac.yaml — but that
+      # is a cluster deployment, not this file.
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
+      # Pinned rather than left to the default: this stack mounts the Docker socket
+      # above, so the two have to agree. FLIGHT_RUNTIME=kubernetes belongs to a
+      # cluster deployment, where there is no socket to mount.
+      FLIGHT_RUNTIME:    docker
       APP_IMAGE:         ${APP_IMAGE:?set APP_IMAGE in .env — the GPU app image to run per flight}
       DB_WRITER_URL:     http://db-writer:8000
       APP_NETWORK:       comms-net

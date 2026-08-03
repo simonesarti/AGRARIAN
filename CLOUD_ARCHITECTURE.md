@@ -177,24 +177,70 @@ MediaMTX and Mosquitto for the protocols they terminate themselves.
 
 #### Build the orchestrator against an interface, not a cluster **[built]**
 
-The orchestrator targets a two-method abstraction:
+The orchestrator targets a three-method abstraction:
 
 ```python
 class FlightRuntime(Protocol):
     def start(self, flight_id: int, env: dict) -> str: ...   # returns handle
     def stop(self, handle: str) -> None: ...
+    def list_managed(self) -> list: ...                      # for crash recovery
 ```
 
-The **Docker backend** is built and tested — `DockerFlightRuntime`, runnable on a laptop
-against `/var/run/docker.sock`. It unblocked the whole flight lifecycle (stream live →
-hook → container → stream stops → container gone) with no cloud account involved. The
-Kubernetes backend (create Job, delete Job) is a comparable amount of code and lands at
-deployment time.
+**Both backends are now built and tested.** `DockerFlightRuntime` runs on a laptop
+against `/var/run/docker.sock`; it unblocked the whole flight lifecycle (stream live →
+hook → container → stream stops → container gone) with no cloud account involved.
+`KubernetesFlightRuntime` creates one Job per flight and is what makes the scaled-to-zero
+GPU node pool above possible — a Job the cluster cannot place is what causes a machine to
+be created, and a finished Job is what lets one be destroyed.
 
 This was not indecision, and the split held up: the orchestrator's hard part turned out
 to be exactly the lifecycle logic — reconnects, duplicate hooks, failed starts — none of
 which is platform-specific, and all of which is tested against a fake runtime with no
-container daemon in sight.
+container daemon in sight. **`flights.py` did not change by one line when the second
+backend arrived**, which is the claim the design was making and is now evidence rather
+than intent. `FLIGHT_RUNTIME=docker|kubernetes` selects between them.
+
+##### What does not translate, and one thing that nearly didn't
+
+Three settings are genuinely per-backend rather than shared, and pretending otherwise
+would have been worse than admitting it:
+
+- **`APP_GPUS` → `APP_GPU_COUNT`.** Under Docker you name cards on a host you know.
+  Under Kubernetes you request a *count* and the scheduler picks the node, which is the
+  entire point of the node pool. These are different questions, so they are different
+  settings.
+- **`APP_NETWORK` has no analogue.** Pods share a cluster network and find each other by
+  service DNS. The setting is simply absent from the Kubernetes path.
+- **Node selector and GPU toleration have no Docker analogue.** A GPU pool is normally
+  tainted to keep ordinary workloads off it; without a matching toleration every flight
+  sits `Pending` forever, which fails as a flight that never starts rather than as an
+  error.
+
+`APP_SHM_SIZE` is the one that nearly didn't translate, and it is worth recording because
+the failure would have been invisible. The pipeline needs 256 MB of `/dev/shm` — the
+annotation worker takes a silent SIGBUS on the runtime default a few frames in. Docker
+spells that `--shm-size=256m`; Kubernetes has no such field, and the equivalent is a
+memory-backed `emptyDir` mounted at `/dev/shm`, sized with a *quantity* (`256Mi`). One
+`APP_SHM_SIZE` is kept, written in Docker's spelling, and translated. A pod without the
+volume gets 64 MB, which the test measures as a control.
+
+##### The service account is the point **[verified]**
+
+The strongest standing argument for this backend was never scheduling — it was that the
+Docker one holds `/var/run/docker.sock`, which is root on the host. `configs/k8s/orchestrator-rbac.yaml`
+replaces it with a ServiceAccount bound to a **Role** (not a ClusterRole) permitting five
+verbs on `jobs` in one namespace.
+
+Be precise about what that buys, because it is easy to overclaim: **the privilege is not
+reduced, it is scoped.** A compromised orchestrator can still start GPU workloads — that
+is its job. What it can no longer do is read a Secret, create a privileged pod, touch the
+hub's namespace, or reach the node.
+
+`tests/comms/test_k8s_runtime.py` runs **under that service account's own token**, so
+every call in it is simultaneously a test of the manifest: deleting `list` from the Role
+makes `recover()` fail with a 403, which was checked rather than assumed. The runner adds
+the other direction — eight `kubectl auth can-i` probes, three affirmative and five
+refusals.
 
 ---
 
@@ -1197,23 +1243,27 @@ waits on them and neither is work:**
    and no-data analysis are skipped without it, so a real part of `danger_detection` has
    never executed.
 
-**The ingress tier is finished, and the product has been watched working in a browser.**
-Between them those closed the three items that stood at the top of this list, so what
-follows is shorter than it has been at any point on this branch — and, for the first
-time, contains nothing that is a *doubt*. Every remaining item is a feature or a
-deployment step, not a question about whether something works.
+**The ingress tier is finished, the product has been watched working in a browser, and
+both `FlightRuntime` backends exist.** Between them those closed the four items that
+stood at the top of this list, so what follows is shorter than it has been at any point
+on this branch — and, for the first time, contains nothing that is a *doubt*. Every
+remaining item is a feature or a deployment step, not a question about whether something
+works.
 
 **Then, in order:**
 
-1. **The Kubernetes `FlightRuntime` backend** (§2). Mechanical — the interface exists and
-   the Docker backend is the reference — and it retires the orchestrator's hold on the
-   Docker socket, which is the strongest standing argument for making the move. It is
-   first now mostly because everything ahead of it is done.
-2. **Flight history in the portal** (§9, *Open*). The first thing a user will ask for that
+1. **Flight history in the portal** (§9, *Open*). The first thing a user will ask for that
    the system already has the data for. Every row exists; what is missing is a paged read
    route and a page.
+2. **Manifests for the hub tier.** The orchestrator's half of the migration is done and
+   the flight namespace exists; the eight hub services are still compose-only. §2 calls
+   this mechanical and it is — every service already takes its configuration from the
+   environment — with the one real difference being that MediaMTX and Mosquitto need
+   `LoadBalancer` services carrying TCP and UDP rather than an HTTP Ingress. **This is
+   only worth starting when a cluster is actually being paid for**, which is why it is
+   below a feature a user can see.
 
-Three things left this list rather than being completed by it, and the distinction
+Four things left this list rather than being completed by it, and the distinction
 matters because each leaves a residue:
 
 - **Certificate renewal** is answered (§7), and leaves one line for whoever writes the
@@ -1223,6 +1273,13 @@ matters because each leaves a residue:
   was the whole question. It leaves the smaller half of that item behind — see *Open*.
 - **The ingress tier** is built on both sides. It leaves the choice of when to make TLS
   compulsory, which is below and is not work.
+- **The Kubernetes `FlightRuntime` backend** is built, and with it the service account
+  that retires the Docker socket (§2). It leaves the rest of the migration — the hub
+  services have no manifests — which is item 2 above rather than a residue of this one.
+  It also leaves a knob this platform offers and Docker does not: `activeDeadlineSeconds`
+  would cap a single flight's GPU hours. It is deliberately unset, because a backend that
+  ends flights the other one would not is a backend the abstraction no longer hides. It
+  belongs with quota (*Open*), not here.
 
 Not on that list, and worth saying why: **making TLS compulsory on the drone side.**
 Every encrypted listener now exists, and the plaintext ones remain by design (§7, §8).
@@ -1237,6 +1294,34 @@ billing).
 
 ### Built and tested
 
+- **The Kubernetes `FlightRuntime` backend, against a real API server** (§2, 2026-08-03).
+  `KubernetesFlightRuntime` creates one Job per flight; `FLIGHT_RUNTIME` selects it.
+  `tests/comms/run_k8s_runtime.sh` — **65 assertions** — stands up a k3s cluster in a
+  container and drives the real thing: a real API server, a real scheduler, a real
+  kubelet. No mock has an opinion about whether a Job spec is schedulable.
+
+  The result that matters most is the one that cost nothing to state and would have cost
+  a lot to miss: **`flights.py` did not change**. Reconnects, duplicate hooks, failed
+  starts and crash recovery all run unmodified on the second backend, which is what §2
+  claimed in advance and can now stop claiming.
+
+  Three properties were **falsified rather than asserted**, because each is the kind that
+  passes vacuously:
+
+  - `/dev/shm` is 256 MB in a running flight pod. The control is the same image in a Job
+    without the `emptyDir`: **64 MB**, the value that SIGBUSes the annotation worker.
+    Without the control this measures Alpine, not the volume.
+  - `stop()` removes the pod, not just the Job. Rebuilt with `propagation_policy="Orphan"`
+    and confirmed the check fails — the Job disappears and a pod keeps running with
+    nothing owning it, which on a GPU node pool is the most expensive mistake in the file.
+  - The RBAC manifest is load-bearing. The test holds the orchestrator's **own service
+    account token**, so removing `list` from the Role was confirmed to fail `recover()`
+    with a 403 rather than passing quietly under admin credentials.
+
+  Not covered, and it is the obvious gap: **there was no GPU and no device plugin.** The
+  `nvidia.com/gpu` limit, the node selector and the toleration are checked as spec — the
+  Job body the API server would receive — because a cluster with no GPU cannot schedule a
+  pod that asks for one. The first real cluster is where those three stop being spec.
 - **A person watched the annotated video play, in Chrome and in Firefox** (§6 step 7,
   2026-08-03). The oldest open item on this branch, and the only one no automated test
   could ever reach. `run_watch_live.sh` put a real flight in the air on a real GPU;
@@ -1652,9 +1737,16 @@ work that has yet to start.
   supported degraded mode rather than a fault — the harness reports which of the two it
   got — but no test has yet driven a real elevation raster through `extract_dem_window`
   and the window cache.
-- **The orchestrator holds the Docker socket.** Anything that can reach its port can
-  start containers on the host. Its port is internal-only, but this is the strongest
-  argument for the Kubernetes backend, where the equivalent is a scoped service account.
+- **The orchestrator holds the Docker socket — under the backend this repo runs.**
+  Anything that can reach its port can start containers on the host. Its port is
+  internal-only, and this was the strongest argument for the Kubernetes backend.
+
+  That backend now exists and the alternative is built: `FLIGHT_RUNTIME=kubernetes` plus
+  `configs/k8s/orchestrator-rbac.yaml` gives a service account that may create Jobs in one
+  namespace and nothing else (§2). **The weakness stays on this list anyway**, because
+  what is deployed here is still docker-compose and still mounts the socket. Having the
+  fix available is not the same as running it, and this section is about what is true on
+  this branch right now.
 
 ### Built but not yet wired to anything
 
@@ -1675,13 +1767,18 @@ list nearly empty. Everything here that mattered was portal work.
 
 ### Designed, not built
 
-- Kubernetes `FlightRuntime` backend (create Job, delete Job)
+- **Manifests for the hub tier.** Eight services that exist only as compose services.
+  Mechanical (§2), and gated on a cluster being paid for rather than on a decision.
 - **The cloud L4 load balancer and cert-manager (§7).** Deployment-time pieces with
   nothing to build locally: the LB is a managed resource and cert-manager replaces
   `scripts/generate_local_certs.sh` when a hostname resolves here.
 
 The ingress tier itself has left this list. Both halves are built and tested — see
 above — which is why §8's port table no longer has a "not configured" cell in it.
+
+The Kubernetes `FlightRuntime` backend has left it too, and it took the *only* piece of
+the cluster migration that was ever a design question with it. What remains above is
+translation work.
 
 ### Open
 
