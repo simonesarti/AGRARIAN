@@ -12,11 +12,18 @@
 # the air, prints a URL, and waits. It exits when you press Enter, cleaning up
 # every container.
 #
-# PLAIN HTTP. The portal ships COOKIE_SECURE=true, and a browser will not return a
-# Secure cookie over http:// — the symptom is a login that appears to work and then
-# forgets you. There is no TLS terminator in this repo yet (CLOUD_ARCHITECTURE.md
-# §7), so this runs with the local-HTTP affordance switched on. That is exactly the
-# configuration §8 says is not deployable, and it is fine here and nowhere else.
+# PLAIN HTTP, and now by choice rather than by necessity. The portal ships
+# COOKIE_SECURE=true and a browser will not return a Secure cookie over http:// —
+# the symptom is a login that appears to work and then forgets you — so this runs
+# with the local-HTTP affordance switched on. That is exactly the configuration §8
+# says is not deployable, and it is fine here and nowhere else.
+#
+# Traefik exists now (§7) and could front this. It is deliberately not used here:
+# a locally-issued CA that the browser does not trust turns "does the video play?"
+# into a click-through warning page and a WebRTC connection failing for a reason
+# that has nothing to do with the page. run_traefik_tls.sh already drives the
+# portal over real TLS. This runner is for eyes on the product, so it removes
+# every variable it can.
 #
 # HOST ADDRESS. The portal composes playback URLs from MEDIA_PUBLIC_HOST, and
 # MediaMTX advertises MTX_WEBRTCICEHOSTNAT1TO1IPS in its ICE candidates. Both must
@@ -214,13 +221,25 @@ cat <<BANNER
      That is the whole question. If it plays, browser playback is verified
      and CLOUD_ARCHITECTURE.md §9 loses its last product-path unknown.
 
+     The <video> element is autoplay muted playsinline. Muted is what makes
+     autoplay legal in Chrome and Safari without a click, so the specific
+     failure to watch for is a first frame that never arrives while the WHEP
+     POST above returned 201 — that is a policy or track-attachment problem,
+     not a credential one.
+
   b) Network tab, filter "whep".
-     The iframe loads MediaMTX's reader page at
-         http://$HOST:8889/out/$UUID/?jwt=<token>
-     and that page's own JavaScript then POSTs to .../whep. THE QUESTION IS
-     WHETHER THAT POST CARRIES THE jwt. If it 401s, MediaMTX's reader dropped
-     the query string, and the fix is to negotiate WHEP directly in
-     portal/static/watch.js instead of iframing the reader.
+     There should be exactly ONE request:
+         POST http://$HOST:8889/out/$UUID/whep?jwt=<token>   -> 201
+     sent by portal/static/watch.js itself, with an SDP offer as the body and
+     the answer as the response. No PATCH follows it: candidates are all
+     gathered before the offer goes out.
+
+     What must NOT appear is a request to MediaMTX's own reader page,
+     http://$HOST:8889/out/$UUID/ . That is the iframe this page used to be
+     built on, and it can never work — that page is gated behind MediaMTX's
+     internal user roster and answers 401 to every credential this system can
+     mint. run_portal.sh has a regression assertion for it; if you see it here,
+     something reintroduced it.
 
   c) Network tab, filter "WS".
      One connection to ws://$HOST:8765/?token=... should sit at status 101.
