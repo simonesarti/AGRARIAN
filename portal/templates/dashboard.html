@@ -5,7 +5,10 @@
 <div class="card">
   <div class="cardhead">
     <h1>Stream slots</h1>
-    <span class="muted">{{ streams|length }} active{% if live_count %} · {{ live_count }} flying now{% endif %}</span>
+    <span class="muted">
+      {{ streams|length }} active{% if live_count %} · {{ live_count }} flying now{% endif %}
+      · <a href="/history">Flight history</a>
+    </span>
   </div>
 
   <p class="muted">
@@ -44,6 +47,10 @@
           {% if s.live %}
             <a class="button primary" href="/watch?stream_id={{ s.stream_id }}">Watch</a>
           {% endif %}
+          {# Survives retirement: revoking a slot hides it from this table, but
+             its flights are still in the history — which is the whole reason
+             "remove" is a revoke and not a delete. #}
+          <a class="button" href="/history?stream_id={{ s.stream_id }}">History</a>
           <form method="post" action="/streams/{{ s.stream_id }}/rotate">
             <button type="submit" title="Issue a new key and kill the old one immediately">New key</button>
           </form>

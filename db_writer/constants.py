@@ -68,6 +68,23 @@ MAX_STREAMS_PER_USER = 10
 # than a driver-dependent truncation or an opaque database error.
 MAX_STREAM_LABEL_LENGTH = 128
 
+# ── Flight history ────────────────────────────────────────────────────────────
+# History is read by page, never in full. A user who has flown daily for a year
+# has a few hundred flights; a single response carrying all of them costs the
+# database a full scan of their partition of `flights` and the browser a table
+# nobody scrolls to the end of.
+
+FLIGHT_HISTORY_PAGE_SIZE = 20
+# A caller may ask for a bigger page but not an unbounded one. Without a ceiling
+# ?limit=1000000 is a scan the caller chose and the server paid for.
+MAX_FLIGHT_HISTORY_PAGE_SIZE = 100
+
+# One flight's alerts, on its detail page. A busy danger-detection sortie writes
+# an alert every few seconds, so this is capped for the same reason the history
+# is paged — and the response says how many there are in total, so a truncated
+# list never reads as a complete one.
+FLIGHT_ALERTS_PAGE_SIZE = 50
+
 # ── Drone stream keys ─────────────────────────────────────────────────────────
 # The operator types the ingest URL into the drone controller by hand before every
 # flight, so the key has to be short enough to transcribe without error. That rules

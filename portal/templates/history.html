@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Flight history — AGRARIAN{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="cardhead">
+    <h1>Flight history</h1>
+    <a href="/">← All slots</a>
+  </div>
+
+  <p class="muted">
+    Every flight this account has flown, newest first. A flight is one publishing
+    session on one slot — reconnecting inside the grace period continues the same
+    flight rather than starting another.
+  </p>
+
+  {% if stream_id is not none %}
+    <p class="muted small">
+      Showing one slot only. <a href="/history">Show every slot</a>
+    </p>
+  {% endif %}
+
+  {% if flights %}
+  <table class="slots">
+    <thead>
+      <tr><th>Flight</th><th>Started</th><th>Duration</th><th>Alerts</th><th>Recordings</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for f in flights %}
+      <tr>
+        <td>
+          <strong>{{ f.label or "Untitled slot" }}</strong>
+          <div class="muted small">flight {{ f.flight_id }}</div>
+        </td>
+        <td class="nowrap">{{ (f.start_time or "")[:19]|replace("T", " ") }}</td>
+        <td>
+          {% if f.open %}
+            {# Deliberately not "Live". end_time is NULL both for a flight still
+               in the air and for one whose orchestrator died before it could
+               close, and history cannot tell those apart. The dashboard is where
+               a Watch button belongs; this page reports what was recorded. #}
+            <span class="badge">Open</span>
+          {% else %}
+            {{ f.duration or "—" }}
+          {% endif %}
+        </td>
+        <td>{{ f.alert_count }}</td>
+        <td>{{ f.recording_count }}</td>
+        <td class="actions">
+          <a class="button" href="/flights/{{ f.flight_id }}">Details</a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {# Cursor paging: "older" carries the last flight_id on this page, so a flight
+     starting while someone reads page one cannot push a row onto page two that
+     they have already seen. There is no "newer" link for the same reason there
+     is no page number — the cursor only runs one way, and the way back is the
+     unparameterised page. #}
+  <div class="row pager">
+    {% if paged %}<a href="/history{% if stream_id is not none %}?stream_id={{ stream_id }}{% endif %}">← Newest</a>{% endif %}
+    {% if next_before %}
+      <a href="/history?before={{ next_before }}{% if stream_id is not none %}&stream_id={{ stream_id }}{% endif %}">Older →</a>
+    {% endif %}
+  </div>
+  {% else %}
+    <p class="empty">
+      {% if paged %}
+        Nothing older to show. <a href="/history">Back to the newest flights</a>
+      {% else %}
+        No flights yet. One starts on its own when a drone publishes to a slot's
+        ingest URL.
+      {% endif %}
+    </p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Flight {{ flight.flight_id }} — AGRARIAN{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="cardhead">
+    <h1>{{ flight.label or "Untitled slot" }} · flight {{ flight.flight_id }}</h1>
+    <a href="/history">← Flight history</a>
+  </div>
+
+  <dl class="facts">
+    <div><dt>Started</dt><dd>{{ (flight.start_time or "")[:19]|replace("T", " ") }}</dd></div>
+    <div>
+      <dt>Ended</dt>
+      <dd>
+        {% if flight.open %}
+          <span class="badge">Open</span>
+          {# Same caveat as the history table: NULL end_time means nobody closed
+             this flight, which is usually because it is still flying and
+             sometimes because the orchestrator died first. #}
+          <span class="muted small">still publishing, or never closed out</span>
+        {% else %}
+          {{ (flight.end_time or "")[:19]|replace("T", " ") }}
+        {% endif %}
+      </dd>
+    </div>
+    <div><dt>Duration</dt><dd>{{ flight.duration or "—" }}</dd></div>
+    <div><dt>Alerts</dt><dd>{{ flight.alert_total }}</dd></div>
+  </dl>
+</div>
+
+<div class="card">
+  <h2>Recordings</h2>
+  {% if flight.recordings %}
+    <p class="muted small">
+      Where the recorder archived this flight's annotated video. These are storage
+      locations, not links: a segment lives in the deployment's object storage and
+      is fetched with the operator's own credentials, which the portal does not
+      hold and must not.
+    </p>
+    <table class="slots">
+      <thead><tr><th>Uploaded</th><th>Backend</th><th>Location</th></tr></thead>
+      <tbody>
+        {% for r in flight.recordings %}
+        <tr>
+          <td class="nowrap">{{ (r.uploaded_at or "")[:19]|replace("T", " ") }}</td>
+          <td>{{ r.storage_backend }}</td>
+          <td><code class="key">{{ r.storage_location }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">No recordings archived for this flight.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <div class="cardhead">
+    <h2>Alerts</h2>
+    {% if flight.alert_total > alerts_shown %}
+      <span class="muted small">showing the {{ alerts_shown }} most recent of {{ flight.alert_total }}</span>
+    {% endif %}
+  </div>
+
+  {% if flight.alerts %}
+  <ul class="alerts-grid">
+    {% for a in flight.alerts %}
+    <li class="alert">
+      <div class="alert-head">{{ a.alert_msg }}</div>
+      <div class="muted small">
+        {{ (a.datetime or "")[:19]|replace("T", " ") }}{% if a.frame_id is not none %} · frame {{ a.frame_id }}{% endif %}
+      </div>
+      {% if a.has_image %}
+        {# One request per crop, fetched lazily. The bytes never travel with this
+           page: fifty alerts would be fifty inline JPEGs the browser could
+           neither cache separately nor skip. #}
+        <img src="/flights/{{ flight.flight_id }}/alerts/{{ a.alert_id }}.jpg"
+             alt="Alert frame" loading="lazy"
+             {% if a.image_width %}width="{{ a.image_width }}"{% endif %}
+             {% if a.image_height %}height="{{ a.image_height }}"{% endif %}>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+    <p class="empty">No alerts were raised on this flight.</p>
+  {% endif %}
+</div>
+{% endblock %}

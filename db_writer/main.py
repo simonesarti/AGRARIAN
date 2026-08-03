@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 
@@ -31,6 +31,7 @@ from auth import (
     user_id_from_session,
     verify_publisher,
 )
+from constants import FLIGHT_HISTORY_PAGE_SIZE
 from db_manager import (
     AlertWriter,
     EmailAlreadyRegistered,
@@ -421,10 +422,98 @@ def list_active_flights(authorization: Optional[str] = Header(default=None)):
     disagree.
 
     No flight *history* here. That is a separate question with separate paging
-    and a separate cost, and nothing in the portal asks it yet.
+    and a separate cost, and it is answered by /flights/history below.
     """
     user_id = _require_session(authorization)
     return {"flights": _directory.active_flights(user_id)}
+
+
+# ------------------------------------------------------------------ #
+# Flight history — the read side of everything the system recorded
+# ------------------------------------------------------------------ #
+#
+# Declared BEFORE /flights/{flight_id}. FastAPI matches routes in declaration
+# order, and "history" is not an int, so the parameterised route would answer
+# this path with a 422 about path parameter parsing if it came first.
+
+
+@app.get("/flights/history")
+def flight_history(
+    limit: int = FLIGHT_HISTORY_PAGE_SIZE,
+    before: Optional[int] = None,
+    stream_id: Optional[int] = None,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    A page of the caller's own flights, newest first, with alert and recording
+    counts.
+
+    `before` is a cursor, not a page number: it is a flight_id, and the page is
+    the flights below it. See UserDirectory.flight_history for why an offset
+    would repeat rows here.
+
+    Scoped by the session claim like every account route above it, so there is
+    no user_id to tamper with and a stream_id belonging to somebody else selects
+    nothing rather than being refused — the filter runs inside the same query
+    that already restricts to this user's flights.
+    """
+    user_id = _require_session(authorization)
+    return _directory.flight_history(
+        user_id, limit=limit, before=before, stream_id=stream_id)
+
+
+@app.get("/flights/{flight_id}")
+def flight_detail(flight_id: int, authorization: Optional[str] = Header(default=None)):
+    """
+    One flight: when it flew, what it recorded, and its most recent alerts.
+
+    404 for a flight belonging to another user, identical to the 404 for one
+    that does not exist. flight_ids are sequential, so a distinguishable
+    response would confirm the existence of other tenants' flights to anyone
+    willing to count.
+
+    Alert images are not in this response — see UserDirectory.flight_detail.
+    They are fetched one at a time from the route below, so a page with fifty
+    alerts on it loads fifty small resources the browser can cache and defer
+    rather than one enormous one it cannot.
+    """
+    user_id = _require_session(authorization)
+    detail = _directory.flight_detail(flight_id, user_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Flight not found")
+    return detail
+
+
+@app.get("/flights/{flight_id}/alerts/{alert_id}/image")
+def alert_image(
+    flight_id: int,
+    alert_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    The JPEG crop stored with one alert.
+
+    The only route in this service that returns something other than JSON. It is
+    still session-scoped: these are photographs of a tenant's own land, and both
+    the flight and the alert are checked against the caller's ownership in one
+    query (see alert_image) rather than trusted from the URL.
+
+    404 covers all three failures — no such alert, wrong tenant, and an alert
+    that simply carried no crop — because the caller is entitled to distinguish
+    none of them.
+    """
+    user_id = _require_session(authorization)
+    image = _directory.alert_image(alert_id, flight_id, user_id)
+    if image is None:
+        raise HTTPException(status_code=404, detail="No image for that alert")
+    # private: a crop is one tenant's, and a shared proxy must not keep a copy
+    # to hand to the next caller asking for the same URL. immutable because an
+    # alert row is never rewritten — the bytes at this id will not change.
+    return Response(
+        content=image,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=3600, immutable"},
+    )
 
 
 @app.post("/session/{flight_id}/alert")

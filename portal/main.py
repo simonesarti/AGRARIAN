@@ -32,6 +32,7 @@ in a URL and the first is not.
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -561,6 +562,144 @@ async def revoke_stream(request: Request, stream_id: int):
         return _redirect("/login")
     await _db.revoke_stream(token, stream_id)
     return _redirect("/")
+
+
+# ── Flight history ────────────────────────────────────────────────────────────
+
+
+def _parse_time(value: Optional[str]) -> Optional[datetime]:
+    """
+    db-writer's timestamps come back as ISO-8601 strings. Anything unparseable
+    reads as absent rather than raising: a malformed timestamp should cost the
+    duration column on one row, not the whole page.
+    """
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _duration(start: Optional[str], end: Optional[str]) -> Optional[str]:
+    """
+    How long a flight lasted, as a person would say it. None while it is still
+    open — "so far" is not what this column means, and a number that grows every
+    time the page is reloaded would be read as a duration that had been recorded.
+    """
+    started, ended = _parse_time(start), _parse_time(end)
+    if started is None or ended is None:
+        return None
+    seconds = int((ended - started).total_seconds())
+    if seconds < 0:
+        # Not reachable through the orchestrator, which stamps end_time on
+        # teardown. Rendered as unknown rather than as "-3m" if it ever is.
+        return None
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _history_row(flight: dict) -> dict:
+    """One flight as the table renders it. The only place duration is computed."""
+    return {
+        **flight,
+        "duration": _duration(flight.get("start_time"), flight.get("end_time")),
+        # Not "live". An open flight is usually one in the air, but it is also
+        # what a crashed orchestrator leaves behind (see db-writer's note on
+        # flights.end_time), and history must not assert liveness it cannot know.
+        "open": not flight.get("end_time"),
+    }
+
+
+@app.get("/history", response_class=HTMLResponse)
+async def history_page(
+    request: Request,
+    before: Optional[int] = Query(default=None),
+    stream_id: Optional[int] = Query(default=None),
+):
+    """
+    Every flight this account has flown, newest first.
+
+    `before` is db-writer's cursor, carried in the URL so an "Older" link is an
+    ordinary link — no state here, which is the same reason the session lives in
+    a cookie. The portal never invents a cursor; it echoes the one it was given.
+    """
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+
+    me = await _db.whoami(token)
+    page = await _db.flight_history(token, before=before, stream_id=stream_id)
+
+    return templates.TemplateResponse(
+        request, "history.html",
+        {
+            "email": me.get("email"),
+            "flights": [_history_row(f) for f in page["flights"]],
+            "next_before": page.get("next_before"),
+            "stream_id": stream_id,
+            # Whether this is a later page, so the first one can be linked back
+            # to without keeping a stack of cursors.
+            "paged": before is not None,
+        })
+
+
+@app.get("/flights/{flight_id}", response_class=HTMLResponse)
+async def flight_page(request: Request, flight_id: int):
+    """
+    One flight: what it recorded, and the alerts it raised.
+
+    A 404 from db-writer means "not yours or not there", and the global handler
+    renders it as a plain error page — the two are not distinguished here
+    because they are not distinguished there either.
+    """
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+
+    me = await _db.whoami(token)
+    flight = await _db.flight_detail(token, flight_id)
+
+    return templates.TemplateResponse(
+        request, "flight.html",
+        {
+            "email": me.get("email"),
+            "flight": _history_row(flight),
+            # The list is capped, so the page has to be able to say so rather
+            # than presenting a page of alerts as the whole flight.
+            "alerts_shown": len(flight["alerts"]),
+        })
+
+
+@app.get("/flights/{flight_id}/alerts/{alert_id}.jpg")
+async def alert_image(request: Request, flight_id: int, alert_id: int):
+    """
+    The crop stored with one past alert, forwarded from db-writer.
+
+    A URL rather than a data: URI, unlike the live alert aside, and the
+    difference is deliberate: live alerts arrive one at a time over a socket
+    that is already open, while a flight's history is fifty of them at once.
+    As resources the browser fetches them lazily, caches them, and never blocks
+    the page on them.
+
+    Nothing is cached in this process. The portal holds no state (see the module
+    docstring) and an image cache would be the first thing to break that.
+    """
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+
+    image = await _db.alert_image(token, flight_id, alert_id)
+    return Response(
+        content=image,
+        media_type="image/jpeg",
+        # private, because this is one tenant's photograph and a shared cache
+        # between here and the browser must not keep a copy for the next caller.
+        headers={"Cache-Control": "private, max-age=3600, immutable"},
+    )
 
 
 # ── Watching a flight ─────────────────────────────────────────────────────────

@@ -105,7 +105,7 @@ The stack is split across two independent deployments:
 | **ws-server** | comms | Maintains a WebSocket connection to the viewer UI; receives alert events from the app and pushes them in real time |
 | **recorder** | comms | Receives a webhook from MediaMTX on each completed recording segment and uploads it to the configured storage backend |
 | **orchestrator** | comms | Starts one app container per flight when a stream goes live and stops it when the publisher drops |
-| **portal** | comms | The account pages — sign-up, sign-in, stream slots and the live view. The only service on the public side that talks to db-writer |
+| **portal** | comms | The account pages — sign-up, sign-in, stream slots, the live view and flight history. The only service on the public side that talks to db-writer |
 | **app** | standalone | Core GPU processing pipeline; consumes video and telemetry, produces annotated stream and structured alerts |
 
 > **No reverse proxy is deployed.** Every service above publishes its own port directly and

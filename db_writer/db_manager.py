@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 import bcrypt
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, LargeBinary, String, create_engine
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, LargeBinary, String, create_engine, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 
@@ -18,7 +18,10 @@ from constants import (
     DB_MANAGER_POOL_SIZE,
     DB_MANAGER_QUEUE_WAIT_TIMEOUT,
     DB_MANAGER_THREAD_CLOSE_TIMEOUT,
+    FLIGHT_ALERTS_PAGE_SIZE,
+    FLIGHT_HISTORY_PAGE_SIZE,
     MAX_EMAIL_LENGTH,
+    MAX_FLIGHT_HISTORY_PAGE_SIZE,
     MAX_PASSWORD_BYTES,
     MAX_STREAM_LABEL_LENGTH,
     MAX_STREAMS_PER_USER,
@@ -737,6 +740,217 @@ class UserDirectory:
                 }
                 for f, s in rows
             ]
+
+    # ── Flight history ────────────────────────────────────────────────────────
+    #
+    # The read side of everything above. Three methods, each joining through
+    # streams and filtering on user_id in the same query that selects the row —
+    # never fetching first and checking ownership afterwards. That ordering is
+    # what makes "not yours" and "does not exist" the same answer, which is the
+    # property the portal's 404s rest on.
+
+    def flight_history(
+            self,
+            user_id: int,
+            limit: int = FLIGHT_HISTORY_PAGE_SIZE,
+            before: Optional[int] = None,
+            stream_id: Optional[int] = None,
+    ) -> dict:
+        """
+        A page of this user's flights, newest first, with alert and recording
+        counts. Returns {"flights": [...], "next_before": id or None}.
+
+        **Paged by key, not by offset.** `before` is a flight_id and the page is
+        everything below it. OFFSET would be simpler and would be wrong here:
+        flights are ordered newest first, so a flight opening while the user
+        reads page 1 shifts every later row down by one, and page 2 then repeats
+        the row that page 1 ended on. Keyset paging is immune — "older than
+        flight 91" means the same thing however many flights start afterwards.
+
+        flight_id descending rather than start_time descending, and they are not
+        interchangeable: start_time has no unique constraint, so two flights
+        opened in the same clock tick would have an undefined order between them
+        and a page boundary landing there could skip one entirely. The PK is
+        monotonic and unique, which is what a cursor needs.
+
+        One row more than asked for is fetched, and the extra one is what sets
+        next_before. Without it a full last page offers an "older" link that
+        leads to nothing, which reads as a bug rather than as the end.
+        """
+        limit = max(1, min(int(limit), MAX_FLIGHT_HISTORY_PAGE_SIZE))
+
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            query = (
+                session.query(Flight, Stream)
+                .join(Stream, Flight.stream_id == Stream.stream_id)
+                .filter(Stream.user_id == user_id)
+            )
+            if stream_id is not None:
+                # Not a security boundary — user_id above already is one. This
+                # narrows the page to one slot, and a stream_id belonging to
+                # somebody else simply matches nothing.
+                query = query.filter(Flight.stream_id == stream_id)
+            if before is not None:
+                query = query.filter(Flight.flight_id < before)
+
+            rows = query.order_by(Flight.flight_id.desc()).limit(limit + 1).all()
+
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            ids = [f.flight_id for f, _ in rows]
+
+            # Counted in two grouped queries over this page's ids rather than as
+            # two joins on the main one: alerts and recordings both hang off
+            # flights, so joining them together multiplies the rows and every
+            # count comes back as the product of the two.
+            alerts = self._counts_by_flight(session, Alert.flight_id, Alert.alert_id, ids)
+            recordings = self._counts_by_flight(
+                session, Recording.flight_id, Recording.recording_id, ids)
+
+            return {
+                "flights": [
+                    {
+                        "flight_id": f.flight_id,
+                        "stream_id": s.stream_id,
+                        "label": s.label,
+                        "start_time": f.start_time,
+                        # NULL means the flight was never closed out. Usually
+                        # that is "still in the air", but it is also what a
+                        # crashed orchestrator leaves behind, so the portal
+                        # renders it as open rather than as live.
+                        "end_time": f.end_time,
+                        "alert_count": alerts.get(f.flight_id, 0),
+                        "recording_count": recordings.get(f.flight_id, 0),
+                    }
+                    for f, s in rows
+                ],
+                # The cursor for the next page, or None at the end of history.
+                "next_before": ids[-1] if (has_more and ids) else None,
+            }
+
+    @staticmethod
+    def _counts_by_flight(session: Session, flight_column, pk_column, ids: List[int]) -> dict:
+        """
+        {flight_id: row count} over the given flights, or {} for no flights.
+
+        The empty guard is not a micro-optimisation: `IN ()` is a syntax error on
+        some backends and a query that matches nothing on others, and neither is
+        worth finding out about from a page that renders every count as zero.
+        """
+        if not ids:
+            return {}
+        return dict(
+            session.query(flight_column, func.count(pk_column))
+            .filter(flight_column.in_(ids))
+            .group_by(flight_column)
+            .all()
+        )
+
+    def flight_detail(self, flight_id: int, user_id: int) -> Optional[dict]:
+        """
+        One of this user's flights, with its recordings and its most recent
+        alerts. None if the flight does not exist OR belongs to someone else —
+        the caller cannot tell which, and must not be able to.
+
+        Alert IMAGE BYTES are deliberately absent. A flight with two hundred
+        alerts holds two hundred JPEGs, and inlining them would make one page
+        load tens of megabytes that the browser cannot cache separately or load
+        lazily. Each alert reports whether it has one; alert_image() serves it.
+
+        `alert_total` is the true count and `alerts` is at most one page of it,
+        so a truncated list can be labelled as truncated rather than silently
+        passing for the whole flight.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            row = (
+                session.query(Flight, Stream)
+                .join(Stream, Flight.stream_id == Stream.stream_id)
+                .filter(Flight.flight_id == flight_id, Stream.user_id == user_id)
+                .first()
+            )
+            if row is None:
+                return None
+            flight, stream = row
+
+            alert_total = (session.query(func.count(Alert.alert_id))
+                           .filter(Alert.flight_id == flight_id).scalar()) or 0
+
+            # Newest first, matching the live alert aside — the two views of the
+            # same flight should not disagree about which end is the top.
+            alerts = (session.query(Alert)
+                      .filter(Alert.flight_id == flight_id)
+                      .order_by(Alert.alert_id.desc())
+                      .limit(FLIGHT_ALERTS_PAGE_SIZE)
+                      .all())
+
+            recordings = (session.query(Recording)
+                          .filter(Recording.flight_id == flight_id)
+                          .order_by(Recording.recording_id)
+                          .all())
+
+            return {
+                "flight_id": flight.flight_id,
+                "stream_id": stream.stream_id,
+                "label": stream.label,
+                "start_time": flight.start_time,
+                "end_time": flight.end_time,
+                "alert_total": alert_total,
+                "alerts": [
+                    {
+                        "alert_id": a.alert_id,
+                        "alert_msg": a.alert_msg,
+                        "frame_id": a.frame_id,
+                        "datetime": a.datetime,
+                        # Whether to render an <img> at all, without shipping the
+                        # bytes to find out.
+                        "has_image": a.image_data is not None,
+                        "image_width": a.image_width,
+                        "image_height": a.image_height,
+                    }
+                    for a in alerts
+                ],
+                "recordings": [
+                    {
+                        "recording_id": r.recording_id,
+                        "storage_backend": r.storage_backend,
+                        # Where the recorder put it. A blob name or a path on the
+                        # recordings volume — not a URL anyone can open, which is
+                        # why the portal shows it rather than linking it.
+                        "storage_location": r.storage_location or r.segment_path,
+                        "uploaded_at": r.uploaded_at,
+                    }
+                    for r in recordings
+                ],
+                # public_uuid is deliberately NOT returned. It names the flight's
+                # media path, and history is a read of what happened, not a way
+                # to reach the stream it happened on.
+            }
+
+    def alert_image(self, alert_id: int, flight_id: int, user_id: int) -> Optional[bytes]:
+        """
+        The JPEG crop stored with one alert, or None if there is no such alert,
+        it carries no image, or it belongs to another user.
+
+        Both ids are checked, not just alert_id: alert_ids are sequential across
+        every tenant, so the flight in the URL has to be the alert's flight and
+        the flight has to be the caller's. Either one alone would let a caller
+        walk the id space and read other people's crops — which are photographs
+        of somebody else's land.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            row = (
+                session.query(Alert.image_data)
+                .join(Flight, Alert.flight_id == Flight.flight_id)
+                .join(Stream, Flight.stream_id == Stream.stream_id)
+                .filter(Alert.alert_id == alert_id,
+                        Alert.flight_id == flight_id,
+                        Stream.user_id == user_id)
+                .first()
+            )
+            return row[0] if row else None
 
 
 class AlertWriter:

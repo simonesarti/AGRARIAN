@@ -160,6 +160,36 @@ button:hover, .button:hover { border-color: var(--muted); }
 .steps { color: var(--muted); margin: 0 0 10px; padding-left: 20px; }
 .steps li { margin: 4px 0; }
 
+/* ── Flight history ────────────────────────────────────────────────────────── */
+
+/* Timestamps are the one column that must not wrap: a date broken across two
+   lines is unreadable at a glance, and glancing is what this table is for. */
+.nowrap { white-space: nowrap; }
+
+.pager { justify-content: space-between; margin-top: 16px; }
+/* One link only ("Older" on the first page) still belongs on the right, or it
+   would sit where "Newest" sits on every other page. */
+.pager a:only-child { margin-left: auto; }
+
+.facts { display: flex; flex-wrap: wrap; gap: 10px 32px; margin: 14px 0 0; }
+.facts dt { font-size: 12px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); }
+.facts dd { margin: 2px 0 0; }
+
+/* Crops are wide and there are up to fifty of them, so they tile rather than
+   stack — the live aside is a column beside a video, this is the whole page. */
+.alerts-grid {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+}
+/* width/height attributes are set from the stored dimensions so the browser
+   reserves the space before the image arrives; this keeps the aspect ratio
+   while still letting the tile decide the width. */
+.alerts-grid img { width: 100%; height: auto; }
+
 /* ── Watch page ────────────────────────────────────────────────────────────── */
 
 .watch { display: grid; grid-template-columns: 2fr 1fr; gap: 18px; margin-top: 14px; }

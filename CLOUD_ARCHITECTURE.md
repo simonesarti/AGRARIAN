@@ -651,17 +651,69 @@ returns exactly what `/viewer/token` disambiguates over, deliberately — the pa
 offers the button and the call that authorises pressing it must agree on what is active,
 and two different queries would eventually disagree.
 
+#### The read side: flight history **[built]**
+
+Three more routes answer what *has* flown, which is a different question from what is
+flying and is deliberately not served by the same query:
+
+| Route | Answers |
+| --- | --- |
+| `GET /flights/history?limit&before&stream_id` | a page of past flights, newest first, with alert and recording counts |
+| `GET /flights/{id}` | one flight: when it flew, what was archived, and a page of its alerts |
+| `GET /flights/{id}/alerts/{alert_id}/image` | the JPEG crop stored with one alert |
+
+Four decisions in there are worth stating, because each has an obvious alternative that
+is worse:
+
+- **`before` is a cursor, not an offset.** It is a `flight_id`, and a page is the flights
+  below it. History is ordered newest first, so with `OFFSET` a flight taking off while
+  someone reads page 1 shifts every later row down by one and page 2 repeats the row page
+  1 ended on. The cursor is immune: *older than flight 91* means the same thing however
+  many flights start afterwards. It orders by `flight_id` rather than `start_time` for a
+  related reason — `start_time` has no unique constraint, so two flights opened in the
+  same tick have no defined order between them and a page boundary landing there could
+  drop one entirely.
+- **The counts are two grouped queries, not two joins.** Alerts and recordings both hang
+  off `flights`; joining both in one query multiplies the rows, and a flight with 3
+  alerts and 2 recordings reports 6 of each. Both figures are asserted, with the
+  inflating query kept beside them as a control.
+- **Alert images are a route, not a field.** The live alert feed inlines a crop as base64
+  because it is delivering one alert over a socket that is already open; a flight's
+  history is fifty of them at once, and inlining those would be tens of megabytes the
+  browser can neither cache separately nor defer. As URLs they are lazy, cacheable, and
+  individually authorised.
+- **`public_uuid` is not in any of the three responses.** History reports what happened;
+  it is not a way to reach the media path it happened on. A viewer token is still the
+  only thing that opens a stream.
+
+Every one of the three joins through `streams` and filters on `user_id` **inside the same
+query that selects the row**, never fetching first and checking ownership after. That is
+what makes "not yours" and "does not exist" the same 404. The image route checks both ids
+— the alert must belong to the flight in the URL *and* the flight to the caller — because
+`alert_id` is sequential across every tenant in the system, and these are photographs of
+somebody's land.
+
 #### The front-end
 
 Server-rendered HTML from a small FastAPI service, no build step and no framework. The
-whole surface is four pages — sign in, register, slots, watch — and a toolchain would be
-more moving parts than the pages themselves.
+whole surface is six pages — sign in, register, slots, watch, history, one flight — and a
+toolchain would be more moving parts than the pages themselves.
 
 | Page | What it does |
 | --- | --- |
 | `/login`, `/register` | The only forms that carry a password. Registration signs the new account straight in |
 | `/` | Slots, each with the full `rtmps://` ingest URL to retype, plus New key / Retire, and a Watch button on whatever is live |
 | `/watch` | The annotated video and the alert feed for one flight |
+| `/history` | Every flight this account has flown, newest first, paged by cursor. `?stream_id=` narrows it to one slot |
+| `/flights/{id}` | One flight: duration, archived recordings, and its alerts with their crops |
+
+The history pages are ordinary links with the cursor in the query string, which is the
+same statelessness the session cookie buys: an *Older* link is a URL, not a position this
+process is remembering on someone's behalf. They also render an open flight as **Open**
+rather than *Live*, and that is not a wording choice — a null `end_time` means nobody
+closed the flight, which is usually because it is still in the air and sometimes because
+the orchestrator died first (§5). The dashboard is where liveness is asserted, because
+that is the page whose claim is checked against `/flights` before a Watch button appears.
 
 Three things about it are load-bearing rather than incidental:
 
@@ -1243,27 +1295,25 @@ waits on them and neither is work:**
    and no-data analysis are skipped without it, so a real part of `danger_detection` has
    never executed.
 
-**The ingress tier is finished, the product has been watched working in a browser, and
-both `FlightRuntime` backends exist.** Between them those closed the four items that
-stood at the top of this list, so what follows is shorter than it has been at any point
-on this branch — and, for the first time, contains nothing that is a *doubt*. Every
-remaining item is a feature or a deployment step, not a question about whether something
-works.
+**The ingress tier is finished, the product has been watched working in a browser, both
+`FlightRuntime` backends exist, and the portal now shows what has flown as well as what
+is flying.** Between them those closed the five items that stood at the top of this list.
+What follows is one item.
 
-**Then, in order:**
+**Then:**
 
-1. **Flight history in the portal** (§9, *Open*). The first thing a user will ask for that
-   the system already has the data for. Every row exists; what is missing is a paged read
-   route and a page.
-2. **Manifests for the hub tier.** The orchestrator's half of the migration is done and
+1. **Manifests for the hub tier.** The orchestrator's half of the migration is done and
    the flight namespace exists; the eight hub services are still compose-only. §2 calls
    this mechanical and it is — every service already takes its configuration from the
    environment — with the one real difference being that MediaMTX and Mosquitto need
    `LoadBalancer` services carrying TCP and UDP rather than an HTTP Ingress. **This is
-   only worth starting when a cluster is actually being paid for**, which is why it is
-   below a feature a user can see.
+   only worth starting when a cluster is actually being paid for.** Until then it is
+   work that can only be tested against a cluster nobody is running, which is why it
+   waited behind every feature a user can see — and there are none of those left above
+   it, so the honest reading is that this branch is now waiting on a deployment
+   decision rather than on code.
 
-Four things left this list rather than being completed by it, and the distinction
+Five things left this list rather than being completed by it, and the distinction
 matters because each leaves a residue:
 
 - **Certificate renewal** is answered (§7), and leaves one line for whoever writes the
@@ -1275,11 +1325,18 @@ matters because each leaves a residue:
   compulsory, which is below and is not work.
 - **The Kubernetes `FlightRuntime` backend** is built, and with it the service account
   that retires the Docker socket (§2). It leaves the rest of the migration — the hub
-  services have no manifests — which is item 2 above rather than a residue of this one.
+  services have no manifests — which is item 1 above rather than a residue of this one.
   It also leaves a knob this platform offers and Docker does not: `activeDeadlineSeconds`
   would cap a single flight's GPU hours. It is deliberately unset, because a backend that
   ends flights the other one would not is a backend the abstraction no longer hides. It
   belongs with quota (*Open*), not here.
+- **Flight history** is built (§4, *Built and tested*), and it turned out to be the read
+  side of everything the system already recorded rather than a feature of its own: no
+  table changed, no column was added, and the orchestrator was not touched. What it
+  leaves is smaller than the item was and is in *Open*: a recording is shown as a
+  storage location rather than offered as a download, because handing one over means the
+  portal holding object-storage credentials or db-writer signing URLs, and neither is a
+  history feature.
 
 Not on that list, and worth saying why: **making TLS compulsory on the drone side.**
 Every encrypted listener now exists, and the plaintext ones remain by design (§7, §8).
@@ -1293,6 +1350,36 @@ with a feature that does not exist yet (email verification with password reset, 
 billing).
 
 ### Built and tested
+
+- **Flight history in the portal** (§4, 2026-08-03). Three read routes on db-writer, two
+  pages on the portal, and no schema change of any kind — every row this reads was
+  already being written. Covered twice, at the two levels where it can be wrong:
+
+  `tests/comms/test_flight_history.py` — **45 assertions**, SQLite in memory, no stack —
+  is the query layer. `tests/comms/run_portal.sh` — now **118 assertions**, up from 88 —
+  drives the pages through real HTTP against real PostgreSQL: alerts written by the app's
+  own route, a segment logged by the recorder's, the flight closed by the orchestrator's,
+  and then the history read the way a browser reads it.
+
+  Two properties carry **controls that fail**, because both are the kind of claim that
+  passes vacuously against small data:
+
+  - **Cursor paging does not repeat a row** when a flight takes off mid-browse. The
+    control runs `OFFSET` over the same rows at the same moment and *does* repeat one —
+    so the property is a fact about this data, not a belief about paging.
+  - **Alert and recording counts do not inflate each other.** The control is the single
+    joined query, which reports a flight with 3 alerts and 2 recordings as having **6 and
+    6**.
+
+  Tenancy was checked by breaking it: deleting the `user_id` filter from the history
+  query, and the flight check from the image lookup, fails 10 of the 45 — including
+  "another tenant's flight is absent" and "a real alert id under the wrong flight is
+  refused". A test that cannot fail this way is not testing isolation.
+
+  What is **not** covered: nobody has looked at either page in a browser. The markup is
+  asserted, the crop is byte-compared through two services, and neither of those is the
+  same claim as "the grid of fifty crops looks right" — the same gap the watch page's
+  alert aside still has, and it is in *Open* with it.
 
 - **The Kubernetes `FlightRuntime` backend, against a real API server** (§2, 2026-08-03).
   `KubernetesFlightRuntime` creates one Job per flight; `FLIGHT_RUNTIME` selects it.
@@ -1842,10 +1929,24 @@ translation work.
   are all tested, and `run_portal.sh` asserts the markup, but "asserted" and "looks
   right at 390px wide" are different claims. `run_watch_live.sh` prints a `redis-cli
   PUBLISH` line for exactly the first one, so it costs a paste rather than a setup.
-- **No flight history.** The portal shows what is airborne now and nothing that has
-  landed, so recordings and past alerts are in the database and unreachable from the UI.
-  Every row needed is already there (`flights`, `alerts`, `recordings`); what is missing
-  is a paged read route and a page, and neither is on the path of anything else.
+
+  **The two history pages join this item rather than adding one of their own.** They are
+  server-rendered HTML asserted through HTTP, with the same gap and the same fix: the
+  alert grid on a flight's page is the crop rendering question again, at fifty crops
+  instead of one.
+- **A recording is a location, not a download.** History reaches every row the system
+  records, but the recordings table stores a blob name or a path on the recordings
+  volume, and the portal shows it as text. Handing the segment over means either the
+  portal holding the deployment's object-storage credentials — which §7 keeps out of the
+  tier facing the internet, for the same reason it keeps `SESSION_JWT_SECRET` out — or
+  db-writer minting pre-signed URLs, which is a small feature and a real decision about
+  which service owns storage credentials. Neither is a history feature, which is why
+  this is here and not in what was built.
+- **A flight's alert list stops at fifty.** The detail page shows the most recent page
+  and says how many there are, so a truncated list never passes for a whole one, but
+  there is no *older alerts* control the way there is for flights. The cursor paging is
+  already written one layer down; this is the same pattern applied a second time, and it
+  waits for someone to actually hit the ceiling.
 - Recorder per-tenant upload prefixes
 - **TLS certificate issue.** What remains of what used to be "issue and renewal": the
   issuing half waits on a hostname, since cert-manager cannot ask Let's Encrypt for an

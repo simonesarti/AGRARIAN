@@ -10,9 +10,11 @@ What is NOT covered here: whether video actually plays. That is WebRTC
 negotiation between the browser and MediaMTX, and the portal is not in the middle
 of it — it composes a URL. The URL's shape is asserted; the picture is not.
 """
+import base64
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -84,6 +86,23 @@ def call(base, path, form=None, cookie=None, origin="", method=None, headers=Non
             return Response(r.status, r.headers, r.read().decode(errors="replace"))
     except urllib.error.HTTPError as e:
         return Response(e.code, e.headers, e.read().decode(errors="replace"))
+
+
+def get_raw(base, path, cookie=None):
+    """
+    One GET, body kept as bytes. Returns (status, headers, body).
+
+    Separate from call() because that one decodes with errors="replace", which
+    would silently corrupt exactly the thing an image response is asserted on.
+    """
+    req = urllib.request.Request(base + path, method="GET")
+    if cookie:
+        req.add_header("Cookie", f"agrarian_session={cookie}")
+    try:
+        with _opener.open(req, timeout=15) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
 
 
 def post_json(base, path, body=None, token=None, method="POST"):
@@ -377,6 +396,141 @@ check("another tenant asking for a token gets nothing to watch", r.status == 404
 
 r = call(PORTAL1, f"/api/viewer-token?stream_id={alice_slot['stream_id']}", form={}, cookie=mallory)
 check("naming alice's stream explicitly does not help them", r.status == 404, str(r.status))
+
+# ── Flight history ───────────────────────────────────────────────────────────
+#
+# Built on the flight opened just above: alerts and a recording are written the
+# way the app and the recorder write them, the flight is closed the way the
+# orchestrator closes it, and then the pages are read the way a browser reads
+# them. Nothing here reaches into the database directly except for ground truth.
+
+FID = flight["flight_id"]
+PUB = flight["publisher_token"]
+
+# Bytes chosen to be recognisable rather than valid: what is being asserted is
+# that exactly what was stored comes back out, through two services.
+CROP = b"\xff\xd8\xff\xe0 not a real jpeg, but exactly these bytes \x00\x01\x02"
+
+for i in range(3):
+    st, _ = post_json(DBW, f"/session/{FID}/alert", {
+        "frame_id": 100 + i,
+        "alert_msg": f"person in field {i}",
+        "timestamp": float(i),
+        "datetime": f"2026-07-01T09:00:0{i}",
+        # Only the first carries a crop, so has_image has both answers to give.
+        "image_data": base64.b64encode(CROP).decode() if i == 0 else None,
+        "image_width": 320, "image_height": 240,
+    }, token=PUB)
+check("three alerts are accepted for the live flight", st == 200, str(st))
+
+st, _ = post_json(DBW, "/recording", {
+    "public_uuid": flight["public_uuid"],
+    "segment_path": "/recordings/out/seg-0.mp4",
+    "storage_backend": "azure",
+    "storage_location": "agrarian/seg-0.mp4",
+})
+check("the recorder logs a segment against the flight", st == 200, str(st))
+
+st, _ = post_json(DBW, f"/flight/{FID}/close", token=PUB)
+check("the orchestrator closes the flight", st == 200, str(st))
+
+# Alerts are written by a background thread, so the count is eventually right
+# rather than immediately right. Poll rather than sleep: a fixed sleep is either
+# slower than it needs to be or flaky, and usually both.
+history = ""
+for _ in range(30):
+    history = call(PORTAL1, "/history", cookie=alice).body
+    if "<td>3</td>" in history:
+        break
+    time.sleep(0.5)
+
+check("the history page lists the flight that just landed",
+      f"flight {FID}<" in history, history[:200])
+check("...with its alerts counted", "<td>3</td>" in history)
+check("...and its recording counted", "<td>1</td>" in history)
+check("a closed flight shows a duration rather than an Open badge",
+      ">Open<" not in history, "the landed flight is still shown as open")
+check("the history page offers a way into the flight",
+      f'href="/flights/{FID}"' in history)
+
+r = call(PORTAL1, "/", cookie=alice)
+check("the dashboard links to the history, and to one slot's history",
+      'href="/history"' in r.body and f'href="/history?stream_id={alice_slot["stream_id"]}"' in r.body)
+
+r = call(PORTAL1, f"/history?stream_id={alice_slot['stream_id']}", cookie=alice)
+check("filtering the history to one slot still shows that slot's flight",
+      r.status == 200 and f"flight {FID}<" in r.body, str(r.status))
+
+# ── One flight's page ────────────────────────────────────────────────────────
+
+r = call(PORTAL1, f"/flights/{FID}", cookie=alice)
+check("the flight page renders", r.status == 200, str(r.status))
+check("it shows the alerts that were raised",
+      all(f"person in field {i}" in r.body for i in range(3)), r.body[:200])
+check("it shows where the recording was archived",
+      "agrarian/seg-0.mp4" in r.body and "azure" in r.body)
+check("the crop is a lazily-fetched resource, not bytes inlined into the page",
+      'loading="lazy"' in r.body and "data:image/jpeg;base64," not in r.body)
+
+# The alert_id is not something the test knows; it comes from the page, which is
+# also the only place a browser would learn it.
+img_src = r.body.split(f'src="/flights/{FID}/alerts/')[1].split('"')[0]
+check("exactly one of the three alerts offers an image — the two without a crop do not",
+      r.body.count(f'src="/flights/{FID}/alerts/') == 1, str(r.body.count("<img")))
+check("...and the image is sized from what was stored, so the page does not reflow",
+      'width="320"' in r.body and 'height="240"' in r.body)
+
+status, headers, body = get_raw(PORTAL1, f"/flights/{FID}/alerts/{img_src}", cookie=alice)
+check("the crop comes back through the portal, byte for byte", body == CROP,
+      f"{status} {len(body)} bytes")
+check("...as an image, not as JSON",
+      (headers.get("Content-Type") or "") == "image/jpeg", headers.get("Content-Type"))
+check("...marked private, so no shared cache keeps a tenant's photograph",
+      "private" in (headers.get("Cache-Control") or ""), headers.get("Cache-Control"))
+
+# ── Another tenant, again ────────────────────────────────────────────────────
+
+r = call(PORTAL1, f"/flights/{FID}", cookie=mallory)
+check("another tenant opening the flight page gets a 404", r.status == 404, str(r.status))
+
+status, _, body = get_raw(PORTAL1, f"/flights/{FID}/alerts/{img_src}", cookie=mallory)
+check("...and cannot fetch the crop either", status == 404 and body != CROP, str(status))
+
+status, _, _ = get_raw(PORTAL1, f"/flights/{FID}/alerts/{img_src}", cookie=None)
+check("nor can an anonymous visitor with the exact URL",
+      status in (303, 401, 404), str(status))
+
+r = call(PORTAL2, "/history", cookie=mallory)
+check("their own history is empty, not alice's", r.status == 200 and "No flights yet" in r.body,
+      str(r.status))
+
+# ── Paging ───────────────────────────────────────────────────────────────────
+#
+# Enough flights to overflow one page. Each is opened and closed the way the
+# orchestrator would, so these are ordinary rows and not a fixture.
+
+opened = []
+for _ in range(21):
+    st, f = post_json(DBW, "/flight/open", {"stream_key": alice_slot["stream_key"]})
+    opened.append(f["flight_id"])
+    post_json(DBW, f"/flight/{f['flight_id']}/close", token=f["publisher_token"])
+check("twenty-one more flights fly and land", len(opened) == 21 and st == 200, str(st))
+
+r = call(PORTAL1, "/history", cookie=alice)
+check("the newest flight is on the first page", f"flight {opened[-1]}<" in r.body)
+check("...and the oldest is not — the page is bounded",
+      f"flight {FID}<" not in r.body, "the whole history came back in one page")
+check("a cursor onward is offered", "/history?before=" in r.body, "no Older link on a full page")
+
+cursor = r.body.split("/history?before=")[1].split('"')[0]
+older = call(PORTAL1, f"/history?before={cursor}", cookie=alice)
+check("following it reaches the older flights", older.status == 200 and f"flight {FID}<" in older.body,
+      str(older.status))
+check("...and repeats none of the newer ones",
+      not any(f"flight {i}<" in older.body for i in opened[-5:]),
+      "a row appeared on both pages")
+check("the older page offers a way back to the newest",
+      'href="/history"' in older.body)
 
 # ── Rate limiting ────────────────────────────────────────────────────────────
 #

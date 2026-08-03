@@ -15,6 +15,7 @@ try to run these directly with `python3`.
 | Test | Needs | How to run |
 | --- | --- | --- |
 | `test_schema.py` | nothing | one-liner below |
+| `test_flight_history.py` | nothing | one-liner below |
 | `test_tokens.py` | nothing | one-liner below |
 | `test_session_tokens.py` | nothing | one-liner below |
 | `test_mediamtx_auth.py` | nothing | one-liner below |
@@ -87,6 +88,15 @@ docker run --rm -v "$PWD/db_writer:/w" -v "$PWD/tests/comms:/tests:ro" \
   sh -c "pip install -q sqlalchemy bcrypt; python /tests/test_schema.py"
 ```
 
+Flight history reads — paging, counting and ownership — against the same in-memory
+database:
+
+```bash
+docker run --rm -v "$PWD/db_writer:/w" -v "$PWD/tests/comms:/tests:ro" \
+  -w /tmp -e DB_WRITER_DIR=/w python:3.11-slim \
+  sh -c "pip install -q sqlalchemy bcrypt; python /tests/test_flight_history.py"
+```
+
 Token scope separation and cross-flight replay:
 
 ```bash
@@ -112,7 +122,7 @@ docker run --rm -v "$PWD/db_writer:/dbw" -v "$PWD/tests/comms:/tests:ro" \
 ./run_db_replication.sh      # 7 + 20×2 assertions, real PostgreSQL
 ./run_redis_failure.sh       # 3 + 7 assertions, Redis restarted mid-test
 ./run_portal_auth.sh         # 51 assertions, portal API across 2 replicas
-./run_portal.sh              # 87 + 2 assertions, the portal driven as a browser
+./run_portal.sh              # 118 + 2 assertions, the portal driven as a browser
 ./run_mediamtx_auth.sh       # 27 assertions, real MediaMTX + ffmpeg publishes
 ./run_orchestrator.sh        # 21 assertions, real containers spawned and torn down
 ./run_orchestrator_real_app.sh                    # 15 assertions, the real GPU app in danger_detection
@@ -207,6 +217,27 @@ Also pins `active_flights()`, which resolves `/viewer/token`: only currently ope
 flights count (a landed one — `end_time` set — must not come back), and a lone
 active flight resolves with nothing to disambiguate.
 
+**`test_flight_history.py`** — the query layer behind the portal's history pages, at the
+level where it can be silently wrong. Two of its assertions carry **controls that fail**,
+because both claims pass vacuously otherwise:
+
+- *cursor paging does not repeat a row* — a flight takes off between page one and page
+  two, and the control runs `OFFSET` over the same rows at the same moment and **does**
+  repeat one;
+- *alert and recording counts do not inflate each other* — the control is the single
+  joined query, which reports a flight with 3 alerts and 2 recordings as having **6 and
+  6**.
+
+The rest is ownership, which is what this feature could get catastrophically wrong: a
+tenant's history contains none of another's, a flight belonging to someone else is as
+absent as one that never existed, and an alert crop is refused when the alert is real but
+the flight in the URL is not its own — `alert_id` is sequential across every tenant, so
+that pairing is the attack. Deleting the `user_id` filter from the history query and the
+flight check from the image lookup fails **10 of the 45**; a test that cannot fail that
+way is not testing isolation. It also pins that the media path (`public_uuid`) is in none
+of the responses — history reports what happened, it does not hand out a way to reach the
+stream — and that reading history writes nothing, taken as row counts before and after.
+
 **`test_session_tokens.py`** — the portal credential's separation from the other two.
 All three are signed with the same secret, so the `scope` claim is the only thing
 keeping them apart, and it matters most here: a **viewer token already carries a `sub`
@@ -281,6 +312,16 @@ What it guards beyond the happy path:
   `out/<public_uuid>` path, and the alert URL at ws-server. Whether video *plays* is not
   covered — that is WebRTC between the browser and MediaMTX, and the portal is not in
   the middle of it.
+- **Flight history end to end.** The flight opened for the watch assertions is then
+  flown properly: three alerts written through the app's own route, a segment logged
+  through the recorder's, and the flight closed through the orchestrator's. The history
+  page is then read as a browser reads it — counts, the link into the flight, the alert
+  messages, the recording's storage location — and the crop is fetched as a separate
+  resource and compared **byte for byte** with what was posted, having crossed two
+  services. Another tenant gets 404 on the flight page and on the crop URL, and an
+  anonymous visitor holding the exact URL gets neither. Twenty-one more flights are then
+  flown and landed to overflow one page, and the *Older* cursor is followed to check it
+  reaches the oldest flight without repeating any of the newest.
 
 **Rate limiting** is the last section of the file, because exhausting a bucket cannot be
 undone inside the window. The two replicas are started with **different proxy trust** —

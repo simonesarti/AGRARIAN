@@ -130,6 +130,55 @@ class DbWriterClient:
     async def active_flights(self, token: str) -> list:
         return (await self._call("GET", "/flights", token=token))["flights"]
 
+    async def flight_history(
+        self,
+        token: str,
+        before: Optional[int] = None,
+        stream_id: Optional[int] = None,
+    ) -> dict:
+        """
+        A page of past flights plus the cursor for the next one.
+
+        `before` is a flight_id and is passed straight through: it is a cursor
+        db-writer minted, not an offset this side computed, so the portal does no
+        arithmetic on it and cannot get the paging wrong on its own.
+        """
+        query = "&".join(
+            f"{k}={v}" for k, v in (("before", before), ("stream_id", stream_id))
+            if v is not None
+        )
+        return await self._call("GET", "/flights/history" + (f"?{query}" if query else ""),
+                                token=token)
+
+    async def flight_detail(self, token: str, flight_id: int) -> dict:
+        """One flight, its recordings, and a page of its alerts — without images."""
+        return await self._call("GET", f"/flights/{flight_id}", token=token)
+
+    async def alert_image(self, token: str, flight_id: int, alert_id: int) -> bytes:
+        """
+        The JPEG crop for one alert.
+
+        The only response the portal forwards as bytes rather than reading as
+        JSON, which is why it does not go through _call. Every failure mode is
+        the same as everywhere else, so the status handling is repeated
+        deliberately rather than generalised — the difference here is the body,
+        and nothing else.
+        """
+        headers = {"Authorization": f"Bearer {token}"}
+        path = f"/flights/{flight_id}/alerts/{alert_id}/image"
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.get(f"{self._base}{path}", headers=headers)
+        except httpx.HTTPError as e:
+            logger.error(f"db-writer unreachable on GET {path}: {e}")
+            raise DbWriterUnavailable(str(e))
+
+        if resp.status_code == 401:
+            raise SessionExpired(_detail_of(resp))
+        if resp.status_code >= 400:
+            raise UpstreamRejected(resp.status_code, _detail_of(resp))
+        return resp.content
+
     async def viewer_token(self, token: str, stream_id: Optional[int]) -> dict:
         """
         Trade the account-scoped session token for a flight-scoped viewer token.
