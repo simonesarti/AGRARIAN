@@ -1,0 +1,117 @@
+# ws-server — the viewer's alert WebSocket, and the alert-write API the app posts to.
+#
+# TWO PORTS, AND THE SEPARATION IS A SECURITY BOUNDARY (§4)
+# ---------------------------------------------------------
+# 8765 is the viewer WebSocket and is reached from outside, through Traefik.
+# 8000 is the alert-write API and must never be routed from outside the cluster.
+# They are two Services below rather than two ports on one, so that the external
+# one can be named by a Traefik router and the internal one cannot be reached by
+# anything that does not already have a pod address.
+#
+# Replicas are safe here only because fan-out goes through Redis pub/sub: an
+# in-memory client set cannot be shared, which is the defect §4 records and the
+# reason Redis is in the path at all. Replicas subscribe selectively to the
+# flights they actually have viewers for — pattern-subscribing would ship every
+# tenant's JPEG imagery to every replica.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ws-server
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: ws-server
+    app.kubernetes.io/part-of: agrarian
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ws-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ws-server
+        app.kubernetes.io/part-of: agrarian
+    spec:
+      containers:
+        - name: ws-server
+          image: ghcr.io/REPLACE_ME/agrarian-ws-server:v0.1.0
+          ports:
+            - name: ws
+              containerPort: 8765
+            - name: http
+              containerPort: 8000
+          env:
+            # Fixed at 8765, exactly as in compose and for the same reason: this
+            # is the inner hop Traefik dials and it must match the entrypoint in
+            # the static traefik.yml, which cannot interpolate. The port a VIEWER
+            # dials is the Traefik Service's, not this one.
+            - name: WS_PORT
+              value: "8765"
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+          envFrom:
+            # Validates the tokens db-writer mints. No publisher secret exists:
+            # app containers present a per-flight token issued when the flight
+            # opened (§7).
+            - secretRef:
+                name: agrarian-session-jwt
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+---
+# The viewer WebSocket. Traefik routes to this one.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ws-server
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: ws-server
+    app.kubernetes.io/part-of: agrarian
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ws-server
+  ports:
+    - name: ws
+      port: 8765
+      targetPort: ws
+---
+# The alert-write API. A separate Service with a separate name so that "which one
+# did I just route to the internet" is answerable by reading the router, not by
+# counting ports. Nothing in configs/traefik/dynamic/ may ever name this.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ws-server-alerts
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: ws-server
+    app.kubernetes.io/part-of: agrarian
+    agrarian.io/exposure: internal-only
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ws-server
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

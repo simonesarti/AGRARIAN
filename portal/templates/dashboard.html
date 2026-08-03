@@ -17,7 +17,11 @@
   </p>
 
   {% if streams %}
-  <table class="slots">
+  {# The wrapper is what keeps a narrow screen from zooming the whole page out
+     to fit this table — see .table-wrap. It matters most here, because the
+     ingest URL below is deliberately unwrapped. #}
+  <div class="table-wrap">
+  <table class="slots slots-stack">
     <thead>
       <tr><th>Slot</th><th>Ingest URL</th><th>Status</th><th></th></tr>
     </thead>
@@ -63,6 +67,7 @@
       {% endfor %}
     </tbody>
   </table>
+  </div>
   {% else %}
     <p class="empty">No slots yet. Add one to get an ingest URL for a drone.</p>
   {% endif %}

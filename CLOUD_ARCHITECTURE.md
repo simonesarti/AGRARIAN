@@ -125,11 +125,15 @@ when nothing is flying** — but that is exactly when people register, add strea
 rotate keys. A drone flies at 10am; the account was created at 11pm the night before.
 An app-tier portal would exist only while a drone was airborne, which inverts its purpose.
 
-### Platform: Kubernetes **[designed]**
+### Platform: Kubernetes **[built]**
 
 The target is **managed Kubernetes** (AKS/EKS/GKE — not self-hosted; self-managing etcd is
-not where a small team should spend attention). The current stack is docker-compose on a
-single host, and there are no manifests yet.
+not where a small team should spend attention). The compose stack on a single host remains
+the running deployment; the manifests for the whole hub tier now exist beside it in
+`configs/k8s/hub/`, generated into ConfigMaps and applied by `kubectl apply -k configs/`,
+and are deployed and asserted against a real cluster by
+`tests/comms/run_hub_manifests.sh`. What is still missing is a cluster anyone is paying
+for, and the provider-specific values that only exist once there is one.
 
 **The deciding factor is GPU cost when nothing is flying.** One container per *active*
 flight means the GPU tier is idle most of the day — drones fly in daylight, in workable
@@ -157,13 +161,37 @@ two deployment models to operate at once — worse than either alone. This const
 non-obvious and eliminates the option that otherwise looks best for a small team, so it is
 recorded here rather than rediscovered later.
 
-#### Migration is mechanical, with one real change
+#### Migration is mechanical, with two real changes **[built]**
 
 Every hub service already has a Dockerfile and takes configuration from environment
-variables, so compose services convert to Deployments directly. The one genuine difference
-is that **MediaMTX and Mosquitto need `LoadBalancer` services carrying TCP and UDP**, not an
-HTTP Ingress — which is the same split already chosen for TLS termination in §7, so the
-topology and the security model agree.
+variables, so compose services convert to Deployments directly. This section predicted
+one genuine difference and there turned out to be two; the manifests are now written
+and deployed on a real cluster, so both are findings rather than forecasts.
+
+**The predicted one.** MediaMTX and Mosquitto need `LoadBalancer` services carrying TCP
+and UDP, not an HTTP Ingress — which is the same split already chosen for TLS
+termination in §7, so the topology and the security model agree. One correction to how
+that was phrased: for MediaMTX it must be a **single** Service carrying both protocols,
+not one of each. WebRTC advertises exactly one host candidate address
+(`MTX_WEBRTCICEHOSTNAT1TO1IPS`), so 8189/tcp and 8189/udp have to arrive at the same
+external address; two Services would allocate two, and the TCP half would fail for
+precisely the viewers ICE-TCP exists to serve. Mixed-protocol load balancers are GA
+from Kubernetes 1.26 and carried by Azure and AWS NLB; where a provider will not, the
+fallback is two Services pinned to one pre-allocated address.
+
+**The unpredicted one: the recorder cannot stay a separate Deployment.** It shares the
+`recordings` volume with MediaMTX, and two pods sharing a volume needs `ReadWriteMany` —
+Azure Files, EFS or Filestore. That is a paid, network-attached filesystem standing in
+for what is a handoff between two processes that can sit on one node. So the recorder
+becomes a **sidecar container in the MediaMTX pod**, sharing an ordinary
+`ReadWriteOnce` claim.
+
+It costs nothing, which is why it is the right answer rather than a compromise:
+MediaMTX cannot replicate anyway, so a recorder pinned 1:1 to it loses no scaling that
+existed. Every part of this codebase already calls it "the recorder sidecar"; on this
+platform it finally is one. The `runOnRecordSegmentComplete` hook still points at
+`http://recorder:8000`, resolved by a Service that selects the same pod, so one
+`mediamtx.yaml` serves both deployments.
 
 Kubernetes does **not** reverse-proxy anything itself: `Ingress` and the Gateway API are
 interfaces, and a controller has to be installed to implement them. That controller is
@@ -677,11 +705,14 @@ is worse:
   off `flights`; joining both in one query multiplies the rows, and a flight with 3
   alerts and 2 recordings reports 6 of each. Both figures are asserted, with the
   inflating query kept beside them as a control.
-- **Alert images are a route, not a field.** The live alert feed inlines a crop as base64
-  because it is delivering one alert over a socket that is already open; a flight's
-  history is fifty of them at once, and inlining those would be tens of megabytes the
-  browser can neither cache separately nor defer. As URLs they are lazy, cacheable, and
-  individually authorised.
+- **Alert images are a route, not a field.** The live alert feed inlines the image as
+  base64 because it is delivering one alert over a socket that is already open; a
+  flight's history is fifty of them at once, and inlining those would be tens of
+  megabytes the browser can neither cache separately nor defer. As URLs they are lazy,
+  cacheable, and individually authorised. "Tens of megabytes" is not a figure of speech:
+  this document calls these images crops, and they are not — `output_alert_streamer`
+  stores the **full-resolution annotated frame**, unresized, so each one is a 1920×1080
+  JPEG.
 - **`public_uuid` is not in any of the three responses.** History reports what happened;
   it is not a way to reach the media path it happened on. A viewer token is still the
   only thing that opens a stream.
@@ -1296,36 +1327,46 @@ waits on them and neither is work:**
    never executed.
 
 **The ingress tier is finished, the product has been watched working in a browser, both
-`FlightRuntime` backends exist, and the portal now shows what has flown as well as what
-is flying.** Between them those closed the five items that stood at the top of this list.
-What follows is one item.
+`FlightRuntime` backends exist, the portal shows what has flown as well as what is
+flying, and the hub tier now has manifests that deploy on a real cluster.** Between them
+those closed every item that has stood at the top of this list.
 
-**Then:**
+**There is no code item left here.** What remains is the two asks above, plus the
+provider-specific values that only exist once a cluster does — a registry to push the
+five images to, a storage class if the default is not wanted, and the load-balancer
+addresses that `configs/k8s/endpoints.env` needs. None of those is work that can be
+done here.
 
-1. **Manifests for the hub tier.** The orchestrator's half of the migration is done and
-   the flight namespace exists; the eight hub services are still compose-only. §2 calls
-   this mechanical and it is — every service already takes its configuration from the
-   environment — with the one real difference being that MediaMTX and Mosquitto need
-   `LoadBalancer` services carrying TCP and UDP rather than an HTTP Ingress. **This is
-   only worth starting when a cluster is actually being paid for.** Until then it is
-   work that can only be tested against a cluster nobody is running, which is why it
-   waited behind every feature a user can see — and there are none of those left above
-   it, so the honest reading is that this branch is now waiting on a deployment
-   decision rather than on code.
+One claim this list used to make is worth retracting, because it was wrong in a way
+that cost time: it said the hub manifests **"can only be tested against a cluster
+nobody is running"**, and that this made them not worth starting. `run_k8s_runtime.sh`
+had already disproved it next door — k3s in a container is a real API server, a real
+scheduler and a real kubelet, and it starts in seconds. The manifests were written and
+verified without a cloud account, and the two defects that turned up in doing so
+(§2, and the entry in *Built and tested*) would both have shipped straight into the
+first paid cluster.
 
 Five things left this list rather than being completed by it, and the distinction
 matters because each leaves a residue:
 
 - **Certificate renewal** is answered (§7), and leaves one line for whoever writes the
   deployment hook: **it must `touch` a file in Traefik's watched directory**, because
-  Traefik is the terminator that does not notice a replaced leaf on its own.
+  Traefik is the terminator that does not notice a replaced leaf on its own. That
+  applies to the compose deployment. Under the manifests it does not: cert-manager
+  rewrites the `agrarian-tls` Secret, the kubelet refreshes the projected files in
+  place, and Traefik's file watcher sees it. **Mosquitto's `SIGHUP` still has no
+  answer on either platform** — nothing in the manifests sends one, so that remains a
+  job for whatever drives renewal.
 - **The watch page** has been loaded in Chrome and Firefox and the video plays, which
-  was the whole question. It leaves the smaller half of that item behind — see *Open*.
+  was the whole question. The smaller half it left behind — the alert aside and the
+  page on a phone — has since been looked at too, along with the two history pages,
+  and is closed rather than pending; the three defects that pass found are in *Built
+  and tested*.
 - **The ingress tier** is built on both sides. It leaves the choice of when to make TLS
   compulsory, which is below and is not work.
 - **The Kubernetes `FlightRuntime` backend** is built, and with it the service account
-  that retires the Docker socket (§2). It leaves the rest of the migration — the hub
-  services have no manifests — which is item 1 above rather than a residue of this one.
+  that retires the Docker socket (§2). The rest of the migration it used to leave — the
+  hub services having no manifests — is now built too, and both are above.
   It also leaves a knob this platform offers and Docker does not: `activeDeadlineSeconds`
   would cap a single flight's GPU hours. It is deliberately unset, because a backend that
   ends flights the other one would not is a backend the abstraction no longer hides. It
@@ -1351,6 +1392,126 @@ billing).
 
 ### Built and tested
 
+- **The hub tier as Kubernetes manifests, deployed on a real cluster** (§2, 2026-08-03).
+  `configs/k8s/hub/` plus a kustomization at `configs/`, applied with
+  `kubectl apply -k configs/`. All eight hub services come up: Redis, db-writer,
+  ws-server, portal, orchestrator, MediaMTX (with the recorder beside it), Mosquitto
+  and Traefik.
+
+  **The ConfigMaps are generated from the config files the compose stack already
+  mounts**, not copied from them. That is why the kustomization sits at `configs/`
+  rather than in `k8s/` — kustomize refuses to read above its own root, and the root
+  has to contain `mediamtx/`, `mosquitto/` and `traefik/`. Obeying that constraint
+  beats working around it with `--load-restrictor`: two copies of `mediamtx.yaml` is
+  the same defect §4 rejects in `authInternalUsers` and in Mosquitto's
+  dynamic-security plugin — a second store kept in sync by hand, wrong silently.
+
+  Verified by **37 assertions** in `tests/comms/run_hub_manifests.sh`, against k3s in
+  a container with the five service images built and imported. Seventeen read the
+  render before anything runs; twenty ask the live cluster.
+
+  **Two defects were found that reading the manifests could not have caught**, and
+  both were silent:
+
+  - **kustomize's `namespace:` transformer rewrites `Namespace` objects themselves.**
+    It collapsed `agrarian-flights` into `agrarian`, which would have given the
+    orchestrator's Role authority over Jobs in the namespace holding db-writer, Redis
+    and Mosquitto — undoing the entire security argument of
+    `orchestrator-rbac.yaml`. kustomize reports this as an "ID conflict", which does
+    not sound like what it is. There is now no global namespace transformer; every
+    manifest names its own.
+  - **A `configMapGenerator` without an explicit namespace generates into `default`
+    *and* silently declines to stamp its content hash into the references.** The build
+    succeeds and every mount dangles. The failure surfaces only as pods stuck in
+    `ContainerCreating`.
+
+  The second one also broke the assertion written to catch it, which is worth
+  recording because it is the failure mode this whole test directory is built against.
+  The first version compared reference names against a regex for the unhashed
+  spelling; the bare name sits at the end of a line, the pattern required a trailing
+  character, and so it **matched nothing whether or not the bug was present** — it
+  passed the control. It now resolves every `configMapRef`, `configMapKeyRef` and
+  `configMap` volume against the ConfigMaps actually in the render, in the same
+  namespace, and reports one dangling reference against the reintroduced bug and zero
+  without it.
+
+  Both defects were confirmed by reintroducing them. The namespace one fails loudly at
+  build time; the generator one is the quiet one and is why the referential check
+  exists.
+
+  Also asserted, each pinning a claim made elsewhere in this document: the portal
+  manifest carries neither the session secret nor the database secret while
+  db-writer's carries the first (§7, as a manifest property and again as the running
+  pod's environment); db-writer, the alert-write API, Redis and the orchestrator are
+  all `ClusterIP` (§8); Traefik's Service does not carry 8189 (§8); the orchestrator
+  mounts no Docker socket, runs `FLIGHT_RUNTIME=kubernetes`, and under its own
+  ServiceAccount may create Jobs in the flight namespace but not in the hub namespace
+  and cannot read a Secret (§2); the recorder is a container in the MediaMTX pod with
+  both containers mounting the claim, and no separate recorder Deployment exists; and
+  MediaMTX opens **RTMPS** on 1936, which is the strongest evidence available that the
+  TLS Secret mounted and parsed — it exits at startup when the file is missing, so the
+  plaintext listener alone would prove nothing.
+
+  **Not covered: the GPU, the load balancers and the cloud.** k3s's ServiceLB assigns
+  node addresses rather than provisioning anything, so a `LoadBalancer` here proves the
+  Service spec is accepted and routes — not that a provider will carry mixed TCP and
+  UDP on one address. That constraint is real and the first paid cluster is where it
+  stops being spec. The images are placeholders (`ghcr.io/REPLACE_ME/…`) that the
+  runner substitutes, and the flight app is never started, because there is no GPU and
+  no device plugin — the same gap `run_k8s_runtime.sh` already records.
+- **Every page looked at in a browser, at desktop and phone width** (§4, 2026-08-03).
+  The last of the "asserted but unobserved" UI items, and the one that closes the
+  *Open* entry that used to sit here naming two corners of the watch page and the two
+  history pages. Driven against `run_watch_live.sh` — a real flight on a real GPU —
+  with Chrome under playwright at 1440px and at 390px, alerts injected on the Redis
+  channel for the live aside and 57 written through db-writer's own alert route for
+  the flight page.
+
+  **Two of the three corners were fine and one was not.** The alert aside renders,
+  newest first, with the crop decoding and `<script>alert(1)</script>` arriving as
+  text — the `textContent` path holds. The watch page stacks correctly on a phone,
+  because it is the one page anyone made responsive: its breakpoint was the *only*
+  `@media` rule in the stylesheet. Playback re-confirmed in passing — `readyState 4`,
+  1920×1080, `currentTime` advancing, exactly one WHEP POST answering 201, no request
+  to the reader page.
+
+  Three defects were found and fixed, and the first is the one worth remembering:
+
+  - **`/history` widened the layout viewport and zoomed the whole page out.** A
+    six-column table with a `nowrap` timestamp cannot fit 390px, and a browser does
+    not clamp it — it grows the layout viewport instead. Measured: `innerWidth` came
+    back **663** on a 390px device, every word on the page at 59%. **The obvious check
+    cannot see this**, because `scrollWidth > innerWidth` never fires when
+    `innerWidth` is the thing that grew; the first pass of this work asserted no
+    overflow and was wrong. Fixed with a `.table-wrap` scroll container — which was
+    inert until `.card` also got `min-width: 0`, since a grid item refuses to shrink
+    below its content by default.
+  - **The ingest URL broke mid-key.** `word-break: break-all` rendered it as an
+    eleven-line ribbon four characters wide. This is the one string a human
+    transcribes by hand before every flight (§3) and a stream key has no safe break
+    point, so it is now `nowrap` and scrolls inside its own box.
+  - **The alert grid stretched every card to the tallest in its row**, turning the
+    ~1-in-5 alerts with no image into large empty bordered boxes. `align-items: start`.
+
+  Fixing the first one moved **Watch** — the primary action of the product — off
+  screen behind a horizontal scroll with nothing to say so, so the slot table stops
+  being a table below 640px (`.slots-stack`). The history table deliberately does not:
+  its columns are bare numbers that mean nothing without their headers, so it stays a
+  table and its first column became a link instead.
+
+  **One thing this turned up that is not a UI matter at all: an alert image is not a
+  crop.** `output_alert_streamer._process_alert` stores the *full-resolution annotated
+  frame* — `height, width = frame.shape[:2]`, no resize before `cv2.imencode` — so
+  every alert row holds a 1920×1080 JPEG at quality 85. This document calls them crops
+  throughout. It strengthens §4's reasoning for making alert images a route rather than
+  a field, and it means a flight page loads fifty full-HD frames: ~78 KB each for the
+  test pattern measured here, and several times that for real aerial imagery, which
+  compresses far worse than colour bars.
+
+  `run_portal.sh` (118/118) and `run_portal_auth.sh` (51/51) both still pass against
+  the changed templates. What is still not covered is that **nothing re-checks any of
+  this** — it is the same standing gap as the video observation below, and a change to
+  the stylesheet can undo it silently.
 - **Flight history in the portal** (§4, 2026-08-03). Three read routes on db-writer, two
   pages on the portal, and no schema change of any kind — every row this reads was
   already being written. Covered twice, at the two levels where it can be wrong:
@@ -1376,10 +1537,11 @@ billing).
   "another tenant's flight is absent" and "a real alert id under the wrong flight is
   refused". A test that cannot fail this way is not testing isolation.
 
-  What is **not** covered: nobody has looked at either page in a browser. The markup is
-  asserted, the crop is byte-compared through two services, and neither of those is the
-  same claim as "the grid of fifty crops looks right" — the same gap the watch page's
-  alert aside still has, and it is in *Open* with it.
+  What was **not** covered at the time: nobody had looked at either page in a browser.
+  The markup is asserted, the crop is byte-compared through two services, and neither of
+  those is the same claim as "the grid of fifty images looks right". Both pages have
+  since been looked at, at desktop and phone width — see the entry above, which is also
+  where the three defects that found are recorded.
 
 - **The Kubernetes `FlightRuntime` backend, against a real API server** (§2, 2026-08-03).
   `KubernetesFlightRuntime` creates one Job per flight; `FLIGHT_RUNTIME` selects it.
@@ -1854,11 +2016,16 @@ list nearly empty. Everything here that mattered was portal work.
 
 ### Designed, not built
 
-- **Manifests for the hub tier.** Eight services that exist only as compose services.
-  Mechanical (§2), and gated on a cluster being paid for rather than on a decision.
 - **The cloud L4 load balancer and cert-manager (§7).** Deployment-time pieces with
   nothing to build locally: the LB is a managed resource and cert-manager replaces
-  `scripts/generate_local_certs.sh` when a hostname resolves here.
+  `scripts/generate_local_certs.sh` when a hostname resolves here. The manifests
+  already expect both — three `LoadBalancer` Services, and an `agrarian-tls` Secret
+  that `configs/k8s/secrets.README.md` shows as a cert-manager `Certificate` with a
+  hand-made fallback.
+
+The hub manifests have left this list — see *Built and tested*. What they leave behind
+is not manifest work: a registry to push five images to, and the load-balancer
+addresses that only exist once a provider has assigned them.
 
 The ingress tier itself has left this list. Both halves are built and tested — see
 above — which is why §8's port table no longer has a "not configured" cell in it.
@@ -1921,19 +2088,6 @@ translation work.
   already routes HLS through it). The ingress tier they were waiting on now exists, so
   what is left gating them is a reason: neither is worth building before a real user
   reports being unable to watch.
-- **Two corners of the watch page are still unobserved.** The video itself is not one
-  of them any more — it plays in Chrome and in Firefox (see *Built and tested*), which
-  retires autoplay policy as the risk this item was mostly about. What nobody has
-  watched is **the alert aside rendering a real alert in a browser**, and **the page on
-  a phone**. Both are UI rather than protocol: the socket, the fan-out and the escaping
-  are all tested, and `run_portal.sh` asserts the markup, but "asserted" and "looks
-  right at 390px wide" are different claims. `run_watch_live.sh` prints a `redis-cli
-  PUBLISH` line for exactly the first one, so it costs a paste rather than a setup.
-
-  **The two history pages join this item rather than adding one of their own.** They are
-  server-rendered HTML asserted through HTTP, with the same gap and the same fix: the
-  alert grid on a flight's page is the crop rendering question again, at fifty crops
-  instead of one.
 - **A recording is a location, not a download.** History reaches every row the system
   records, but the recordings table stores a blob name or a path on the recordings
   volume, and the portal shows it as text. Handing the segment over means either the

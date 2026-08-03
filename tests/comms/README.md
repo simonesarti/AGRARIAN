@@ -37,6 +37,7 @@ try to run these directly with `python3`.
 | `run_cert_renewal.sh` | the above + Traefik, host `ffmpeg` | `./run_cert_renewal.sh` |
 | `run_orchestrator_recovery.sh` | the same as `run_orchestrator.sh` | `./run_orchestrator_recovery.sh` |
 | `run_k8s_runtime.sh` | Docker only — it brings its own k3s cluster | `./run_k8s_runtime.sh` |
+| `run_hub_manifests.sh` | Docker only — it brings its own k3s cluster | `./run_hub_manifests.sh` |
 | `test_tenancy.py` | running ws-server + Redis | see below |
 | `test_replicas.py` | 2 ws-server replicas + Redis | see below |
 | `run_watch_live.sh` | **not a test** — the whole product plus a browser | `./run_watch_live.sh [host]` |
@@ -134,6 +135,7 @@ docker run --rm -v "$PWD/db_writer:/dbw" -v "$PWD/tests/comms:/tests:ro" \
 ./run_ingress_tls.sh         # 42 assertions, the drone's half — RTMPS, RTSPS, MQTTS
 ./run_cert_renewal.sh        # 15 assertions, what each terminator does on renewal
 ./run_k8s_runtime.sh         # 65 assertions, the other FlightRuntime backend on real k3s
+./run_hub_manifests.sh       # 37 assertions, the whole hub tier deployed on real k3s
 ```
 
 `run_traefik_tls.sh` is the only runner that speaks HTTPS rather than working around

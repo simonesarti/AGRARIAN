@@ -150,6 +150,12 @@ celerybeat.pid
 # Environments
 .env
 .venv
+
+# Deployment facts for the Kubernetes hub, filled in once the load balancers have
+# addresses. Their .example neighbours are tracked; these are not, for the same
+# reason .env is not.
+configs/k8s/endpoints.env
+configs/k8s/flight-app.env
 env/
 venv/
 ENV/

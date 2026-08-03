@@ -51,6 +51,11 @@ a { color: var(--accent); }
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 22px;
+  /* .page is a grid, and a grid item defaults to min-width: auto — it refuses
+     to shrink below the widest thing inside it. Without this the .table-wrap
+     scroll container below is inert: the card grows to fit the table, the page
+     grows to fit the card, and the browser zooms out exactly as before. */
+  min-width: 0;
 }
 .card.narrow { max-width: 420px; margin: 40px auto; }
 
@@ -119,6 +124,16 @@ button:hover, .button:hover { border-color: var(--muted); }
 
 /* ── Slot table ────────────────────────────────────────────────────────────── */
 
+/* Every .slots table lives inside one of these. A table has a minimum width it
+   cannot go below, and on a narrow screen the browser does not clamp it — it
+   widens the LAYOUT VIEWPORT to fit and zooms the whole document out instead.
+   Measured on /history at 390px: window.innerWidth came back 663 and every
+   word on the page shrank to 59%. That failure is invisible to the obvious
+   check, because scrollWidth > innerWidth cannot fire when innerWidth is the
+   thing that grew. Confining the overflow here means the table scrolls
+   sideways and the rest of the page keeps its size. */
+.table-wrap { overflow-x: auto; }
+
 .slots { width: 100%; border-collapse: collapse; margin-top: 14px; }
 .slots th {
   text-align: left;
@@ -132,7 +147,15 @@ button:hover, .button:hover { border-color: var(--muted); }
 .slots td { border-bottom: 1px solid var(--line); padding: 12px 10px; vertical-align: top; }
 
 /* The ingest URL is long and must be readable in full — it gets retyped into a
-   controller, so wrapping it beats truncating it. */
+   controller, so wrapping it beats truncating it.
+
+   It does NOT beat leaving it on one line. This used to be word-break: break-all,
+   which wraps at whatever character the column edge lands on: at 390px the URL
+   came out as an eleven-line ribbon four characters wide, split mid-key. This is
+   the one string in the product a human transcribes by hand before every flight
+   (§3), and a stream key has no safe place to break — every break invites a
+   dropped or doubled character. So it stays on one line and .table-wrap above
+   scrolls to reach the end of it. */
 .key {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12.5px;
@@ -142,11 +165,34 @@ button:hover, .button:hover { border-color: var(--muted); }
   border-radius: 6px;
   padding: 6px 8px;
   display: inline-block;
-  word-break: break-all;
+  white-space: nowrap;
 }
 
 .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
 .actions form { margin: 0; }
+
+/* On a narrow screen the slot table stops being a table. .table-wrap alone
+   fixed the zoom-out but left Watch — the primary action of the whole product —
+   as the last column of something that scrolls sideways, with nothing on screen
+   to say so. These four columns are self-describing (a label, a URL, a status
+   badge, buttons), so stacking them costs no meaning and keeps every control
+   visible.
+
+   The history table deliberately does NOT get this: its columns are bare
+   numbers that mean nothing without their headers, so it stays a table and
+   scrolls, and its first column was made a link instead. */
+@media (max-width: 640px) {
+  .slots-stack, .slots-stack tbody, .slots-stack tr, .slots-stack td {
+    display: block;
+    width: 100%;
+  }
+  .slots-stack thead { display: none; }
+  .slots-stack tr { border-bottom: 1px solid var(--line); padding: 10px 0; }
+  .slots-stack td { border-bottom: 0; padding: 5px 0; }
+  /* The key stays one unbroken line and scrolls inside its own box, so the
+     row does not need the page to scroll on its behalf. */
+  .slots-stack .key { display: block; overflow-x: auto; }
+}
 
 .badge {
   font-size: 12px;
@@ -184,11 +230,20 @@ button:hover, .button:hover { border-color: var(--muted); }
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: 12px;
+  /* Cards size to their own content instead of stretching to the tallest in
+     the row. Roughly one alert in five carries no crop, and a stretched card
+     turned each of those into a large empty bordered box beside two full ones. */
+  align-items: start;
 }
 /* width/height attributes are set from the stored dimensions so the browser
    reserves the space before the image arrives; this keeps the aspect ratio
-   while still letting the tile decide the width. */
-.alerts-grid img { width: 100%; height: auto; }
+   while still letting the tile decide the width.
+
+   Deliberately NOT forced into a fixed box. "Crop" overstates what these are:
+   output_alert_streamer._process_alert stores the full-resolution annotated
+   frame, so every alert image is the video's own aspect ratio and they are
+   already uniform. A fixed box would letterbox all of them and buy nothing. */
+.alerts-grid img { width: 100%; height: auto; border-radius: 6px; }
 
 /* ── Watch page ────────────────────────────────────────────────────────────── */
 

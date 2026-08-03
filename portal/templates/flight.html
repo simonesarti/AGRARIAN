@@ -38,6 +38,9 @@
       is fetched with the operator's own credentials, which the portal does not
       hold and must not.
     </p>
+    {# Same wrapper as the other two tables: a storage location is a long
+       unbroken string, so this one can widen a narrow page just as easily. #}
+    <div class="table-wrap">
     <table class="slots">
       <thead><tr><th>Uploaded</th><th>Backend</th><th>Location</th></tr></thead>
       <tbody>
@@ -50,6 +53,7 @@
         {% endfor %}
       </tbody>
     </table>
+    </div>
   {% else %}
     <p class="empty">No recordings archived for this flight.</p>
   {% endif %}

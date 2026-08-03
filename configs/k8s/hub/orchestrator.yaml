@@ -1,0 +1,131 @@
+# Orchestrator — one GPU container per active flight.
+#
+# THIS FILE IS WHERE THE DOCKER SOCKET STOPS BEING MOUNTED
+# --------------------------------------------------------
+# §9 lists "the orchestrator holds the Docker socket" as a live weakness, and the
+# compose stack still does. Here it does not exist: FLIGHT_RUNTIME=kubernetes, and
+# the authority comes from the ServiceAccount in ../orchestrator-rbac.yaml — five
+# verbs on jobs in one namespace, granted by a Role rather than a ClusterRole.
+#
+# Be precise about what that buys (§2): the privilege is not reduced, it is scoped.
+# A compromised orchestrator can still start GPU workloads, because that is its job.
+# What it can no longer do is read a Secret, create a privileged pod, touch this
+# namespace's other services, or reach the node.
+#
+# STILL NOT EXPOSED. It has no Service at all, not even ClusterIP — MediaMTX's
+# runOn hooks are the only caller and they reach it by pod DNS through the Service
+# below. §8 lists it among the things that must never be routed from outside.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: orchestrator
+    app.kubernetes.io/part-of: agrarian
+spec:
+  # One, and this is not a placeholder. The orchestrator serialises every
+  # operation on a stream key behind a per-key lock held in its own memory, and
+  # recover() rebuilds its bookkeeping from the Jobs it finds at startup. Two
+  # replicas would each hold half a lock and both try to recover the same flights.
+  # Making it replicable is a design change, not a number change.
+  replicas: 1
+  strategy:
+    # Not RollingUpdate: for the duration of a rolling update two orchestrators
+    # would be live at once, which is exactly what the single replica above rules
+    # out. A moment with no orchestrator is safe — nothing stops flying when the
+    # control plane is down (§2), and recover() is built for precisely this.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orchestrator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orchestrator
+        app.kubernetes.io/part-of: agrarian
+    spec:
+      serviceAccountName: agrarian-orchestrator
+      containers:
+        - name: orchestrator
+          image: ghcr.io/REPLACE_ME/agrarian-orchestrator:v0.1.0
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: FLIGHT_RUNTIME
+              value: kubernetes
+            - name: DB_WRITER_URL
+              value: http://db-writer:8000
+            - name: RECONNECT_GRACE_S
+              value: "30"
+            # Docker's spelling, translated by the runtime into a memory-backed
+            # emptyDir of 256Mi mounted at /dev/shm. Kubernetes has no --shm-size
+            # field, and a pod without that volume gets 64 MB — on which the
+            # annotation worker takes a silent SIGBUS a few frames in (§2).
+            - name: APP_SHM_SIZE
+              value: 256m
+            # APP_GPUS is absent on purpose. Under Docker you name cards on a host
+            # you know; here you request a COUNT and the scheduler picks the node,
+            # which is the entire point of the node pool.
+            - name: APP_GPU_COUNT
+              value: "1"
+            # APP_NETWORK is also absent, and has no analogue: pods share a
+            # cluster network and find each other by service DNS.
+            - name: APP_NAMESPACE
+              value: agrarian-flights
+            # A GPU pool is normally labelled AND tainted, so reaching it needs
+            # both. Without a matching toleration every flight sits Pending
+            # forever, which fails as a flight that never starts rather than as an
+            # error — the failure mode §2 warns about. Both values are
+            # provider-specific: these are the AKS/GKE spellings, EKS differs.
+            - name: APP_NODE_SELECTOR
+              value: "agrarian.io/gpu=true"
+            - name: APP_GPU_TOLERATION
+              value: "nvidia.com/gpu=present:NoSchedule"
+          envFrom:
+            # APP_IMAGE — the GPU image to run per flight — plus the APP_ENV_*
+            # settings forwarded to every flight container with the prefix
+            # stripped. They name in-cluster services, so they change between
+            # compose and here: `mediamtx` and `mosquitto` are Service names now.
+            - configMapRef:
+                name: agrarian-flight-app
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: orchestrator
+    app.kubernetes.io/part-of: agrarian
+    agrarian.io/exposure: internal-only
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: orchestrator
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

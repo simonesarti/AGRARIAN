@@ -1,0 +1,92 @@
+# The hub tier, as Kubernetes objects.
+#
+#   kubectl apply -k configs/
+#
+# WHY THIS FILE IS HERE AND NOT IN k8s/
+# -------------------------------------
+# It generates the ConfigMaps from the SAME config files the compose stack mounts —
+# configs/mediamtx/mediamtx.yaml, configs/mosquitto/mosquitto.conf and
+# configs/traefik/ — rather than holding second copies of them. kustomize refuses
+# to read files above its own root, so the root has to be the directory that
+# contains all of them, which is this one.
+#
+# That constraint is worth obeying rather than working around with
+# --load-restrictor. Two copies of mediamtx.yaml is exactly the defect §4 rejects
+# in MediaMTX's own authInternalUsers and in mosquitto's dynamic-security plugin: a
+# second store that has to be kept in sync by hand, and that is wrong silently.
+#
+# The generated names carry a content hash, so editing mediamtx.yaml changes the
+# ConfigMap name, which rolls the Deployment that mounts it. A config change that
+# needed a manual restart to take effect would be the same class of bug as the
+# Traefik certificate one (§7).
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# There is deliberately no `namespace:` transformer here. It would rewrite the
+# namespace of every object INCLUDING the two Namespace objects themselves, which
+# collapses agrarian-flights into agrarian and takes the entire security argument
+# of orchestrator-rbac.yaml with it — the Role would then grant Jobs in the
+# namespace holding db-writer, Redis and Mosquitto. kustomize reports it as an "ID
+# conflict" rather than as the disaster it is. Every manifest below names its own
+# namespace explicitly instead.
+
+resources:
+  # Namespaces, the orchestrator ServiceAccount and its Role. Applied first
+  # because everything below lives in the namespaces it declares.
+  - k8s/orchestrator-rbac.yaml
+  - k8s/hub/redis.yaml
+  - k8s/hub/db-writer.yaml
+  - k8s/hub/ws-server.yaml
+  - k8s/hub/portal.yaml
+  - k8s/hub/orchestrator.yaml
+  - k8s/hub/mediamtx.yaml
+  - k8s/hub/mosquitto.yaml
+  - k8s/hub/traefik.yaml
+
+# EVERY GENERATOR BELOW MUST NAME ITS NAMESPACE. Without it a generated ConfigMap
+# is namespaceless — it lands in `default` — and, worse, kustomize's name-reference
+# rewriter matches on namespace, so it silently declines to stamp the content hash
+# into the Deployments in `agrarian` that mount it. The build succeeds, every
+# reference dangles, and the failure arrives as pods stuck in ContainerCreating
+# rather than as an error from kustomize.
+configMapGenerator:
+  # The real files, not copies of them.
+  - name: agrarian-mediamtx-config
+    namespace: agrarian
+    files:
+      - mediamtx/mediamtx.yaml
+  - name: agrarian-mosquitto-config
+    namespace: agrarian
+    files:
+      - mosquitto/mosquitto.conf
+  - name: agrarian-traefik-static
+    namespace: agrarian
+    files:
+      - traefik/traefik.yml
+  - name: agrarian-traefik-dynamic
+    namespace: agrarian
+    files:
+      - traefik/dynamic/routers.yml
+
+  # Deployment facts, not repository facts. Both are copied from their .example
+  # neighbours and filled in once the load balancers have addresses — see the
+  # comments in each. They are gitignored for the same reason .env is.
+  - name: agrarian-endpoints
+    namespace: agrarian
+    envs:
+      - k8s/endpoints.env
+  - name: agrarian-flight-app
+    namespace: agrarian
+    envs:
+      - k8s/flight-app.env
+
+# Secrets are NOT generated here. secretGenerator would put their values in a file
+# in the repository, and §7's whole position on SESSION_JWT_SECRET is that it lives
+# in exactly two services and nowhere else. See k8s/secrets.README.md for the
+# kubectl commands that create the four this deployment expects.
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: agrarian

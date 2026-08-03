@@ -1,0 +1,142 @@
+# Mosquitto — the telemetry plane.
+#
+# The image is the stock broker plus mosquitto-go-auth prebuilt in, because
+# eclipse-mosquitto does not ship the plugin mosquitto.conf requires
+# (auth_plugin /mosquitto/go-auth.so). Its config also lives at
+# /etc/mosquitto/mosquitto.conf rather than /mosquitto/config/ like the stock image.
+#
+# The upstream plugin project is archived as of mid-2025 (§9). It still works and
+# the tag is pinned, but there is no security-patch path if a CVE surfaces — which
+# is a reason to keep the tag written down here rather than floating.
+#
+# Like MediaMTX, this terminates its own TLS: it preserves the client identity the
+# ACL check depends on, and MQTTS is arbitrary TCP that an L7 proxy has nothing to
+# say about (§7). Unlike MediaMTX, it does NOT reread a replaced certificate on its
+# own — it needs SIGHUP (measured in run_cert_renewal.sh).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mosquitto
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: mosquitto
+    app.kubernetes.io/part-of: agrarian
+spec:
+  # One. A broker holds its subscriptions in memory, so two replicas behind one
+  # load balancer would put a drone's publish and the app's subscription on
+  # different brokers roughly half the time — the topic ACLs would still be
+  # enforced and the telemetry would simply never arrive. That failure looks like
+  # the starved-combiner case run_mqtt_auth.sh had to be taught to detect (§9),
+  # which is the kind of silence worth not building in on purpose.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mosquitto
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mosquitto
+        app.kubernetes.io/part-of: agrarian
+    spec:
+      containers:
+        - name: mosquitto
+          image: iegomez/mosquitto-go-auth:2.1.0-mosquitto_2.0.15
+          ports:
+            - name: mqtts
+              containerPort: 8883
+            - name: mqtt
+              containerPort: 1883
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mosquitto/mosquitto.conf
+              subPath: mosquitto.conf
+              readOnly: true
+            - name: certs
+              mountPath: /mosquitto/certs
+              readOnly: true
+            - name: data
+              mountPath: /mosquitto/data
+            - name: log
+              mountPath: /mosquitto/log
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: agrarian-mosquitto-config
+        - name: certs
+          secret:
+            secretName: agrarian-tls
+            items:
+              # mosquitto.conf points cafile, certfile and keyfile at this one
+              # directory, and the names are what it already expects.
+              - key: tls.crt
+                path: server.crt
+              - key: tls.key
+                path: server.key
+              - key: ca.crt
+                path: ca.crt
+        # emptyDir rather than a claim for both: persistence is off in
+        # mosquitto.conf, so `data` holds nothing worth keeping across a restart,
+        # and the log goes to the container's stdout collector in a cluster.
+        - name: data
+          emptyDir: {}
+        - name: log
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mosquitto-public
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: mosquitto
+    app.kubernetes.io/part-of: agrarian
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: mosquitto
+  ports:
+    # Where a drone should publish: its MQTT password is its stream key, so plain
+    # 1883 puts a non-expiring credential on the wire.
+    - name: mqtts
+      port: 8883
+      targetPort: mqtts
+      protocol: TCP
+    # The same narrow fallback the plaintext RTMP listener is.
+    - name: mqtt
+      port: 1883
+      targetPort: mqtt
+      protocol: TCP
+---
+# The in-cluster name. The app container subscribes over this rather than going
+# out to the load balancer and back — which is the in-cloud scoping decision in
+# §7, and the reason removing the plaintext listener is not purely a drone-side
+# question.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mosquitto
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: mosquitto
+    app.kubernetes.io/part-of: agrarian
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mosquitto
+  ports:
+    - name: mqtt
+      port: 1883
+      targetPort: mqtt
+    - name: mqtts
+      port: 8883
+      targetPort: mqtts

@@ -1,0 +1,112 @@
+# Portal — the account pages, and the only service here a browser talks to directly.
+#
+# WHAT IS DELIBERATELY ABSENT FROM THIS FILE
+# ------------------------------------------
+# SESSION_JWT_SECRET and every database variable. The portal mints nothing,
+# validates nothing and reads no table: it holds the session cookie, forwards its
+# value to db-writer, and treats db-writer's 401 as the answer (§7). That is one
+# extra hop per request, and it buys the signing key of every credential in the
+# system being absent from the tier facing the internet.
+#
+# run_portal.sh proves this is real rather than stated — its replicas are started
+# with neither variable and serve every page. Adding either secretRef here would
+# quietly undo it, which is why there is no commented-out line to uncomment.
+#
+# It must also stay stateless: the session lives in the signed cookie, not in
+# portal memory, so any replica serves any request. §4 records that this system has
+# already hit the in-memory-session defect once, in ws-server, and that one needed
+# Redis to fix. This one needs nothing — as long as no server-side session store is
+# ever introduced.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portal
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: portal
+    app.kubernetes.io/part-of: agrarian
+spec:
+  # Load will be the lowest in the hub — clicks, not frames — so two replicas are
+  # about not being a single point of failure rather than capacity (§4).
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: portal
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: portal
+        app.kubernetes.io/part-of: agrarian
+    spec:
+      containers:
+        - name: portal
+          image: ghcr.io/REPLACE_ME/agrarian-portal:v0.1.0
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: DB_WRITER_URL
+              value: http://db-writer:8000
+            # Database 1, not ws-server's 0 — see redis.yaml.
+            - name: REDIS_URL
+              value: redis://redis:6379/1
+            # Both stay true: the browser reaches this over HTTPS through Traefik.
+            # A Secure cookie is not returned over http://, so turning either off
+            # produces a login that appears to work and then forgets the user.
+            - name: COOKIE_SECURE
+              value: "true"
+            - name: PUBLIC_TLS
+              value: "true"
+          envFrom:
+            # MEDIA_PUBLIC_HOST, WS_PUBLIC_HOST, WS_PORT, TRUSTED_PROXY_HOPS and
+            # PORTAL_ALLOWED_ORIGIN_HOSTS. These are deployment facts that are not
+            # known until the load balancer has an address, so they live in a
+            # ConfigMap written at deploy time rather than being baked in here.
+            #
+            # TRUSTED_PROXY_HOPS is the dangerous one and is discussed in
+            # hub-endpoints.example.yaml: it must count the REAL hops between the
+            # browser and this process, which is a deployment fact and not a
+            # property of any product name.
+            - configMapRef:
+                name: agrarian-endpoints
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: portal
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: portal
+    app.kubernetes.io/part-of: agrarian
+spec:
+  # ClusterIP even though this is the public-facing service: Traefik terminates
+  # TLS and forwards here. A LoadBalancer on this would be a plaintext path around
+  # the terminator, which is the one thing a terminator cannot tolerate (§8).
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: portal
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

@@ -1,0 +1,107 @@
+# db-writer — flight records, alert persistence, and every authorization decision
+# in the system.
+#
+# WHY THIS ONE GETS THE MOST REPLICAS
+# -----------------------------------
+# It is on both planes (§2). /auth/mediamtx sits on the critical path of every
+# publish and every read — MediaMTX asks it on each connection attempt — while
+# /streams and the portal's routes do not. Sizing follows the auth endpoint; the
+# rest rides along on capacity that already had to exist. Caching that decision is
+# deliberately absent (§4), because a cache on an authorization answer delays
+# revocation, and revocability is the property stream keys are built on.
+#
+# It holds no per-flight state, which is what makes a replica count meaningful at
+# all: every endpoint works from the flight_id in the URL plus the database, so any
+# replica serves any flight regardless of which one opened it.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-writer
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: db-writer
+    app.kubernetes.io/part-of: agrarian
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: db-writer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: db-writer
+        app.kubernetes.io/part-of: agrarian
+    spec:
+      containers:
+        - name: db-writer
+          # Built from db_writer/Dockerfile and pushed to the deployment's own
+          # registry. Not :latest — a tag that moves makes a rollout unrepeatable
+          # and a rollback impossible.
+          image: ghcr.io/REPLACE_ME/agrarian-db-writer:v0.1.0
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: DB_SERVICE
+              value: postgresql
+            - name: DB_PORT
+              value: "5432"
+            - name: VIEWER_TOKEN_TTL_S
+              value: "43200"
+            - name: PUBLISHER_TOKEN_TTL_S
+              value: "86400"
+          envFrom:
+            # Database host/name and the worker credentials. A managed Postgres
+            # is outside the cluster, so this is a connection string rather than
+            # a service in this namespace — see secrets.example.yaml.
+            - secretRef:
+                name: agrarian-db
+            # SESSION_JWT_SECRET. The only shared secret in the system (§7),
+            # carried by exactly two services: this one mints, ws-server
+            # validates. It is deliberately NOT in the portal's envFrom.
+            - secretRef:
+                name: agrarian-session-jwt
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-writer
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: db-writer
+    app.kubernetes.io/part-of: agrarian
+spec:
+  # ClusterIP, and §8 is emphatic about it: db-writer must never be routed from
+  # outside. The portal is what preserves that — the browser talks to the portal,
+  # the portal talks to this over the cluster network.
+  #
+  # The compose stack publishes this on host 8002 for the interim laptop-app
+  # deployment. That publish has no equivalent here and must not be given one.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: db-writer
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

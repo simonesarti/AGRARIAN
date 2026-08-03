@@ -1,0 +1,298 @@
+# MediaMTX — the video plane — with the recorder as a sidecar beside it.
+#
+# TWO THINGS HERE ARE NOT MECHANICAL TRANSLATIONS. §2 says the migration is
+# mechanical with one real change; it turned out to be two, and this file is both.
+#
+# 1. THE RECORDER IS A SIDECAR, NOT A DEPLOYMENT
+# ----------------------------------------------
+# In compose the recorder is its own service sharing the `recordings` volume with
+# MediaMTX. Two pods cannot share a volume without ReadWriteMany, and RWX on
+# managed Kubernetes means Azure Files, EFS or Filestore — a paid, network-attached
+# filesystem, for what is a handoff between two processes that can sit on one node.
+#
+# So the recorder moves into this pod. It costs nothing: MediaMTX cannot replicate
+# anyway (below), so a recorder pinned 1:1 to it loses no scaling that existed. It
+# also makes the segment handoff local — MediaMTX writes a file and posts a path to
+# localhost, and the file is on the same disk the reader opens.
+#
+# The hook URL changes with it: mediamtx.yaml points runOnRecordSegmentComplete at
+# http://recorder:8000, which resolves to the sidecar only because a Service of
+# that name exists below pointing back at this same pod. Left as a Service rather
+# than rewritten to localhost so that one config file serves both deployments.
+#
+# 2. MediaMTX DOES NOT REPLICATE
+# ------------------------------
+# A path lives on the single instance its publisher connected to (§2, §9). Round-
+# robin a load balancer across replicas and viewers land on instances that have
+# never heard of the path. replicas: 1 is therefore correct rather than cautious,
+# and the options when it stops being enough are path-aware routing, a relay tree
+# or sharding by path — none of which is a replica count.
+---
+# Segments live here between MediaMTX writing them and the recorder uploading them.
+#
+# ReadWriteOnce, which every provider has, precisely because only one pod mounts
+# it. That is a consequence of the sidecar decision above: as two Deployments this
+# would have had to be ReadWriteMany.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: recordings
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/part-of: agrarian
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      # A segment is an hour of annotated 1080p (recordSegmentDuration: 1h), and
+      # the recorder deletes on successful upload only when
+      # RECORDING_DELETE_LOCAL_ON_SUCCESS is set. Size this for the backlog an
+      # outage of the storage backend would produce, not for one segment.
+      storage: 50Gi
+  # storageClassName is deliberately unset: the cluster's default is right for a
+  # ReadWriteOnce disk on all three providers. Set it if the default is not SSD.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mediamtx
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: mediamtx
+    app.kubernetes.io/part-of: agrarian
+spec:
+  replicas: 1
+  strategy:
+    # A ReadWriteOnce volume cannot be attached to the old and new pods at once,
+    # so a RollingUpdate would deadlock: the new pod waits for a volume the old
+    # pod will not release until the new one is ready.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mediamtx
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mediamtx
+        app.kubernetes.io/part-of: agrarian
+    spec:
+      containers:
+        # ── The media server ───────────────────────────────────────────────────
+        - name: mediamtx
+          # The -ffmpeg tag is required and NOT for ffmpeg. The default image ships
+          # the binary and nothing else — no shell, no wget — and MediaMTX execs
+          # runOn* hooks directly, so on that image every hook fails with
+          # `exec: "wget": executable file not found in $PATH`, logged at INF and
+          # otherwise silent. That is why recordings were never uploaded until it
+          # was found (§4). This tag is Alpine based and supplies busybox wget.
+          image: bluenviron/mediamtx:latest-ffmpeg
+          ports:
+            - name: rtmps
+              containerPort: 1936
+            - name: rtsps
+              containerPort: 8322
+            - name: rtmp
+              containerPort: 1935
+            - name: rtsp
+              containerPort: 8554
+            - name: hls
+              containerPort: 8888
+            - name: whep
+              containerPort: 8889
+            - name: webrtc-udp
+              containerPort: 8189
+              protocol: UDP
+            - name: webrtc-tcp
+              containerPort: 8189
+              protocol: TCP
+          env:
+            # The address MediaMTX advertises in its ICE candidates, which must be
+            # one the BROWSER can dial — so it is the load balancer's external
+            # address, not a pod or service IP. It is not knowable until the
+            # LoadBalancer below has been provisioned, which is why it comes from
+            # a ConfigMap written at deploy time rather than being baked in here.
+            - name: MTX_WEBRTCICEHOSTNAT1TO1IPS
+              valueFrom:
+                configMapKeyRef:
+                  name: agrarian-endpoints
+                  key: MEDIA_PUBLIC_HOST
+          volumeMounts:
+            - name: config
+              mountPath: /mediamtx.yml
+              subPath: mediamtx.yaml
+              readOnly: true
+            - name: certs
+              mountPath: /certs
+              readOnly: true
+            - name: recordings
+              mountPath: /recordings
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+
+        # ── The recording uploader ─────────────────────────────────────────────
+        - name: recorder
+          image: ghcr.io/REPLACE_ME/agrarian-recorder:v0.1.0
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: DB_WRITER_URL
+              value: http://db-writer:8000
+          envFrom:
+            # RECORDING_STORE_SERVICE (local | azure | aws) and whichever backend's
+            # credentials go with it. A Secret rather than a ConfigMap because two
+            # of the three carry storage keys.
+            - secretRef:
+                name: agrarian-recording-store
+          volumeMounts:
+            # The same claim the media server writes to. This is the whole reason
+            # the two are one pod.
+            - name: recordings
+              mountPath: /recordings
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: agrarian-mediamtx-config
+        - name: certs
+          secret:
+            # Written by cert-manager. MediaMTX rereads this file when it changes,
+            # unaided and within seconds, and a flight already in the air is not
+            # disturbed — measured in run_cert_renewal.sh. Do NOT send it SIGHUP by
+            # analogy with Mosquitto: that kills it, and with it every flight in
+            # the air.
+            secretName: agrarian-tls
+            items:
+              - key: tls.crt
+                path: server.crt
+              - key: tls.key
+                path: server.key
+        - name: recordings
+          persistentVolumeClaim:
+            claimName: recordings
+---
+# The drone's ports and the browser's WebRTC media, straight off the load balancer.
+#
+# MIXED TCP AND UDP ON ONE SERVICE, ON PURPOSE AND WITH A CONSTRAINT
+# -------------------------------------------------------------------
+# 8189 must be reachable over both protocols at the SAME external address, because
+# ICE advertises one host candidate address (MTX_WEBRTCICEHOSTNAT1TO1IPS above) and
+# both transports have to arrive there. Splitting them into a TCP Service and a UDP
+# Service would allocate two addresses and break the TCP half for exactly the
+# viewers it exists to serve — those on networks that pass no UDP.
+#
+# Mixed-protocol LoadBalancers are GA from Kubernetes 1.26 and supported by Azure
+# and by AWS NLB. Where the provider will not do it, the fallback is two Services
+# pinned to one pre-allocated address, NOT two addresses.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mediamtx-public
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: mediamtx
+    app.kubernetes.io/part-of: agrarian
+  annotations:
+    # Provider-specific and deliberately left as the one that does nothing on its
+    # own. AWS wants service.beta.kubernetes.io/aws-load-balancer-type: external
+    # plus nlb-ip; Azure and GCP need nothing for an L4 LB.
+    agrarian.io/note: "L4 load balancer — see CLOUD_ARCHITECTURE.md §7 for why not L7"
+spec:
+  type: LoadBalancer
+  # Preserves the client source address, which the rate limiter and the auth hook
+  # both care about, and which an L7 proxy in front would destroy. It also means an
+  # L4 LB adds no X-Forwarded-For hop — see TRUSTED_PROXY_HOPS in the endpoints
+  # ConfigMap.
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: mediamtx
+  ports:
+    - name: rtmps
+      port: 1936
+      targetPort: rtmps
+      protocol: TCP
+    - name: rtsps
+      port: 8322
+      targetPort: rtsps
+      protocol: TCP
+    # The plaintext pair stays, as the narrow fallback §7 describes for drone
+    # firmware that cannot do TLS at all. Deleting these two lines and setting
+    # encryption to `strict` in mediamtx.yaml is the two-line change for the day
+    # no drone needs them.
+    - name: rtmp
+      port: 1935
+      targetPort: rtmp
+      protocol: TCP
+    - name: rtsp
+      port: 8554
+      targetPort: rtsp
+      protocol: TCP
+    - name: webrtc-udp
+      port: 8189
+      targetPort: webrtc-udp
+      protocol: UDP
+    - name: webrtc-tcp
+      port: 8189
+      targetPort: webrtc-tcp
+      protocol: TCP
+---
+# HLS and WHEP signalling, reachable only from Traefik. These two are NOT on the
+# LoadBalancer above: a direct publish would be a plaintext path around the
+# terminator (§8). 8189 is the deliberate exception and must stay one.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mediamtx
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: mediamtx
+    app.kubernetes.io/part-of: agrarian
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mediamtx
+  ports:
+    - name: hls
+      port: 8888
+      targetPort: hls
+    - name: whep
+      port: 8889
+      targetPort: whep
+---
+# Points back at the pod this file already defines. It exists so that
+# mediamtx.yaml's runOnRecordSegmentComplete hook — http://recorder:8000/... —
+# resolves identically under compose and here, rather than needing localhost in
+# one and a service name in the other.
+apiVersion: v1
+kind: Service
+metadata:
+  name: recorder
+  namespace: agrarian
+  labels:
+    app.kubernetes.io/name: mediamtx
+    app.kubernetes.io/part-of: agrarian
+    agrarian.io/exposure: internal-only
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mediamtx
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

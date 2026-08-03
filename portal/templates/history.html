@@ -21,6 +21,9 @@
   {% endif %}
 
   {% if flights %}
+  {# Six columns and a timestamp that must not wrap: this is the table that was
+     measured widening the layout viewport to 663px on a 390px screen. #}
+  <div class="table-wrap">
   <table class="slots">
     <thead>
       <tr><th>Flight</th><th>Started</th><th>Duration</th><th>Alerts</th><th>Recordings</th><th></th></tr>
@@ -29,7 +32,13 @@
       {% for f in flights %}
       <tr>
         <td>
-          <strong>{{ f.label or "Untitled slot" }}</strong>
+          {# The label links to the same place as the Details button at the end
+             of the row. That button is the only way into a flight, and it is
+             the last of six columns — on a phone the table scrolls sideways and
+             the button starts off-screen, which would leave this page a dead
+             end for anyone who does not discover the swipe. The first column is
+             always visible. #}
+          <strong><a href="/flights/{{ f.flight_id }}">{{ f.label or "Untitled slot" }}</a></strong>
           <div class="muted small">flight {{ f.flight_id }}</div>
         </td>
         <td class="nowrap">{{ (f.start_time or "")[:19]|replace("T", " ") }}</td>
@@ -53,6 +62,7 @@
       {% endfor %}
     </tbody>
   </table>
+  </div>
 
   {# Cursor paging: "older" carries the last flight_id on this page, so a flight
      starting while someone reads page one cannot push a row onto page two that
