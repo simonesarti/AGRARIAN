@@ -713,6 +713,16 @@ is worse:
   this document calls these images crops, and they are not — `output_alert_streamer`
   stores the **full-resolution annotated frame**, unresized, so each one is a 1920×1080
   JPEG.
+
+  That was true of the response and **false of the query**, which is the more expensive
+  half and went unnoticed for as long as the claim was only ever read rather than
+  measured. `flight_detail` selected the mapped entity, so every column came with it:
+  the page fetched fifty full-resolution JPEGs out of the database and into db-writer
+  purely to evaluate `image_data is not None` and discard them. Measured at 400 KB a
+  frame, that is **19.5 MB moved per page view to produce fifty booleans**. The columns
+  are now named explicitly and the database answers `image_data IS NOT NULL` itself.
+  Deferring the attribute would have been worse: it fixes the one query and turns any
+  later access into a lazy `SELECT` per row.
 - **`public_uuid` is not in any of the three responses.** History reports what happened;
   it is not a way to reach the media path it happened on. A viewer token is still the
   only thing that opens a stream.
@@ -1516,7 +1526,7 @@ billing).
   pages on the portal, and no schema change of any kind — every row this reads was
   already being written. Covered twice, at the two levels where it can be wrong:
 
-  `tests/comms/test_flight_history.py` — **45 assertions**, SQLite in memory, no stack —
+  `tests/comms/test_flight_history.py` — **50 assertions**, SQLite in memory, no stack —
   is the query layer. `tests/comms/run_portal.sh` — now **118 assertions**, up from 88 —
   drives the pages through real HTTP against real PostgreSQL: alerts written by the app's
   own route, a segment logged by the recorder's, the flight closed by the orchestrator's,
@@ -1986,6 +1996,30 @@ work that has yet to start.
   supported degraded mode rather than a fault — the harness reports which of the two it
   got — but no test has yet driven a real elevation raster through `extract_dem_window`
   and the window cache.
+- **Every alert stores a full 1920×1080 frame as `bytea`.** `image_data` is a
+  `LargeBinary` column, and `output_alert_streamer._process_alert` writes the whole
+  annotated frame to it unresized. The alert cooldown is **1.0 s**, so a persisting
+  danger condition writes up to 3600 full-HD JPEGs an hour into the database, per
+  flight. At 400 KB a frame that is over a gigabyte for a heavy hour.
+
+  Two things make this a weakness rather than an emergency. PostgreSQL stores a `bytea`
+  over 2 KB out of line in TOAST, so a query that does not name the column does not read
+  it — which is why the `flight_detail` fix above mattered so much and why the remaining
+  cost is disk, backup size and WAL volume rather than query latency. And nothing renders
+  these anywhere near their stored size: the history grid cell is `minmax(260px, 1fr)`
+  and the live aside is a column, so the stored asset is roughly twenty times the linear
+  dimension of any consumer.
+
+  **The cheap fix is to downscale before encoding, not to move the bytes.** Object
+  storage is the eventual answer and is consistent with recordings, but it is the larger
+  change: it needs a new holder of storage credentials (db-writer holds none today; the
+  recorder does), and it must not be done by handing out pre-signed URLs. §4's alert
+  image route checks that the alert belongs to the flight *and* the flight to the caller,
+  in the query that selects the row, because `alert_id` is sequential across every tenant
+  and these are photographs of somebody's land — and a pre-signed URL is a bearer
+  credential that bypasses exactly that check for its lifetime. A storage key with
+  db-writer streaming the bytes keeps the property; a URL in a row is also the thing §5
+  refuses for `output_path`, for the same reason.
 - **The orchestrator holds the Docker socket — under the backend this repo runs.**
   Anything that can reach its port can start containers on the host. Its port is
   internal-only, and this was the strongest argument for the Kubernetes backend.

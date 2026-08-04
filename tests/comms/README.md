@@ -220,22 +220,29 @@ flights count (a landed one — `end_time` set — must not come back), and a lo
 active flight resolves with nothing to disambiguate.
 
 **`test_flight_history.py`** — the query layer behind the portal's history pages, at the
-level where it can be silently wrong. Two of its assertions carry **controls that fail**,
-because both claims pass vacuously otherwise:
+level where it can be silently wrong. Three of its assertions carry **controls that
+fail**, because all three claims pass vacuously otherwise:
 
 - *cursor paging does not repeat a row* — a flight takes off between page one and page
   two, and the control runs `OFFSET` over the same rows at the same moment and **does**
   repeat one;
 - *alert and recording counts do not inflate each other* — the control is the single
   joined query, which reports a flight with 3 alerts and 2 recordings as having **6 and
-  6**.
+  6**;
+- *the flight page never selects alert image bytes* — the control is the mapped-entity
+  query it replaced, which **does**. This one is about cost rather than correctness, and
+  it is here because every other assertion in the file passes either way: a correct
+  answer computed expensively is still a correct answer. `flight_detail` used to fetch
+  fifty full-resolution JPEGs — 19.5 MB at 400 KB a frame — to evaluate
+  `image_data is not None` and discard them. The assertion reads the SQL SQLAlchemy
+  emits and allows `image_data` in a predicate but not in a select list.
 
 The rest is ownership, which is what this feature could get catastrophically wrong: a
 tenant's history contains none of another's, a flight belonging to someone else is as
 absent as one that never existed, and an alert crop is refused when the alert is real but
 the flight in the URL is not its own — `alert_id` is sequential across every tenant, so
 that pairing is the attack. Deleting the `user_id` filter from the history query and the
-flight check from the image lookup fails **10 of the 45**; a test that cannot fail that
+flight check from the image lookup fails **10 of the 50**; a test that cannot fail that
 way is not testing isolation. It also pins that the media path (`public_uuid`) is in none
 of the responses — history reports what happened, it does not hand out a way to reach the
 stream — and that reading history writes nothing, taken as row counts before and after.

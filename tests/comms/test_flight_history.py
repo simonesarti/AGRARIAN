@@ -313,6 +313,81 @@ with Sessions() as s:
     again = (s.query(m.Flight).count(), s.query(m.Alert).count(), s.query(m.Recording).count())
 check("reading history changes nothing in the database", totals == again, f"{totals} → {again}")
 
+# ── The page does not fetch the images it is careful not to return ───────────
+#
+# flight_detail's docstring has always promised the bytes are absent, and that
+# was true of the response and false of the query: session.query(Alert) selects
+# every column, so a fifty-alert page pulled fifty full-resolution JPEGs into the
+# process to evaluate `image_data is not None` and discard them.
+#
+# Every assertion above passes either way — a correct answer computed expensively
+# is still a correct answer — so the cost needs its own check, and the check has
+# to look at the SQL rather than at the result. What is asserted is narrow and
+# exact: image_data may appear in a predicate, and must not appear in a select
+# list.
+
+from sqlalchemy import event
+
+
+def statements_for(fn):
+    """Every SQL statement SQLAlchemy emits while fn() runs."""
+    seen = []
+    listener = lambda conn, cur, stmt, params, ctx, many: seen.append(stmt)  # noqa: E731
+    event.listen(directory._engine, "before_cursor_execute", listener)
+    try:
+        fn()
+    finally:
+        event.remove(directory._engine, "before_cursor_execute", listener)
+    return seen
+
+
+def selects_image_bytes(statements):
+    """True if any statement puts image_data in its select list.
+
+    Split on FROM: everything before it is what the database has to materialise
+    and send. `image_data IS NOT NULL` lives after it, in the select list only as
+    a computed boolean, and is exactly what this must not flag.
+    """
+    for stmt in statements:
+        head = stmt.split(" \nFROM")[0].split(" FROM")[0]
+        if "image_data" in head and "IS NOT NULL" not in head:
+            return True
+    return False
+
+
+detail_sql = statements_for(lambda: directory.flight_detail(counted, alice))
+check("the flight page never selects alert image bytes",
+      not selects_image_bytes(detail_sql))
+check("...and still answers has_image for every alert on the page",
+      all("has_image" in a for a in directory.flight_detail(counted, alice)["alerts"]))
+
+# The control. Without it the assertion above passes against any query that
+# happens not to mention the column — including one that selects no alerts at
+# all — and would have passed against the mapped-entity query it was written to
+# catch only if that query really does name the column. This proves it does.
+def _old_query_shape():
+    with Sessions() as s:
+        (s.query(m.Alert)
+          .filter(m.Alert.flight_id == counted)
+          .order_by(m.Alert.alert_id.desc())
+          .limit(50).all())
+
+check("...and the control: the mapped-entity query it replaced DOES select them",
+      selects_image_bytes(statements_for(_old_query_shape)))
+
+# The history list walks flights, not alerts, but it counts them — and a count
+# that reached for the rows would be the same defect one level up.
+history_sql = statements_for(lambda: directory.flight_history(alice, limit=50))
+check("the history list never selects alert image bytes either",
+      not selects_image_bytes(history_sql))
+
+# alert_image is the one that must, and asserting so keeps the two checks above
+# honest about what they are measuring.
+image_sql = statements_for(
+    lambda: directory.alert_image(alert["alert_id"], counted, alice))
+check("...while alert_image, which serves the crop, does select them",
+      selects_image_bytes(image_sql))
+
 print()
 print("=" * 60)
 print(f"{sum(results)}/{len(results)} passed")

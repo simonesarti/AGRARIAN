@@ -858,6 +858,19 @@ class UserDirectory:
         load tens of megabytes that the browser cannot cache separately or load
         lazily. Each alert reports whether it has one; alert_image() serves it.
 
+        That was true of the RESPONSE and false of the QUERY until this was
+        fixed, which is the more expensive half. `session.query(Alert)` selects
+        every column, so the page fetched up to fifty full-resolution JPEGs out
+        of the database and into this process purely to evaluate
+        `image_data is not None` and throw them away. The alert image is the
+        whole annotated frame at 1920x1080 (output_alert_streamer stores it
+        unresized), so that is tens of megabytes per page view, on the endpoint
+        whose docstring promised the opposite.
+
+        The columns are therefore listed explicitly. Deferring the attribute
+        instead would be worse: it fixes this query and turns any later
+        `a.image_data` into one lazy SELECT per row.
+
         `alert_total` is the true count and `alerts` is at most one page of it,
         so a truncated list can be labelled as truncated rather than silently
         passing for the whole flight.
@@ -879,7 +892,19 @@ class UserDirectory:
 
             # Newest first, matching the live alert aside — the two views of the
             # same flight should not disagree about which end is the top.
-            alerts = (session.query(Alert)
+            #
+            # Named columns, not the mapped entity: image_data must not be in
+            # this result set. Whether a crop exists is answered by the database
+            # as a boolean, so the bytes never leave it.
+            alerts = (session.query(
+                          Alert.alert_id,
+                          Alert.alert_msg,
+                          Alert.frame_id,
+                          Alert.datetime,
+                          Alert.image_width,
+                          Alert.image_height,
+                          Alert.image_data.isnot(None).label("has_image"),
+                      )
                       .filter(Alert.flight_id == flight_id)
                       .order_by(Alert.alert_id.desc())
                       .limit(FLIGHT_ALERTS_PAGE_SIZE)
@@ -904,8 +929,8 @@ class UserDirectory:
                         "frame_id": a.frame_id,
                         "datetime": a.datetime,
                         # Whether to render an <img> at all, without shipping the
-                        # bytes to find out.
-                        "has_image": a.image_data is not None,
+                        # bytes to find out. Computed in SQL — see the query.
+                        "has_image": bool(a.has_image),
                         "image_width": a.image_width,
                         "image_height": a.image_height,
                     }
