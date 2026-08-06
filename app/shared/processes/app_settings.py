@@ -8,6 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from app.shared.processes.constants import (
     ALERTS_COOLDOWN_SECONDS,
     ALERTS_JPEG_COMPRESSION_QUALITY,
+    ALERTS_MAX_IMAGE_EDGE_PX,
     HM_ANOMALY_AE_THRESHOLD,
     HM_ANOMALY_MIN_ANOMALY_DURATION,
     HM_ANOMALY_REQUIRE_BOTH,
@@ -167,6 +168,11 @@ class AppSettings(BaseSettings):
     # ------------------------------------------------------------------ #
 
     alerts_jpeg_compression_quality: int = Field(default=ALERTS_JPEG_COMPRESSION_QUALITY, ge=0, le=100)
+    # Longest edge of the JPEG stored with an alert. The annotated frame arrives at
+    # full resolution and nothing renders it near that size, so it is reduced before
+    # encoding rather than after storing — see the constant for what that was costing.
+    # 0 disables resizing.
+    alerts_max_image_edge_px: int = Field(default=ALERTS_MAX_IMAGE_EDGE_PX, ge=0)
 
     # ------------------------------------------------------------------ #
     # WEBSOCKET SERVER SIDECAR

@@ -182,6 +182,7 @@ def main():
 
     alert_writer_config = NotificationsStreamWriterConfig(
         alerts_jpeg_quality=s.alerts_jpeg_compression_quality,
+        alerts_max_image_edge_px=s.alerts_max_image_edge_px,
         alerts_max_consecutive_failures=ALERTS_MAX_CONSECUTIVE_FAILURES,
         queue_get_timeout=ALERTS_QUEUE_GET_TIMEOUT,
         log_file_path=str(output_dir / f"{session_ts}.log"),

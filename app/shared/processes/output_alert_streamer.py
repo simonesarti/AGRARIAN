@@ -19,6 +19,7 @@ from app.shared.processes.constants import (
     ALERTS_QUEUE_GET_TIMEOUT,
     ALERTS_JPEG_COMPRESSION_QUALITY,
     ALERTS_MAX_CONSECUTIVE_FAILURES,
+    ALERTS_MAX_IMAGE_EDGE_PX,
 )
 from app.shared.processes.logging_config import worker_log_level
 
@@ -41,6 +42,8 @@ class NotificationsStreamWriterConfig(BaseModel):
     """Configuration for NotificationsStreamWriter."""
 
     alerts_jpeg_quality: int = Field(default=ALERTS_JPEG_COMPRESSION_QUALITY, ge=0, le=100)
+    # Longest edge of the stored JPEG; 0 stores the annotated frame as it arrives.
+    alerts_max_image_edge_px: int = Field(default=ALERTS_MAX_IMAGE_EDGE_PX, ge=0)
     alerts_max_consecutive_failures: PositiveInt = ALERTS_MAX_CONSECUTIVE_FAILURES
 
     # Queue timeouts
@@ -134,9 +137,47 @@ class NotificationsStreamWriter(mp.Process):
         self.ws_client = WsServerClient(self.config.ws_server_url)
         self.ws_client.bind_flight(self.config.flight_id, self.config.publisher_token)
 
-    def _compress_frame(self, frame: np.ndarray) -> tuple[str, bytes]:
-        """Compress frame to JPEG, returning (base64 string for WS, raw bytes for DB)."""
+    def _downscale(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Shrink the annotated frame so its longest edge is at most the configured max.
+
+        Returns the frame unchanged when resizing is disabled (max edge 0) or when it
+        is already small enough — never upscales, since enlarging a frame would add
+        bytes without adding detail.
+
+        INTER_AREA because this is always a reduction, and it is the only interpolation
+        that averages the pixels being discarded rather than sampling past them. On an
+        annotated frame that matters more than it looks: thin bounding-box edges and
+        text alias badly under INTER_LINEAR at these ratios.
+        """
+        max_edge = self.config.alerts_max_image_edge_px
+        if not max_edge:
+            return frame
+
+        height, width = frame.shape[:2]
+        longest = max(height, width)
+        if longest <= max_edge:
+            return frame
+
+        scale = max_edge / longest
+        # round() rather than int(): truncating both axes independently can shift the
+        # aspect ratio by a pixel, which is visible as a stretch on a wide frame.
+        new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+
+    def _compress_frame(self, frame: np.ndarray) -> tuple[str, bytes, int, int]:
+        """
+        Compress frame to JPEG.
+
+        Returns (base64 string for WS, raw bytes for DB, width, height) — and the
+        dimensions are returned rather than read from the caller's frame because this
+        is where the frame stops being full resolution. Reading frame.shape at the call
+        site would record the size of an image that was never stored.
+        """
         compression_start = time()
+
+        frame = self._downscale(frame)
+        height, width = frame.shape[:2]
 
         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), self.config.alerts_jpeg_quality]
         _, buffer = cv2.imencode('.jpg', frame, encode_param)
@@ -145,8 +186,11 @@ class NotificationsStreamWriter(mp.Process):
         raw_bytes = buffer.tobytes()
         jpg_as_text = base64.b64encode(raw_bytes).decode('utf-8')
 
-        logger.debug(f"Frame compressed in {(time() - compression_start) * 1000:.1f} ms")
-        return jpg_as_text, raw_bytes
+        logger.debug(
+            f"Frame compressed in {(time() - compression_start) * 1000:.1f} ms "
+            f"({width}x{height}, {len(raw_bytes)} bytes)"
+        )
+        return jpg_as_text, raw_bytes, width, height
 
     def _log_alert(self, frame_id: int, alert_msg: str, timestamp: float, datetime_str: str):
         """
@@ -181,13 +225,15 @@ class NotificationsStreamWriter(mp.Process):
         """
         logger.info(f"Processing alert: frame_id={meta.frame_id}, msg='{meta.alert_msg}'")
 
-        # Compress frame (results are None if the corresponding manager is inactive)
-        jpg_as_text, compressed_bytes = self._compress_frame(frame)
+        # Compress frame (results are None if the corresponding manager is inactive).
+        # width/height describe what was ENCODED, not what arrived: the frame is
+        # downscaled first, and reading meta from the incoming array here would label
+        # every row with dimensions no stored image has.
+        jpg_as_text, compressed_bytes, width, height = self._compress_frame(frame)
 
         # Create alert data structure
         alert_datetime = dtt.fromtimestamp(meta.timestamp)
         alert_datetime_str = alert_datetime.isoformat()
-        height, width = frame.shape[:2]
 
         alert_data = {
             'frame_id': meta.frame_id,
@@ -264,6 +310,7 @@ class NotificationsStreamWriter(mp.Process):
         logger.info(f"  Database      : {self.config.db_writer_url}")
         logger.info(f"  Log file      : {self.config.log_file_path}")
         logger.info(f"  JPEG quality  : {self.config.alerts_jpeg_quality}")
+        logger.info(f"  Max image edge: {self.config.alerts_max_image_edge_px or 'unrestricted'} px")
 
         try:
 

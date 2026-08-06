@@ -209,6 +209,24 @@ ALERTS_QUEUE_GET_TIMEOUT = 0.1                                # 100 ms
 ALERTS_MAX_CONSECUTIVE_FAILURES = 5
 ALERTS_JPEG_COMPRESSION_QUALITY = 85
 
+# Longest edge, in pixels, of the JPEG stored with an alert. The annotated frame
+# arrives here at full resolution — 1920x1080 — and used to be encoded at that size,
+# which is roughly 400 KB a row in a LargeBinary column with a 1.0 s alert cooldown:
+# up to 3600 full-HD frames an hour, per flight, or over a gigabyte for a heavy hour.
+#
+# Nothing consumes them anywhere near that size. The history grid cell is
+# minmax(260px, 1fr) and the live alert aside is a column, so the stored asset was
+# about twenty times the linear dimension of every consumer it has.
+#
+# The cost was not only disk. The alert queue in db-writer is bounded by count
+# (ALERT_QUEUE_SIZE = 500), not by bytes, so a full queue of full-HD frames is ~200 MB
+# of resident Python objects against a 512Mi pod limit — the queue could reach the
+# memory limit before it ever reached the length limit it was sized by.
+#
+# 960 keeps a 1920x1080 frame's aspect and lands around a quarter of the pixels.
+# Set to 0 to disable resizing and store the frame as it arrives.
+ALERTS_MAX_IMAGE_EDGE_PX = 960
+
 # -------------------------- ALERTS WS --------------------------
 
 WEBSOCKET_HOST = "0.0.0.0"

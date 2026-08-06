@@ -709,10 +709,13 @@ is worse:
   base64 because it is delivering one alert over a socket that is already open; a
   flight's history is fifty of them at once, and inlining those would be tens of
   megabytes the browser can neither cache separately nor defer. As URLs they are lazy,
-  cacheable, and individually authorised. "Tens of megabytes" is not a figure of speech:
+  cacheable, and individually authorised. "Tens of megabytes" was not a figure of speech:
   this document calls these images crops, and they are not — `output_alert_streamer`
-  stores the **full-resolution annotated frame**, unresized, so each one is a 1920×1080
-  JPEG.
+  stored the **full-resolution annotated frame**, unresized, so each one was a 1920×1080
+  JPEG. They are now capped at 960 on the longest edge (`ALERTS_MAX_IMAGE_EDGE_PX`, see
+  §9), which shrinks the page without changing this reasoning: fifty images is still
+  fifty requests' worth of bytes to inline, and the authorisation argument never
+  depended on their size at all.
 
   That was true of the response and **false of the query**, which is the more expensive
   half and went unnoticed for as long as the claim was only ever read rather than
@@ -2002,30 +2005,55 @@ work that has yet to start.
   supported degraded mode rather than a fault — the harness reports which of the two it
   got — but no test has yet driven a real elevation raster through `extract_dem_window`
   and the window cache.
-- **Every alert stores a full 1920×1080 frame as `bytea`.** `image_data` is a
-  `LargeBinary` column, and `output_alert_streamer._process_alert` writes the whole
-  annotated frame to it unresized. The alert cooldown is **1.0 s**, so a persisting
-  danger condition writes up to 3600 full-HD JPEGs an hour into the database, per
-  flight. At 400 KB a frame that is over a gigabyte for a heavy hour.
+- **Alert images were full 1920×1080 frames. [fixed]** `image_data` is a `LargeBinary`
+  column, and `output_alert_streamer._process_alert` wrote the whole annotated frame to
+  it unresized. With a **1.0 s** alert cooldown a persisting danger condition wrote up
+  to 3600 full-HD JPEGs an hour into the database, per flight — over a gigabyte for a
+  heavy hour at 400 KB a frame.
 
-  Two things make this a weakness rather than an emergency. PostgreSQL stores a `bytea`
+  This entry stays as a record rather than being deleted, because the second half of
+  what it cost was found only while fixing the first and is the more interesting one.
+
+  Two things made it a weakness rather than an emergency. PostgreSQL stores a `bytea`
   over 2 KB out of line in TOAST, so a query that does not name the column does not read
   it — which is why the `flight_detail` fix above mattered so much and why the remaining
-  cost is disk, backup size and WAL volume rather than query latency. And nothing renders
-  these anywhere near their stored size: the history grid cell is `minmax(260px, 1fr)`
-  and the live aside is a column, so the stored asset is roughly twenty times the linear
-  dimension of any consumer.
+  cost was disk, backup size and WAL volume rather than query latency. And nothing
+  renders these anywhere near their stored size: the history grid cell is
+  `minmax(260px, 1fr)` and the live aside is a column, so the stored asset was roughly
+  twenty times the linear dimension of any consumer.
 
-  **The cheap fix is to downscale before encoding, not to move the bytes.** Object
-  storage is the eventual answer and is consistent with recordings, but it is the larger
-  change: it needs a new holder of storage credentials (db-writer holds none today; the
-  recorder does), and it must not be done by handing out pre-signed URLs. §4's alert
-  image route checks that the alert belongs to the flight *and* the flight to the caller,
-  in the query that selects the row, because `alert_id` is sequential across every tenant
-  and these are photographs of somebody's land — and a pre-signed URL is a bearer
-  credential that bypasses exactly that check for its lifetime. A storage key with
-  db-writer streaming the bytes keeps the property; a URL in a row is also the thing §5
-  refuses for `output_path`, for the same reason.
+  **The cost that was not on this list is memory.** db-writer's `AlertWriter` queue is
+  bounded by **count** — `ALERT_QUEUE_SIZE = 500` — and not by bytes, so a full queue of
+  full-HD frames is a couple of hundred megabytes of resident Python objects against the
+  `512Mi` limit in `configs/k8s/hub/db-writer.yaml`. The queue could reach the pod's
+  memory ceiling before the length ceiling it was sized by, and an OOM kill is `SIGKILL`,
+  so the graceful drain in `AlertWriter.stop()` never runs and the queued alerts are
+  lost. That also relieves the drain timeout: `DB_MANAGER_THREAD_CLOSE_TIMEOUT` is 5 s,
+  which 500 full-HD inserts would not have finished inside.
+
+  **The fix was to downscale before encoding, not to move the bytes**, exactly as this
+  entry predicted. `ALERTS_MAX_IMAGE_EDGE_PX = 960` caps the longest edge, so a
+  1920×1080 frame is stored at 960×540 — a quarter of the pixels, and measured at
+  roughly a third of the bytes on representative imagery. `INTER_AREA`, because this is
+  always a reduction and it is the only interpolation that averages the pixels being
+  discarded rather than sampling past them; annotation boxes and text alias badly
+  otherwise. Setting it to 0 restores the old behaviour.
+
+  The subtle half is that `image_width`/`image_height` are what the history page renders
+  with, and `_process_alert` read them from the *incoming* frame. Downscaling without
+  touching that would have labelled every row with dimensions no stored image has, so
+  `_compress_frame` now returns the encoded size and the caller no longer measures the
+  input. `tests/shared/test_alert_downscale.py` carries the control for it: the same
+  frame with resizing disabled must report different dimensions, which fails against any
+  implementation that resizes and then reports `frame.shape`.
+
+  Object storage remains the eventual answer and is consistent with recordings, but it
+  is the larger change and §11.5 is where it now lives: it needs a holder of storage
+  credentials, and it must not be done by handing out pre-signed URLs to a browser. §4's
+  alert image route checks that the alert belongs to the flight *and* the flight to the
+  caller, in the query that selects the row, because `alert_id` is sequential across
+  every tenant and these are photographs of somebody's land — and a pre-signed URL is a
+  bearer credential that bypasses exactly that check for its lifetime.
 - **The orchestrator holds the Docker socket — under the backend this repo runs.**
   Anything that can reach its port can start containers on the host. Its port is
   internal-only, and this was the strongest argument for the Kubernetes backend.
