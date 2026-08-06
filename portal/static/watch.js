@@ -26,9 +26,31 @@
   const MAX_ALERTS = 50;          // the DOM, not the flight — older ones scroll off
   const RECONNECT_MS = 3000;
 
+  /*
+   * A publisher that drops and returns inside RECONNECT_GRACE_S is the same
+   * flight, on the same path, with the same viewer token (§6). Everything the
+   * browser holds stays valid across it, so the page must recover on its own —
+   * it used to print "Reload to try again", which made a ten-second radio glitch
+   * a manual step for whoever was watching.
+   *
+   * Two things have to be watched, because it is not certain which one fires.
+   * MediaMTX may close the reader session when the path loses its source, which
+   * surfaces as a connection state change; or it may hold the session open and
+   * simply stop sending, which surfaces as nothing at all and a frozen picture.
+   * The state handler catches the first, the stall watchdog catches the second.
+   */
+  const VIDEO_RETRY_MS = 2000;
+  const STALL_CHECK_MS = 1000;
+  const STALL_TIMEOUT_MS = 5000;  // generous: a brief hiccup must not renegotiate
+
   let socket = null;
   let pc = null;
   let closing = false;
+
+  let videoRetryTimer = null;
+  let stallTimer = null;
+  let lastMediaTime = 0;
+  let lastProgressAt = 0;
 
   function note(text) {
     videoNoteEl.textContent = text;
@@ -97,6 +119,76 @@
     });
   }
 
+  /*
+   * Retry the video, and only the video.
+   *
+   * It cannot be done by calling start(): that returns early while the alert
+   * socket is open, which is exactly the state this runs in — ws-server holds
+   * the viewer's socket per flight, and a publisher dropping inside the grace
+   * window does not end the flight, so the socket never closes and start() would
+   * do nothing.
+   *
+   * The token is re-fetched rather than reused, and that is what makes one
+   * function serve both cases. Inside the grace window /api/viewer-token answers
+   * with the same live flight and the video comes back. Once the flight has
+   * really ended it answers 404, fetchToken() says so on the page and returns
+   * null, and the retry stops instead of spinning against a path that is gone.
+   */
+  function scheduleVideoRetry(why) {
+    if (closing || videoRetryTimer) return;
+    setStatus(why, "muted");
+    videoRetryTimer = window.setTimeout(async function () {
+      videoRetryTimer = null;
+      if (closing) return;
+
+      let info;
+      try {
+        info = await fetchToken();
+      } catch (e) {
+        scheduleVideoRetry("Reconnecting to the video…");
+        return;
+      }
+      if (!info) return;   // flight over, or the session went — fetchToken said so
+
+      setStatus("Live — flight " + info.flight_id, "live-text");
+      startVideo(info).catch(function () {
+        scheduleVideoRetry("Reconnecting to the video…");
+      });
+    }, VIDEO_RETRY_MS);
+  }
+
+  /*
+   * The frozen-picture case. A peer connection can stay "connected" while no
+   * media arrives, so connectionState alone is not enough to notice that the
+   * publisher went away. currentTime advancing is the only direct evidence that
+   * frames are still being decoded.
+   *
+   * Guarded on document.hidden because a backgrounded tab has its video
+   * throttled or paused by the browser, and reconnecting then would renegotiate
+   * a stream nobody is looking at.
+   */
+  function watchForStall() {
+    if (stallTimer) window.clearInterval(stallTimer);
+    lastMediaTime = 0;
+    lastProgressAt = Date.now();
+
+    stallTimer = window.setInterval(function () {
+      if (closing || document.hidden) { lastProgressAt = Date.now(); return; }
+      if (!pc || pc.connectionState !== "connected") return;
+
+      if (playerEl.currentTime !== lastMediaTime) {
+        lastMediaTime = playerEl.currentTime;
+        lastProgressAt = Date.now();
+        return;
+      }
+      if (Date.now() - lastProgressAt > STALL_TIMEOUT_MS) {
+        window.clearInterval(stallTimer);
+        stallTimer = null;
+        scheduleVideoRetry("Video stalled — reconnecting…");
+      }
+    }, STALL_CHECK_MS);
+  }
+
   async function startVideo(info) {
 
     // start() also runs when the ALERT socket reconnects, which says nothing
@@ -116,11 +208,19 @@
     };
 
     pc.onconnectionstatechange = function () {
-      if (!pc) return;
-      if (pc.connectionState === "failed") {
-        setStatus("Video connection failed.", "error");
-        note("The stream could not be reached. Reload to try again — WebRTC "
-             + "falls back to TCP automatically where UDP is blocked.");
+      if (!pc || closing) return;
+
+      // "disconnected" is often transient and ICE recovers by itself, so it is
+      // reported and left alone; the stall watchdog is what catches it if the
+      // picture never comes back. "failed" and "closed" are terminal and there
+      // is nothing to wait for.
+      if (pc.connectionState === "disconnected") {
+        setStatus("Video interrupted — waiting…", "muted");
+        return;
+      }
+      if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+        videoNoteEl.hidden = true;
+        scheduleVideoRetry("Video interrupted — reconnecting…");
       }
     };
 
@@ -136,23 +236,29 @@
         body: pc.localDescription.sdp,
       });
     } catch (e) {
-      setStatus("Could not reach the video server.", "error");
+      scheduleVideoRetry("Could not reach the video server — retrying…");
       return;
     }
 
     if (!resp.ok) {
       // 401 here is the viewer token, not the session: it is minted per flight
-      // and expires on its own schedule. Reloading buys a fresh one.
+      // and expires on its own schedule. The retry re-fetches one, so this no
+      // longer asks the user to reload — and if the flight has actually ended,
+      // /api/viewer-token answers 404 and the retry stops there instead.
       setStatus(
         resp.status === 401
-          ? "The video credential expired. Reload the page."
-          : `The video server refused the stream (${resp.status}).`,
-        "error");
+          ? "The video credential expired — renewing…"
+          : `The video server refused the stream (${resp.status}) — retrying…`,
+        "muted");
+      scheduleVideoRetry(statusEl.textContent);
       return;
     }
 
     const answer = await resp.text();
     await pc.setRemoteDescription({ type: "answer", sdp: answer });
+
+    // Only now is there something that could stall.
+    watchForStall();
   }
 
   function renderAlert(alert) {
@@ -239,6 +345,10 @@
 
   window.addEventListener("beforeunload", function () {
     closing = true;
+    // closing is checked by both timers, but clearing them as well means a
+    // pending retry cannot fire against a page that is already going away.
+    if (videoRetryTimer) { window.clearTimeout(videoRetryTimer); videoRetryTimer = null; }
+    if (stallTimer) { window.clearInterval(stallTimer); stallTimer = null; }
     if (socket) socket.close();
     if (pc) pc.close();
   });
