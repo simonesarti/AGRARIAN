@@ -2167,6 +2167,7 @@ do, so that this section never reads as more finished than it is:
 | Landed | |
 | --- | --- |
 | `RECONNECT_GRACE_S` 30 s → 120 s (§10.2) | **[built]** 2026-08-06 |
+| `recordSegmentDuration` 1 h → 24 h (§10.2) | **[built]** 2026-08-06 |
 
 Everything else below is **[designed]**.
 
@@ -2273,9 +2274,9 @@ That same flush is what gives the archive its shape, and it makes one invariant 
 is what ends a flight — and every disconnect closes the segment. The boundary is clean
 at any grace value.
 
-`recordSegmentDuration` therefore rises to **24 h**, from the 1 h that was only ever a
-placeholder: no consumer airframe flies long enough for an hourly split to fire, so the
-setting has never once divided a real flight. With the ceiling raised, one flight
+`recordSegmentDuration` therefore rises to **24 h [built]**, from the 1 h that was only
+ever a placeholder: no consumer airframe flies long enough for an hourly split to fire,
+so the setting has never once divided a real flight. With the ceiling raised, one flight
 produces exactly one recording — except when the publisher drops and returns inside the
 grace window, which produces one per connection interval. `flights → recordings` is
 already 1:many, so that case needs nothing.

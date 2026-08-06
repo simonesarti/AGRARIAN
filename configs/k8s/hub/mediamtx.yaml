@@ -44,8 +44,9 @@ spec:
   accessModes: ["ReadWriteOnce"]
   resources:
     requests:
-      # A segment is an hour of annotated 1080p (recordSegmentDuration: 1h), and
-      # the recorder deletes on successful upload only when
+      # A segment is one flight of annotated 1080p: recordSegmentDuration is 24h,
+      # a ceiling no airframe reaches, so what closes a file is the publisher
+      # disconnecting. The recorder deletes on successful upload only when
       # RECORDING_DELETE_LOCAL_ON_SUCCESS is set. Size this for the backlog an
       # outage of the storage backend would produce, not for one segment.
       storage: 50Gi

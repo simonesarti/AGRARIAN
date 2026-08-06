@@ -152,9 +152,23 @@ paths:
     record: yes
     recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
     recordFormat: fmp4
-    # Split long sessions into hourly files; on publisher disconnect the current
-    # segment is always closed and flushed regardless of this setting.
-    recordSegmentDuration: 1h
+    # A ceiling, not a schedule. What actually ends a segment is the publisher
+    # disconnecting: MediaMTX always closes and flushes the current file then,
+    # regardless of this setting. Since every flight ends with a disconnect, and
+    # every flight boundary IS a disconnect, no recording can ever span two
+    # flights — which is the property the recordings table depends on.
+    #
+    # 24h rather than the 1h this used to hold. No consumer airframe flies long
+    # enough for an hourly split to fire, so it never once divided a real flight;
+    # it only stood between the archive and one file per flight. This value is
+    # now what it says it is: the ceiling for a session that never disconnects.
+    #
+    # RAISED, NOT DELETED. An omitted line inherits whatever the next MediaMTX
+    # release defaults to, and this file already records that mistake once — SRT
+    # and MoQ ran on every start in v1.19 because they were enabled by default and
+    # nobody had decided so. Quoted in the recordings PVC comment in
+    # configs/k8s/hub/mediamtx.yaml, which moves with it.
+    recordSegmentDuration: 24h
     # Notify the recorder sidecar when a segment is complete so it can upload it.
     # $MTX_SEGMENT_PATH is set by MediaMTX at hook runtime.
     runOnRecordSegmentComplete: wget -q -O /dev/null --post-data="path=$MTX_SEGMENT_PATH" http://recorder:8000/on-segment-complete
