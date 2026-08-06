@@ -858,6 +858,15 @@ def open_flight(req: OpenFlightRequest):
         # the orchestrator forwards it without interpreting it. None means this slot
         # has no boundary, which is a supported state rather than a missing one.
         "geofence_vertexes": flight["geofence_vertexes"],
+        # The five optical variables, or empty for the deployment's own. Rendered
+        # here too, so the orchestrator forwards this dict without interpreting it.
+        #
+        # Every field in this response has to be forwarded explicitly, and that is
+        # the one thing to be careful about when adding another: open_flight_for_key
+        # returning a value is not the same as the orchestrator receiving it. This
+        # field was missing for exactly that reason, and no test that called the
+        # manager directly could see it.
+        "camera_env": flight["camera_env"],
         "publisher_token": mint_publisher_token(flight["flight_id"]),
     }
 

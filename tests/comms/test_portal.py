@@ -532,6 +532,218 @@ check("...and repeats none of the newer ones",
 check("the older page offers a way back to the newest",
       'href="/history"' in older.body)
 
+# ── Per-slot configuration ───────────────────────────────────────────────────
+#
+# Three things a slot can carry — processing mode, operating boundary and camera
+# optics — all of which were DEPLOYMENT-WIDE until recently. One mode per cluster,
+# one polygon for every tenant, one airframe's optics for everybody. The boundary
+# was the sharp one: nothing leaked, but tenant B was evaluated against tenant A's
+# fence, which is a wrong answer rather than an error.
+#
+# Everything below drives the portal's own pages and then checks db-writer, because
+# the seam between them is where the last defect lived: the portal passed five
+# arguments to a client method that took four, every no-stack suite stayed green,
+# and slot creation was a 500.
+
+r = call(PORTAL1, "/geofences", cookie=alice)
+check("the geofences page renders for a signed-in user",
+      r.status == 200 and "No boundaries yet" in r.body, str(r.status))
+check("...and redirects an anonymous visitor",
+      call(PORTAL1, "/geofences").status == 303)
+
+r = call(PORTAL1, "/drones", cookie=alice)
+check("the cameras page renders for a signed-in user",
+      r.status == 200 and "No cameras yet" in r.body, str(r.status))
+check("...and redirects an anonymous visitor",
+      call(PORTAL1, "/drones").status == 303)
+
+# The vertex editor posts parallel lon/lat fields, so urlencode has to repeat the
+# key — a dict would collapse them to one point.
+SQUARE = [("11.0", "45.0"), ("11.1", "45.0"), ("11.1", "45.1"), ("11.0", "45.1")]
+
+
+def fence_form(label, points):
+    return [("label", label)] + [(k, v) for lon, lat in points
+                                 for k, v in (("lon", lon), ("lat", lat))]
+
+
+r = call(PORTAL1, "/geofences", form=fence_form("north pasture", SQUARE), cookie=alice)
+check("creating a boundary redirects back to the page",
+      r.status == 303 and r.location == "/geofences", f"{r.status} {r.location}")
+
+st, body = post_json(DBW, "/geofences", token=alice, method="GET")
+check("db-writer holds the boundary the portal created",
+      st == 200 and len(body["geofences"]) == 1
+      and body["geofences"][0]["vertices"] == [[11.0, 45.0], [11.1, 45.0], [11.1, 45.1], [11.0, 45.1]],
+      str(body["geofences"]))
+fence_id = body["geofences"][0]["geofence_id"]
+
+r = call(PORTAL1, "/geofences", cookie=alice)
+check("...and the page shows it back", "north pasture" in r.body and "45.1" in r.body)
+
+# Two points is not a polygon. db-writer owns that rule — the portal ships no copy
+# of it — so this proves the refusal survives the hop rather than being re-checked.
+r = call(PORTAL1, "/geofences", form=fence_form("too few", SQUARE[:2]), cookie=alice)
+check("a two-point boundary is refused, with db-writer's own reason",
+      r.status >= 400 and "at least 3" in r.body, f"{r.status}")
+
+CAM = {"focal_len_mm": "12.29", "sensor_width_mm": "17.35", "sensor_height_mm": "13.00",
+       "sensor_width_px": "5280", "sensor_height_px": "3956"}
+
+r = call(PORTAL1, "/drones", form={"label": "Mavic 3E", **CAM}, cookie=alice)
+check("creating a camera redirects back to the page",
+      r.status == 303 and r.location == "/drones", f"{r.status} {r.location}")
+
+st, body = post_json(DBW, "/drones", token=alice, method="GET")
+check("db-writer holds the camera the portal created",
+      st == 200 and len(body["drones"]) == 1 and body["drones"][0]["focal_len_mm"] == 12.29,
+      str(body["drones"]))
+drone_id = body["drones"][0]["drone_id"]
+
+# The cross-field rule, over real HTTP. Every value below is individually valid and
+# positive; only the millimetre and pixel ratios disagree. Nothing downstream would
+# raise — ground measurements would just come out stretched on one axis — so the
+# refusal has to happen here or nowhere.
+r = call(PORTAL1, "/drones",
+         form={"label": "mismatched", **CAM, "sensor_width_px": "5472", "sensor_height_px": "3648"},
+         cookie=alice)
+check("a sensor whose aspect ratios disagree is refused",
+      r.status >= 400 and "aspect ratio" in r.body.lower(), str(r.status))
+
+# ── Assigning them to a slot ─────────────────────────────────────────────────
+
+sid = alice_slot["stream_id"]
+for path, field, value, name in (
+    (f"/streams/{sid}/mode", "app_mode", "health_monitoring", "mode"),
+    (f"/streams/{sid}/geofence", "geofence_id", str(fence_id), "boundary"),
+    (f"/streams/{sid}/drone", "drone_id", str(drone_id), "camera"),
+):
+    r = call(PORTAL1, path, form={field: value}, cookie=alice)
+    check(f"setting the slot's {name} redirects to the dashboard",
+          r.status == 303 and r.location == "/", f"{r.status} {r.location}")
+
+st, body = post_json(DBW, "/streams", token=alice, method="GET")
+slot = [x for x in body["streams"] if x["stream_id"] == sid][0]
+check("db-writer holds all three choices the portal made",
+      slot["app_mode"] == "health_monitoring" and slot["geofence_id"] == fence_id
+      and slot["drone_id"] == drone_id, str(slot))
+
+r = call(PORTAL1, "/", cookie=alice)
+check("the dashboard shows them selected, not merely offered",
+      r.body.count("selected") >= 3 and "north pasture" in r.body and "Mavic 3E" in r.body)
+
+# ── This is the assertion the whole section exists for ───────────────────────
+#
+# A flight opened on that slot must carry what the user chose in the browser, all
+# the way to the environment a container would start with. Everything above proves
+# the portal wrote it down; this proves it is what actually flies.
+
+st, flight = post_json(DBW, "/flight/open", {"stream_key": alice_key})
+check("a flight opened on the configured slot carries the mode",
+      flight.get("app_mode") == "health_monitoring", str(flight.get("app_mode")))
+check("...the boundary, rendered in the app's own spelling",
+      flight.get("geofence_vertexes") == "(11.0, 45.0), (11.1, 45.0), (11.1, 45.1), (11.0, 45.1)",
+      str(flight.get("geofence_vertexes")))
+check("...and the five camera variables the app reads",
+      (flight.get("camera_env") or {}).get("DRONE_TRUE_FOCAL_LEN_MM") == "12.29"
+      and len(flight.get("camera_env") or {}) == 5,
+      str(flight.get("camera_env")))
+post_json(DBW, f"/flight/{flight['flight_id']}/close", token=flight["publisher_token"])
+
+# ── Another tenant ───────────────────────────────────────────────────────────
+#
+# Two more sequential ids are now guessable from outside. Both must answer like ids
+# that do not exist, and neither may change anything.
+
+r = call(PORTAL1, "/", cookie=mallory)
+check("another tenant's dashboard offers neither of alice's",
+      "north pasture" not in r.body and "Mavic 3E" not in r.body)
+check("...and their own pages are empty",
+      "No boundaries yet" in call(PORTAL1, "/geofences", cookie=mallory).body
+      and "No cameras yet" in call(PORTAL1, "/drones", cookie=mallory).body)
+
+r = call(PORTAL2, "/register", form={"email": "tenant2@test.io", "password": PW})
+tenant2 = cookie_value(r)
+call(PORTAL1, "/streams", form={"label": "theirs"}, cookie=tenant2)
+st, body = post_json(DBW, "/streams", token=tenant2, method="GET")
+their_slot = body["streams"][0]["stream_id"]
+
+for path, field, value, name in (
+    (f"/streams/{their_slot}/geofence", "geofence_id", str(fence_id), "boundary"),
+    (f"/streams/{their_slot}/drone", "drone_id", str(drone_id), "camera"),
+):
+    r = call(PORTAL1, path, form={field: value}, cookie=tenant2)
+    check(f"a slot cannot be pointed at another tenant's {name}",
+          r.status == 404, str(r.status))
+
+for path, name in ((f"/geofences/{fence_id}", "edit a boundary"),
+                   (f"/geofences/{fence_id}/delete", "delete a boundary"),
+                   (f"/drones/{drone_id}", "edit a camera"),
+                   (f"/drones/{drone_id}/delete", "delete a camera")):
+    form = fence_form("stolen", SQUARE) if "geofences" in path else {"label": "stolen", **CAM}
+    r = call(PORTAL1, path, form=form, cookie=tenant2)
+    check(f"another tenant cannot {name}", r.status == 404, str(r.status))
+
+st, body = post_json(DBW, "/geofences", token=alice, method="GET")
+check("alice's boundary survived all of that untouched",
+      len(body["geofences"]) == 1 and body["geofences"][0]["label"] == "north pasture")
+st, body = post_json(DBW, "/drones", token=alice, method="GET")
+check("...and so did her camera", len(body["drones"]) == 1 and body["drones"][0]["label"] == "Mavic 3E")
+
+# ── Escaping and forgery on the new pages ────────────────────────────────────
+#
+# Labels are tenant input rendered back into HTML, and these are two more pages
+# that render them. Jinja's autoescaping is the only thing between that and script
+# execution in the owner's own tab.
+
+call(PORTAL1, "/geofences", form=fence_form("<script>alert(1)</script>", SQUARE), cookie=alice)
+r = call(PORTAL1, "/geofences", cookie=alice)
+check("a boundary label with markup comes back escaped",
+      "&lt;script&gt;" in r.body and "<script>alert(1)</script>" not in r.body)
+
+call(PORTAL1, "/drones", form={"label": "<script>alert(1)</script>", **CAM}, cookie=alice)
+r = call(PORTAL1, "/drones", cookie=alice)
+check("a camera label with markup comes back escaped",
+      "&lt;script&gt;" in r.body and "<script>alert(1)</script>" not in r.body)
+
+for path, form, name in (
+    ("/geofences", fence_form("cross-site", SQUARE), "creating a boundary"),
+    ("/drones", {"label": "cross-site", **CAM}, "creating a camera"),
+    (f"/streams/{sid}/drone", {"drone_id": ""}, "clearing a slot's camera"),
+):
+    r = call(PORTAL1, path, form=form, cookie=alice, origin="https://evil.example")
+    check(f"a cross-origin request {name} is refused", r.status == 403, str(r.status))
+
+st, body = post_json(DBW, "/streams", token=alice, method="GET")
+check("...and the refused one changed nothing",
+      [x for x in body["streams"] if x["stream_id"] == sid][0]["drone_id"] == drone_id)
+
+# ── Deleting, and what it leaves behind ──────────────────────────────────────
+#
+# A hard delete, unlike a slot's revoke, and safe only because each flight carries
+# a snapshot of what it was judged and measured with.
+
+r = call(PORTAL1, f"/geofences/{fence_id}/delete", form={}, cookie=alice)
+check("deleting a boundary redirects back to the page",
+      r.status == 303 and r.location == "/geofences", f"{r.status} {r.location}")
+
+st, body = post_json(DBW, "/streams", token=alice, method="GET")
+check("the slot using it stops geofencing rather than dangling",
+      [x for x in body["streams"] if x["stream_id"] == sid][0]["geofence_id"] is None)
+
+st, flight2 = post_json(DBW, "/flight/open", {"stream_key": alice_key})
+check("...so the next flight carries no boundary at all",
+      not flight2.get("geofence_vertexes"), str(flight2.get("geofence_vertexes")))
+check("...while the camera it still points at is unaffected",
+      (flight2.get("camera_env") or {}).get("DRONE_TRUE_FOCAL_LEN_MM") == "12.29")
+post_json(DBW, f"/flight/{flight2['flight_id']}/close", token=flight2["publisher_token"])
+
+# The earlier flight is the control: it flew while the boundary existed, and
+# deleting the boundary must not have reached back into it.
+st, detail = post_json(DBW, f"/flights/{flight['flight_id']}", token=alice, method="GET")
+check("the flight that flew with the boundary is still in history",
+      st == 200 and detail.get("flight_id") == flight["flight_id"], str(st))
+
 # ── Rate limiting ────────────────────────────────────────────────────────────
 #
 # Last in the file, because exhausting a bucket is not undoable inside the

@@ -154,7 +154,7 @@ docker run --rm -v "$PWD/db_writer:/dbw" -v "$PWD/tests/comms:/tests:ro" \
 ./run_db_replication.sh      # 7 + 20×2 assertions, real PostgreSQL
 ./run_redis_failure.sh       # 3 + 7 assertions, Redis restarted mid-test
 ./run_portal_auth.sh         # 51 assertions, portal API across 2 replicas
-./run_portal.sh              # 118 + 2 assertions, the portal driven as a browser
+./run_portal.sh              # 158 + 2 assertions, the portal driven as a browser
 ./run_mediamtx_auth.sh       # 27 assertions, real MediaMTX + ffmpeg publishes
 ./run_orchestrator.sh        # 21 assertions, real containers spawned and torn down
 ./run_orchestrator_real_app.sh                    # 15 assertions, the real GPU app in danger_detection
@@ -427,6 +427,30 @@ What it guards beyond the happy path:
   anonymous visitor holding the exact URL gets neither. Twenty-one more flights are then
   flown and landed to overflow one page, and the *Older* cursor is followed to check it
   reaches the oldest flight without repeating any of the newest.
+
+**Per-slot configuration** is driven through the portal's own pages and then checked
+against db-writer: the mode, the boundary and the camera, all three of which were
+deployment-wide until recently. The section exists because **the seam between the portal
+and db-writer is where the defects have actually been**, and no no-stack suite crosses
+it — they exercise `db_manager` and `build_flight_env` directly. Two real bugs were found
+here that were green everywhere else:
+
+- `portal/main.py` passed five arguments to a `DbWriterClient.create_stream` that took
+  four. Slot creation was a 500.
+- **`/flight/open` never forwarded `camera_env`.** `open_flight_for_key` returned it and
+  the route dropped it, so a camera profile would have been stored, shown, selected —
+  and never reached a container. `test_camera.py` could not see it: it calls the manager
+  directly.
+
+The load-bearing assertion is the one that closes that loop: a flight opened on a
+configured slot is checked to carry **all three** — the mode, the boundary rendered in
+the app's own spelling, and the five camera variables. Everything above it proves the
+portal wrote the choice down; only that one proves it is what flies.
+
+The deletion group is its pair. A boundary is deleted and the slot using it is shown to
+stop geofencing rather than dangle, the next flight carries none, the camera it still
+points at is untouched, and the flight that already flew with the boundary is still in
+history — which is the snapshot doing its job through real HTTP.
 
 **Rate limiting** is the last section of the file, because exhausting a bucket cannot be
 undone inside the window. The two replicas are started with **different proxy trust** —

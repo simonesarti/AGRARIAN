@@ -2614,6 +2614,7 @@ done — so the mode moved without waiting for anything:
 | `APP_MODE` per stream slot (§11.1, §11.7) | **[built]** 2026-08-06 |
 | Geofence per stream slot, named and reusable (§11.1, §11.3) | **[built]** 2026-08-06 |
 | Camera profiles, named and reusable (§11.2) | **[built]** 2026-08-06 |
+| All three driven over real HTTP in `run_portal.sh` (158 assertions) | **[built]** 2026-08-06 |
 
 Everything else below is **[designed]** — which is now only the DEM, and it is the one
 piece that genuinely needs the object-storage work rather than another column.
@@ -2717,6 +2718,31 @@ output.
 Verified by 41 assertions in `tests/comms/test_camera.py`. The one worth naming is the
 same shape as the geofence's: **a slot naming no profile leaves the deployment's optics
 standing**, which is what keeps every existing deployment behaving exactly as it did.
+
+#### The seam is where the defects were **[built]**
+
+All three settings are now also driven over real HTTP in `run_portal.sh` — 118
+assertions to 158 — through the portal's own pages and checked against db-writer. That
+section exists because the no-stack suites do not cross the boundary between services:
+they exercise `db_manager` and `build_flight_env` directly, and both defects found in
+this work lived in between.
+
+The first was arity: `portal/main.py` passed five arguments to a
+`DbWriterClient.create_stream` that took four, so slot creation was a 500 while every
+other suite stayed green.
+
+**The second is the one worth remembering.** `/flight/open` never forwarded
+`camera_env`. `open_flight_for_key` computed it correctly and the route dropped it on
+the floor, so a camera profile could be stored, listed, selected on a slot and shown as
+selected — and never reach a container. Every layer was individually right.
+`test_camera.py` asserts the manager returns it and cannot see that nobody asks. The
+lesson is narrow and worth writing down: **a value in `open_flight_for_key`'s return is
+not a value the orchestrator receives**, because that response is assembled field by
+field, and the next setting added to it will have the same trap waiting.
+
+The assertion that closes the loop is a flight opened on a fully configured slot,
+checked to carry all three — mode, boundary and optics — at once. Everything else proves
+the portal wrote a choice down; only that one proves it is what flies.
 
 The existing cross-field check that physical and pixel aspect ratios agree
 (`_validate_all`) becomes a check at profile-creation time, where the user can see it.
