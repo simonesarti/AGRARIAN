@@ -2559,3 +2559,243 @@ Three consequences, and the third is the one that decided it:
   way, but the answer changes how hard §10.2's timers should work to avoid a re-mint.
   Same shape as the standing question about whether any real drone needs the plaintext
   fallback (§9): a fact somebody who owns the aircraft can supply in a sentence.
+
+---
+
+## 11. The configuration plane **[designed]**
+
+**Nothing here is built either.** §11 depends on §10 and is meaningless without it: the
+whole of it follows from a human being present at the moment a flight is provisioned.
+
+### 11.1 The environment has three halves, not two
+
+`AppSettings` states its own split, and the split is one short:
+
+> **Deployment settings** an operator sets once (model thresholds, drone optics,
+> service hostnames). These are configured on the orchestrator and forwarded to every
+> flight container unchanged.
+>
+> **Flight identity** — `FLIGHT_ID`, `PUBLISHER_TOKEN` and the two stream paths.
+
+`build_flight_env` injects exactly five values, and all five are identity. There has
+never been a place to put **per-flight configuration**, because until §10 there was
+never anybody to ask: the container was spawned by `runOnAvailable`, a machine event
+with no human in the loop, so everything a user might have an opinion about had to be
+baked into the deployment before the drone took off.
+
+This is not only a missing feature. Look at what is deployment-wide today:
+
+```text
+DRONE_TRUE_FOCAL_LEN_MM = 12.29    one specific airframe, hardcoded
+DRONE_SENSOR_WIDTH_MM   = 17.35    "standard for 4/3 CMOS sensor"
+geofencing_vertexes                ONE polygon, shared by every tenant
+APP_ENV_APP_MODE                   one product per deployment
+dem/dem.tif                        one raster on disk
+```
+
+**The geofence is a defect rather than a limitation.** Every tenant on a deployment is
+evaluated against the same polygon, so tenant B's flight is checked against tenant A's
+boundary. Nothing leaks — the app is per-flight and sole-occupant, which is what §4's
+tenancy table asserts — but at least one of them gets wrong danger calls on their own
+land. The honest description: **this system is multi-tenant in its credentials and
+single-tenant in its configuration**, and the second half went unnoticed because there
+was nowhere to put per-tenant configuration even if somebody had wanted to.
+
+`APP_MODE` is the same shape and costs more. One deployment serves one product, so a
+livestock customer and a terrain customer cannot share a cluster.
+
+#### What stays in the environment
+
+Worth writing down before the migration starts, because the temptation is to move
+everything:
+
+> **Does the user have an opinion about it, and would a wrong value be their mistake?**
+
+Camera optics, geofence, DEM, mode — yes, those move. `MAX_SIZE_DETECTION_IN`, queue
+timeouts, `LOG_LEVEL`, model thresholds — no. Those are deployment tuning, and putting
+them in the database hands tenants a way to misconfigure a pipeline they cannot debug.
+
+### 11.2 A "drone" is a named camera profile
+
+The user names a camera configuration — focal length, sensor dimensions in millimetres
+and pixels — and picks one when minting a key. The portal calls it a drone because that
+is what a person calls it.
+
+**§5's rule survives intact, and this is worth being precise about rather than waving
+at.** §5 says a stream is a concurrency slot and *nothing in the schema models a
+physical drone*; §3 says a `streams` row identifies no airframe. Both stay true. Two
+users flying the same model hold two independent rows with identical values and no
+knowledge of each other, and a transfer is one row deleted and another created. No
+identity is tracked, because none is needed — the pipeline wants five numbers, not a
+serial number.
+
+The rule that must not bend is the one §3 states for every other identifier: **a
+`drone_id` is never a credential.** It arrives in a request as a guess; ownership comes
+from the session claim, and another tenant's id gets the same 404 as one that does not
+exist, exactly as `stream_id` does today.
+
+**The values are snapshotted onto the session, not referenced from it.** A foreign key
+would let a later correction rewrite history: a user who fixes a wrong focal length
+would make every past alert appear to have been computed with a parameter it never saw.
+Copying five floats costs nothing and means an alert can always be explained by the
+numbers that actually produced it — the same reason an invoice records a price rather
+than pointing at the product's current one.
+
+The existing cross-field check that physical and pixel aspect ratios agree
+(`_validate_all`) becomes a check at profile-creation time, where the user can see it.
+
+### 11.3 DEM and geofence are independent, and both optional
+
+They are not two views of one area. A single elevation raster can carry many operating
+polygons, and a boundary can move within terrain that does not. So they are two
+separate selections at key creation, each skippable: a flight may use both, either, or
+neither, and `open_dem_tifs()` returning `None` is already a supported degraded mode
+(§9).
+
+**Geofence validation splits in two, and the halves are not duplicates.**
+
+The portal authors it: two numeric inputs per vertex, a minimum of three, and more on
+request. That is a better instrument than a text box, and it removes the need for the
+string parser in `app_settings.py` entirely — structured input never needs a regex.
+
+The app keeps a **cheap assertion** at its boundary: at least three points, coordinates
+in range. Not the parser, and not politeness. The app receives this through an
+environment variable, and what fills that variable can be wrong for reasons that have
+nothing to do with the user — a bad migration, a defect in composition, a container run
+by hand while debugging. A malformed geofence that is silently accepted produces wrong
+danger calls on somebody's land, which is the one failure this pipeline must not have.
+The same position is already taken twice in this document: §4's unrecognised actions
+arrive closed, and db-writer enforces bcrypt's length bound even though the portal
+could have.
+
+### 11.4 Getting the raster into the container without changing the app
+
+The app reads its DEM from a mounted path. **That interface does not change**, and
+everything below follows from keeping it.
+
+The obvious answer — one shared volume holding every tenant's rasters — is wrong twice.
+It needs `ReadWriteMany`, which §2 already rejected for the recorder as "a paid,
+network-attached filesystem standing in for what is a handoff between two processes."
+And it would put every tenant's terrain inside every flight container, which is the
+tenancy hole §11.1 exists to close.
+
+Instead, **something outside the app container puts the file where the app expects it**:
+
+```text
+Kubernetes   initContainer holds a short-lived, single-object URL, writes the
+             raster into an emptyDir; the app container mounts that emptyDir at
+             the path it already reads
+
+Docker       the orchestrator fetches into a per-flight directory and bind-mounts
+             it, which is the same shape with the same property
+```
+
+The app changes by **zero lines** — it still opens a file. The storage credential never
+enters the container that processes untrusted video, which is the property §3 protects
+when it says the GPU tier holds no reusable credential. And the fetch happens inside the
+15-minute pre-flight window (§10.2), which is the only reason a hundred-megabyte
+download is affordable at all: under spawn-on-stream-appearance the same transfer would
+have run with the drone already publishing, and the opening minutes of every flight
+would have been lost to it.
+
+That the two platforms do this differently is not a wrinkle. §2 already records three
+settings that are genuinely per-backend rather than shared, and `FlightRuntime` exists
+precisely so `flights.py` never learns which one is underneath.
+
+**The later optimisation, deliberately not the starting point.** `extract_dem_window`
+reads windows rather than whole rasters, so a **Cloud Optimized GeoTIFF** read over
+GDAL's `/vsiaz/` or `/vsis3/` would fetch only the tiles a flight touches and remove the
+download entirely. It is the right answer if transfer time ever becomes the constraint,
+and the wrong one to reach for now: it puts storage access back inside the app
+container, which is exactly what the init container was for.
+
+### 11.5 One storage account, tenants separated by prefix
+
+**Not one account per user.** Holding a customer's own cloud credentials would mean
+encrypting them at rest, rotating them, and a breach that hands out other people's
+storage accounts rather than only this system's data. The deployment owns one account
+and tenants are separated by key prefix:
+
+```text
+tenants/<user_id>/dems/<uuid>.tif
+tenants/<user_id>/recordings/<public_uuid>/<timestamp>.mp4
+```
+
+This generalises what §9 already carries as an open item — recorder per-tenant upload
+prefixes — rather than inventing a second scheme beside it. Nothing tenant-specific goes
+in `users`; the prefix is derived from `user_id`.
+
+**db-writer holds the account key and mints scoped, short-lived URLs**: a single-object
+`PUT` when a user uploads a raster, a single-object `GET` when a flight is provisioned.
+Three reasons, and one honest cost.
+
+- It is already the authority that decides who may reach what, and a credential belongs
+  with the decision it enforces. A separate storage service would need the same
+  ownership data and would either duplicate those checks or call db-writer anyway.
+- It is internal-only by §8 and never reachable from a browser, which the portal is not.
+- It already holds `SESSION_JWT_SECRET`, so it is the tier already hardened for
+  secret-bearing.
+
+The cost is concentration: a compromised db-writer now also yields storage access. That
+is real and it is small, because a compromised db-writer already yields the signing key
+for every credential in the system — the storage key does not meaningfully widen a blast
+radius that size.
+
+The recorder keeps its own credentials rather than being migrated onto minted URLs. It
+only ever writes, only to a prefix it derives, and never reads — and it is a sidecar in
+the MediaMTX pod, a different trust position from the tier that answers tenant requests.
+Moving it would be tidiness rather than a security gain.
+
+**Pre-signed URLs are used here and refused in §9, and the distinction is the point.**
+§9 rejects them for alert images because those would be handed to a *browser*, becoming
+bearer credentials that bypass the alert/flight/caller check for their lifetime. Here
+the holder is this system's own init container, the grant is one object belonging to the
+tenant the flight already belongs to, and the lifetime is minutes. Same mechanism,
+different holder — recorded explicitly so the two do not read as an inconsistency
+somebody later "fixes".
+
+### 11.6 Uploaded rasters: what is checked now, and what is deferred
+
+A tenant-supplied GeoTIFF is untrusted input parsed by GDAL, a library with a real CVE
+history, and §3 already describes the GPU tier as a container processing untrusted
+video. It would now also process untrusted files.
+
+**What is done now** is deliberately basic: a size limit and a format check — the file
+opens, it is a GeoTIFF, its bounds are sane — performed **on upload rather than at
+flight time**. The placement is the part that matters. A file crafted against a parser
+bug is far better detonating in a short-lived validator than in a container holding a
+GPU and a publisher token, and the user learns their file is bad while they are on the
+upload page rather than fifteen minutes later behind a spinner.
+
+**What is deferred, and why that is defensible.** Sandboxing the parse properly, fuzzing
+the path, or pinning GDAL against an advisory feed are all real work, and the blast
+radius does not yet justify them: the container is per-flight and sole-occupant, so what
+a successful exploit reaches first is *the attacker's own tenant data*. The
+consequential risk is escape to the node, and that is not a raster problem — it is the
+argument §2 already makes for the Kubernetes backend and its scoped ServiceAccount, and
+it is answered there or not at all.
+
+This is recorded as a deliberate deferral rather than left unmentioned, because the
+thing that makes it defensible is an assumption that can quietly stop holding: **if a
+flight container ever gains access to anything beyond its own tenant's data, this
+paragraph expires.**
+
+### 11.7 What this forces elsewhere
+
+- **§3 and §5 are extended, not contradicted.** No airframe identity is recorded and no
+  identifier becomes a credential, so both sections' rules hold verbatim. What changes
+  is that the schema grows a configuration side — camera profiles, geofences, DEM
+  references — beside the credential side it has today.
+- **`APP_MODE` moves from the deployment to the key**, which is what turns one cluster
+  serving one product into one cluster serving both. It is the single highest-value item
+  in this section and the cheapest: the app already selects its pipeline from this
+  variable at startup (`app/main.py`), so nothing in the app tier changes at all.
+- **The geofence parser leaves `app_settings.py`** and a short range assertion replaces
+  it (§11.3).
+- **Object-storage tenancy stops being a recorder-only question** and needs deciding
+  once, for both rasters and recordings (§11.5).
+- **Per-tenant configuration needs the same tenancy tests the credential side already
+  has [open].** §9's flight-history work was checked by *breaking* it — deleting the
+  `user_id` filter and confirming 10 assertions fail. Nothing here is trustworthy until
+  the equivalent exists: another tenant's camera profile, geofence and DEM must all be
+  unreachable, and the test must be shown to fail when the filter is removed.
