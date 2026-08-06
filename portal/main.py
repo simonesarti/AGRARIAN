@@ -511,6 +511,7 @@ async def dashboard(request: Request):
             "stream_key": s["stream_key"],
             "created_at": s["created_at"],
             "app_mode": s.get("app_mode"),
+            "geofence": s.get("geofence"),
             "ingest_url": _ingest_url(s["stream_key"]),
             "live": live_by_stream.get(s["stream_id"]),
         }
@@ -558,6 +559,41 @@ async def set_stream_mode(request: Request, stream_id: int,
     if not token:
         return _redirect("/login")
     await _db.set_stream_mode(token, stream_id, app_mode.strip() or None)
+    return _redirect("/")
+
+
+@app.post("/streams/{stream_id}/geofence")
+async def set_stream_geofence(
+    request: Request,
+    stream_id: int,
+    lon: list[str] = Form(default=[]),
+    lat: list[str] = Form(default=[]),
+):
+    """
+    Set or clear a slot's operating boundary, from the next flight onwards.
+
+    Vertices arrive as parallel `lon` and `lat` fields — one pair per row of the
+    editor. Blank rows are dropped rather than rejected, because the editor always
+    renders one empty row for adding the next point and submitting with it untouched
+    must not be an error.
+
+    Nothing here validates a coordinate. db-writer owns the ranges, the three-point
+    floor and the ceiling, and answers 400 with a message written for a human — a
+    second copy of those rules in the portal is a second thing to keep in step, and
+    §11.3 keeps only ONE other copy on purpose, in the app, as a boundary assertion
+    rather than a parser.
+    """
+    _check_origin(request)
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+
+    vertices = [
+        [x.strip(), y.strip()]
+        for x, y in zip(lon, lat)
+        if x.strip() or y.strip()
+    ]
+    await _db.set_stream_geofence(token, stream_id, vertices or None)
     return _redirect("/")
 
 

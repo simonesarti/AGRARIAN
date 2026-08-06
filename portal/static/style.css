@@ -129,6 +129,19 @@ button:hover, .button:hover { border-color: var(--muted); }
 .mode-form { margin-top: 6px; }
 .mode-form select { width: auto; max-width: 100%; padding: 4px 6px; font-size: 13px; }
 
+/* ── Geofence editor ───────────────────────────────────────────────────────── */
+
+.fence { margin-top: 8px; font-size: 13px; }
+.fence summary { cursor: pointer; color: var(--muted); }
+.fence-rows { display: grid; gap: 4px; margin: 8px 0; }
+.fence-row { display: flex; gap: 4px; }
+/* Coordinates are short and fixed-length-ish; the full-width input rule would give
+   each one the whole cell and push the pair onto two lines. */
+.fence-row input { width: 7.5em; padding: 4px 6px; font-size: 13px; }
+.fence-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.fence-actions button { padding: 4px 10px; font-size: 13px; }
+.badge.fenced { background: #1d262c; color: var(--muted); border: 1px solid var(--line); }
+
 /* ── Slot table ────────────────────────────────────────────────────────────── */
 
 /* Every .slots table lives inside one of these. A table has a minimum width it

@@ -124,10 +124,19 @@ class CreateStreamRequest(BaseModel):
     # Omitted or null follows the deployment's own APP_MODE, which is what every
     # slot did before this field existed.
     app_mode: Optional[str] = None
+    # [[lon, lat], ...] operating boundary, or omitted for none.
+    geofence: Optional[list] = None
 
 
 class StreamModeRequest(BaseModel):
     app_mode: Optional[str] = None
+
+
+class StreamGeofenceRequest(BaseModel):
+    # A list of [longitude, latitude] pairs, or null/empty to disable geofencing for
+    # this slot. Longitude first, matching the app's parser and GeoJSON — not the
+    # "lat, lon" a map UI usually shows.
+    vertices: Optional[list] = None
 
 
 class ViewerTokenRequest(BaseModel):
@@ -353,7 +362,7 @@ def add_stream(
     """
     user_id = _require_session(authorization)
     try:
-        return _directory.create_stream(user_id, req.label, req.app_mode)
+        return _directory.create_stream(user_id, req.label, req.app_mode, req.geofence)
     except StreamLimitReached as e:
         # Before ValueError — it is a subclass, so order matters here as it does
         # in /register.
@@ -446,6 +455,35 @@ def set_stream_mode(
     except Exception as e:
         logger.error(f"Unexpected error setting mode on stream {stream_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to set stream mode")
+    return {"ok": True}
+
+
+@app.post("/streams/{stream_id}/geofence")
+def set_stream_geofence(
+    stream_id: int,
+    req: StreamGeofenceRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Set or clear this slot's operating boundary, from the next flight onwards.
+
+    Until this existed the geofence was one deployment-wide polygon, so every tenant
+    was evaluated against the same boundary and at least one of them got wrong danger
+    calls on their own land. Nothing leaked — the app is per-flight and sole-occupant
+    — but the answer it computed was somebody else's.
+
+    Null or an empty list disables geofencing for the slot, which is a supported state.
+    """
+    user_id = _require_session(authorization)
+    try:
+        _directory.set_stream_geofence(stream_id, user_id, req.vertices)
+    except StreamNotFound:
+        raise HTTPException(status_code=404, detail="Stream not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error setting geofence on stream {stream_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to set stream geofence")
     return {"ok": True}
 
 
@@ -624,6 +662,10 @@ def open_flight(req: OpenFlightRequest):
         # tenant at once — the mode used to be an environment variable on the
         # orchestrator, so every flight it ever started ran the same product.
         "app_mode": flight["app_mode"],
+        # Already rendered into the app's "(lon, lat), ..." spelling by db-writer, so
+        # the orchestrator forwards it without interpreting it. None means this slot
+        # has no boundary, which is a supported state rather than a missing one.
+        "geofence_vertexes": flight["geofence_vertexes"],
         "publisher_token": mint_publisher_token(flight["flight_id"]),
     }
 

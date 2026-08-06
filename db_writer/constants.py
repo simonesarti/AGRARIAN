@@ -24,6 +24,18 @@ DB_MANAGER_THREAD_CLOSE_TIMEOUT = 5.0      # 5.0 s
 # drone that publishes into nothing.
 SUPPORTED_APP_MODES = ("danger_detection", "health_monitoring")
 
+# ── Geofence ──────────────────────────────────────────────────────────────────
+# The operating boundary a flight's danger analysis is evaluated against. Held on
+# the stream slot for the same reason as the mode: it was a single deployment-wide
+# polygon, so every tenant on a deployment was checked against the same boundary and
+# at least one of them got wrong danger calls on their own land.
+#
+# Three is the floor because fewer than three points is not a polygon. The ceiling is
+# arbitrary and exists so a form post cannot put an unbounded string into an
+# environment variable.
+GEOFENCE_MIN_VERTICES = 3
+GEOFENCE_MAX_VERTICES = 200
+
 # ── Viewer session tokens ─────────────────────────────────────────────────────
 # Signed here, validated by ws-server. The TTL bounds how long a leaked token is
 # useful — tokens travel in the WebSocket query string and so reach proxy logs.

@@ -2612,9 +2612,10 @@ done — so the mode moved without waiting for anything:
 | Landed | |
 | --- | --- |
 | `APP_MODE` per stream slot (§11.1, §11.7) | **[built]** 2026-08-06 |
+| Geofence per stream slot (§11.1, §11.3) | **[built]** 2026-08-06 |
 
-Everything else below is **[designed]**. The same route is open to the camera profile
-and the geofence, and closed to the DEM, which genuinely needs the object-storage work.
+Everything else below is **[designed]**. The same route is open to the camera profile,
+and closed to the DEM, which genuinely needs the object-storage work.
 
 ### 11.1 The environment has three halves, not two
 
@@ -2642,13 +2643,19 @@ APP_ENV_APP_MODE                   one product per deployment
 dem/dem.tif                        one raster on disk
 ```
 
-**The geofence is a defect rather than a limitation.** Every tenant on a deployment is
-evaluated against the same polygon, so tenant B's flight is checked against tenant A's
-boundary. Nothing leaks — the app is per-flight and sole-occupant, which is what §4's
-tenancy table asserts — but at least one of them gets wrong danger calls on their own
-land. The honest description: **this system is multi-tenant in its credentials and
-single-tenant in its configuration**, and the second half went unnoticed because there
-was nowhere to put per-tenant configuration even if somebody had wanted to.
+**The geofence was a defect rather than a limitation, and it is now fixed. [built]**
+Every tenant on a deployment was evaluated against the same polygon, so tenant B's
+flight was checked against tenant A's boundary. Nothing leaked — the app is per-flight
+and sole-occupant, which is what §4's tenancy table asserts — but at least one of them
+got wrong danger calls on their own land. The honest description of the whole class:
+**this system is multi-tenant in its credentials and single-tenant in its
+configuration**, and the second half went unnoticed because there was nowhere to put
+per-tenant configuration even if somebody had wanted to.
+
+It was latent rather than live, because `geofencing_vertexes` defaults to `None` and
+nothing was wrong while nobody set one. That is the reason it was worth fixing before
+the combination arrived rather than after: the failure mode is a *wrong answer*, not an
+error, so the first sign of it would have been a tenant disputing an alert.
 
 `APP_MODE` was the same shape and cost more: one deployment served one product, so a
 livestock customer and a terrain customer could not share a cluster. **It is the one
@@ -2703,13 +2710,21 @@ separate selections at key creation, each skippable: a flight may use both, eith
 neither, and `open_dem_tifs()` returning `None` is already a supported degraded mode
 (§9).
 
-**Geofence validation splits in two, and the halves are not duplicates.**
+**Geofence validation splits in three, and the parts are not duplicates. [built]**
 
-The portal authors it: two numeric inputs per vertex, a minimum of three, and more on
-request. That is a better instrument than a text box, and it removes the need for the
-string parser in `app_settings.py` entirely — structured input never needs a regex.
+The **portal authors** it: two numeric inputs per vertex, always one blank row to type
+into, and more on request. Longitude first, matching the app's parser and GeoJSON
+rather than the "lat, lon" a map usually shows — which is why both boxes are labelled.
+It validates nothing.
 
-The app keeps a **cheap assertion** at its boundary: at least three points, coordinates
+**db-writer owns the rules** — ranges, the three-point floor, a ceiling so a form post
+cannot put an unbounded string into an environment variable — and answers 400 with a
+message written for a human. Stored as JSON `[[lon, lat], ...]` and rendered into the
+`"(lon, lat), ..."` spelling at injection time, so `geofence_to_env` is the one place
+that knows both. Structured storage is what lets the app-side parser be retired later
+without a data migration.
+
+The **app keeps a cheap assertion** at its boundary: at least three points, coordinates
 in range. Not the parser, and not politeness. The app receives this through an
 environment variable, and what fills that variable can be wrong for reasons that have
 nothing to do with the user — a bad migration, a defect in composition, a container run
@@ -2718,6 +2733,14 @@ danger calls on somebody's land, which is the one failure this pipeline must not
 The same position is already taken twice in this document: §4's unrecognised actions
 arrive closed, and db-writer enforces bcrypt's length bound even though the portal
 could have.
+
+Verified by 27 assertions in `tests/comms/test_geofence.py`. Two are worth naming. The
+rendered string is **parsed back by the app's own regex** and compared to the points
+that went in, which is the only thing standing between two spellings in two services
+that no single test would otherwise cross. And a slot with no fence **injects nothing
+at all** rather than an empty variable — asserted specifically, because
+`env_ignore_empty` makes the app treat those alike *today* and that is a setting
+somebody could change, while an absent variable is unambiguous.
 
 ### 11.4 Getting the raster into the container without changing the app
 

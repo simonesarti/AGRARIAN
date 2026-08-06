@@ -64,15 +64,17 @@ def build_flight_env(opened: dict, base_env: Dict[str, str], stream_key: str) ->
         "TELEMETRY_LISTENER_STREAM_KEY": stream_key,
     }
 
-    # The first piece of CONFIGURATION to travel this path rather than identity, and
-    # the only one that is conditional. A slot expressing no preference leaves
-    # base_env's APP_MODE standing, which is what every flight did while the mode was
-    # deployment-wide — so a single-product deployment behaves exactly as before and
-    # a mixed one finally can exist. Validated by db-writer against its own supported
-    # list before it ever reaches here; the orchestrator does not interpret it.
-    app_mode = opened.get("app_mode")
-    if app_mode:
-        env["APP_MODE"] = app_mode
+    # CONFIGURATION rather than identity, and conditional in a way identity never is.
+    # A slot expressing no preference leaves base_env's value standing, which is what
+    # every flight did while both of these were deployment-wide — so a deployment that
+    # configures neither behaves exactly as before, and a mixed-tenant one finally can
+    # exist. Both are validated by db-writer before they reach here, and rendered by it
+    # into the spelling the app reads; the orchestrator interprets neither.
+    for env_name, key in (("APP_MODE", "app_mode"),
+                          ("GEOFENCING_VERTEXES", "geofence_vertexes")):
+        value = opened.get(key)
+        if value:
+            env[env_name] = value
 
     return env
 

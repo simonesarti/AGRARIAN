@@ -126,6 +126,11 @@ class DbWriterClient:
         return await self._call("POST", f"/streams/{stream_id}/mode",
                                 json={"app_mode": app_mode}, token=token)
 
+    async def set_stream_geofence(self, token: str, stream_id: int,
+                                  vertices: Optional[list]) -> dict:
+        return await self._call("POST", f"/streams/{stream_id}/geofence",
+                                json={"vertices": vertices}, token=token)
+
     async def rotate_stream(self, token: str, stream_id: int) -> dict:
         return await self._call("POST", f"/streams/{stream_id}/rotate", token=token)
 

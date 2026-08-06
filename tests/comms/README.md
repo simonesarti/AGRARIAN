@@ -17,6 +17,7 @@ try to run these directly with `python3`.
 | `test_schema.py` | nothing | one-liner below |
 | `test_flight_history.py` | nothing | one-liner below |
 | `test_app_mode.py` | nothing | one-liner below |
+| `test_geofence.py` | nothing | one-liner below |
 | `test_tokens.py` | nothing | one-liner below |
 | `test_session_tokens.py` | nothing | one-liner below |
 | `test_mediamtx_auth.py` | nothing | one-liner below |
@@ -107,6 +108,15 @@ docker run --rm -v "$PWD/db_writer:/w:ro" -v "$PWD/orchestrator:/o:ro" \
   -v "$PWD/tests/comms:/tests:ro" -w /tmp -e DB_WRITER_DIR=/w -e ORCHESTRATOR_DIR=/o \
   python:3.11-slim \
   sh -c "pip install -q sqlalchemy bcrypt; python /tests/test_app_mode.py"
+```
+
+Per-slot geofence, same mounts — the last third of it is `build_flight_env` too:
+
+```bash
+docker run --rm -v "$PWD/db_writer:/w:ro" -v "$PWD/orchestrator:/o:ro" \
+  -v "$PWD/tests/comms:/tests:ro" -w /tmp -e DB_WRITER_DIR=/w -e ORCHESTRATOR_DIR=/o \
+  python:3.11-slim \
+  sh -c "pip install -q sqlalchemy bcrypt; python /tests/test_geofence.py"
 ```
 
 Token scope separation and cross-flight replay:
@@ -275,6 +285,26 @@ And injection: the slot's mode must beat `base_env`, and **no preference must le
 exist today — a single-product cluster must behave exactly as it did before the column
 existed, and it does only because the orchestrator injects nothing when the slot has no
 opinion.
+
+**`test_geofence.py`** — the second piece of configuration on that path, and the one
+that fixes a wrong answer rather than a missing feature. The operating boundary was a
+single deployment-wide polygon, so every tenant was evaluated against the same fence
+and at least one of them got wrong danger calls on their own land. Nothing leaked; the
+answer was simply somebody else's.
+
+Beyond the ranges and the three-point floor, three assertions carry their weight:
+
+- **The rendered string is parsed back by the app's own regex** and compared to the
+  points that went in. db-writer stores JSON and the app reads
+  `"(lon, lat), (lon, lat), ..."`, so two services hold two spellings of one value —
+  and nothing else in this directory crosses that seam.
+- **A slot with no fence injects nothing**, asserted specifically as *absent* rather
+  than empty. `env_ignore_empty` makes the app treat those alike today, and that is a
+  setting somebody could change.
+- **Lat/lon swapped is caught**, which is the mistake a map UI invites. It is only
+  catchable because latitude is bounded tighter than longitude, so the assertion uses a
+  value that exceeds 90 — a swap inside both ranges is undetectable here and always
+  will be.
 
 **`test_session_tokens.py`** — the portal credential's separation from the other two.
 All three are signed with the same secret, so the `scope` claim is the only thing

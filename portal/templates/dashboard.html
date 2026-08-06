@@ -44,6 +44,50 @@
             </select>
             <noscript><button type="submit">Set</button></noscript>
           </form>
+
+          {# The operating boundary this slot's flights are checked against. Collapsed
+             because most slots never change it, and open by default when one is set
+             so a fence is never quietly in force with nothing on screen saying so.
+
+             Longitude first, matching the app's parser and GeoJSON rather than the
+             "lat, lon" a map usually shows — which is why both boxes are labelled. #}
+          <details class="fence" {% if s.geofence %}open{% endif %}>
+            <summary>
+              Geofence
+              {% if s.geofence %}<span class="badge fenced">{{ s.geofence|length }} points</span>
+              {% else %}<span class="muted small">off</span>{% endif %}
+            </summary>
+            <form method="post" action="/streams/{{ s.stream_id }}/geofence">
+              <div class="fence-rows" data-rows>
+                {% for lon, lat in s.geofence or [] %}
+                <div class="fence-row">
+                  <input type="text" name="lon" value="{{ lon }}" placeholder="lon" inputmode="decimal">
+                  <input type="text" name="lat" value="{{ lat }}" placeholder="lat" inputmode="decimal">
+                </div>
+                {% endfor %}
+                {# Always one blank row to type into. The route drops empty rows, so
+                   submitting without touching it is not an error. #}
+                <div class="fence-row">
+                  <input type="text" name="lon" placeholder="lon" inputmode="decimal">
+                  <input type="text" name="lat" placeholder="lat" inputmode="decimal">
+                </div>
+              </div>
+              <div class="fence-actions">
+                <button type="button" data-add-point>Add point</button>
+                <button type="submit" class="primary">Save</button>
+                {% if s.geofence %}
+                <button type="submit" formaction="/streams/{{ s.stream_id }}/geofence"
+                        name="clear" value="1" class="danger"
+                        onclick="this.closest('form').querySelectorAll('input').forEach(function(i){i.value='';})">
+                  Turn off
+                </button>
+                {% endif %}
+              </div>
+              <p class="muted small">
+                At least 3 points, longitude then latitude. Applies from the next flight.
+              </p>
+            </form>
+          </details>
         </td>
         <td>
           {# Shown in full, every time. The key is recoverable by design: the
@@ -110,4 +154,21 @@
     running until it lands.
   </p>
 </div>
+
+{# Adding a geofence point. Delegated from the document rather than bound per button,
+   so the rows it creates need no wiring of their own — and the form works without
+   this script at all: it posts whatever rows are already rendered, which is how a
+   fence can still be edited or cleared with JavaScript off. #}
+<script>
+  document.addEventListener("click", function (event) {
+    const button = event.target.closest("[data-add-point]");
+    if (!button) return;
+    const rows = button.closest("form").querySelector("[data-rows]");
+    const last = rows.lastElementChild;
+    const row = last.cloneNode(true);
+    row.querySelectorAll("input").forEach(function (input) { input.value = ""; });
+    rows.appendChild(row);
+    row.querySelector("input").focus();
+  });
+</script>
 {% endblock %}

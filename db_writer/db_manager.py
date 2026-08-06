@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import queue
@@ -8,7 +9,8 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 import bcrypt
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, LargeBinary, String, create_engine, func
+from sqlalchemy import (Column, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text,
+                        create_engine, func)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 
@@ -26,6 +28,8 @@ from constants import (
     MAX_STREAM_LABEL_LENGTH,
     MAX_STREAMS_PER_USER,
     MIN_PASSWORD_LENGTH,
+    GEOFENCE_MAX_VERTICES,
+    GEOFENCE_MIN_VERTICES,
     STREAM_KEY_ALPHABET,
     STREAM_KEY_LENGTH,
     SUPPORTED_APP_MODES,
@@ -69,8 +73,17 @@ stream_id (PK)
 user_id (FK → users.user_id)
 stream_key   # Typed into the controller by hand; doubles as the ingest path
 label        # Operator-facing name ("north field quad")
+app_mode     # Which pipeline this slot's flights run; NULL follows the deployment
+geofence     # JSON [[lon, lat], ...] operating boundary; NULL disables geofencing
 revoked_at   # Non-null retires the slot without destroying flight history
 created_at
+
+app_mode and geofence are CONFIGURATION rather than credential, and they live here
+because until this column existed both were deployment-wide — one mode and one
+polygon for every tenant on the deployment, which made the fence simply wrong for
+everyone but the first. They are read when a flight opens and injected into that
+flight's container; changing either takes effect on the next flight, never the one
+in the air.
 
 -------
 flights
@@ -115,6 +128,24 @@ def generate_stream_key() -> str:
     default RNG is predictable from prior outputs.
     """
     return "".join(secrets.choice(STREAM_KEY_ALPHABET) for _ in range(STREAM_KEY_LENGTH))
+
+
+def geofence_to_env(stored: Optional[str]) -> Optional[str]:
+    """
+    Render a stored geofence into the form the app's settings parser reads.
+
+    "(lon, lat), (lon, lat), ..." — the shape GEOFENCING_VERTEXES has always taken.
+    The database holds the structured version so that the app-side parser can be
+    retired later (§11.3) without a data migration; this is the one place that knows
+    both spellings.
+
+    None in, None out: no geofence is a supported state, and the orchestrator injects
+    nothing rather than an empty variable.
+    """
+    if not stored:
+        return None
+    points = json.loads(stored)
+    return ", ".join(f"({lon}, {lat})" for lon, lat in points)
 
 
 def normalize_email(email: str) -> str:
@@ -235,6 +266,14 @@ class Stream(Base):
     # the flight because nothing asks a user anything when a flight opens; §10 is
     # what would move it, and this is the same value one level up.
     app_mode = Column(String(32), nullable=True)
+    # The operating boundary for this slot's flights, as a JSON list of [lon, lat]
+    # pairs, or NULL for no geofencing — which is what every row created before this
+    # column existed means and what the app already treats as a supported mode.
+    #
+    # Stored structured and rendered to the app's "(lon, lat), (lon, lat), ..." form
+    # at injection time. The app's own parser is what reads that today; storing the
+    # structured shape here is what lets the parser go later without a data migration.
+    geofence = Column(Text, nullable=True)
     # Revocation is a timestamp, not a delete: flights reference the stream, and the
     # record of what was published when has to survive both rotation and retirement.
     revoked_at = Column(DateTime, nullable=True)
@@ -474,6 +513,55 @@ class UserDirectory:
             return {"stream_id": stream.stream_id, "user_id": stream.user_id, "label": stream.label}
 
     @staticmethod
+    def _clean_geofence(vertices) -> Optional[str]:
+        """
+        Validate an operating boundary and return it as JSON, or None for no fence.
+
+        Accepts a sequence of (lon, lat) pairs. Checked here rather than trusted for
+        the same reason as the mode: this ends up as an environment variable inside a
+        GPU container, where a malformed value is a process that exits at startup —
+        a drone publishing into nothing rather than an error anyone sees.
+
+        The checks mirror the ones in app/shared/processes/app_settings.py, which
+        stays as the app's own boundary assertion (§11.3). That is not duplication of
+        a parser: what fills that variable can be wrong for reasons no user caused,
+        and a silently-accepted malformed fence is wrong danger calls on somebody's
+        land.
+        """
+        if vertices is None:
+            return None
+        if isinstance(vertices, str):
+            raise ValueError("Geofence must be a list of (longitude, latitude) pairs")
+        points = list(vertices)
+        if not points:
+            return None
+
+        if len(points) < GEOFENCE_MIN_VERTICES:
+            raise ValueError(
+                f"A geofence needs at least {GEOFENCE_MIN_VERTICES} points, got {len(points)}"
+            )
+        if len(points) > GEOFENCE_MAX_VERTICES:
+            raise ValueError(
+                f"A geofence may have at most {GEOFENCE_MAX_VERTICES} points, got {len(points)}"
+            )
+
+        cleaned = []
+        for point in points:
+            try:
+                lon, lat = point
+                lon, lat = float(lon), float(lat)
+            except (TypeError, ValueError):
+                raise ValueError(f"{point!r} is not a (longitude, latitude) pair")
+            # Order matters and is easy to get backwards: longitude first, matching
+            # the app's parser and GeoJSON, not the "lat, lon" a map UI usually shows.
+            if not (-180.0 <= lon <= 180.0):
+                raise ValueError(f"Longitude {lon} is outside -180..180")
+            if not (-90.0 <= lat <= 90.0):
+                raise ValueError(f"Latitude {lat} is outside -90..90")
+            cleaned.append([lon, lat])
+        return json.dumps(cleaned)
+
+    @staticmethod
     def _clean_app_mode(app_mode: Optional[str]) -> Optional[str]:
         """
         Normalise and check a processing mode, or None to follow the deployment.
@@ -497,7 +585,7 @@ class UserDirectory:
         return mode
 
     def create_stream(self, user_id: int, label: Optional[str] = None,
-                      app_mode: Optional[str] = None) -> dict:
+                      app_mode: Optional[str] = None, geofence=None) -> dict:
         """
         Add a stream slot and mint its ingest key. The key is returned once, here.
 
@@ -508,8 +596,11 @@ class UserDirectory:
 
         app_mode selects the pipeline this slot's flights run; None follows the
         deployment's own setting, which is what every slot did before this existed.
+        geofence is a sequence of (lon, lat) pairs bounding this slot's flights, or
+        None for no geofencing — also a supported state.
 
-        Raises StreamLimitReached at the cap, ValueError for a bad label or mode.
+        Raises StreamLimitReached at the cap, ValueError for a bad label, mode or
+        geofence.
         """
         if label is not None:
             label = label.strip() or None
@@ -517,6 +608,7 @@ class UserDirectory:
                 raise ValueError(f"Label must be at most {MAX_STREAM_LABEL_LENGTH} characters")
 
         app_mode = self._clean_app_mode(app_mode)
+        geofence = self._clean_geofence(geofence)
 
         SessionFactory = sessionmaker(bind=self._engine)
         with SessionFactory() as session:
@@ -540,7 +632,7 @@ class UserDirectory:
                 )
 
             stream = Stream(user_id=user_id, label=label, app_mode=app_mode,
-                            stream_key=generate_stream_key())
+                            geofence=geofence, stream_key=generate_stream_key())
             session.add(stream)
             session.commit()
             logger.info(
@@ -548,7 +640,8 @@ class UserDirectory:
                 f"app_mode={stream.app_mode or 'deployment default'}"
             )
             return {"stream_id": stream.stream_id, "stream_key": stream.stream_key,
-                    "label": stream.label, "app_mode": stream.app_mode}
+                    "label": stream.label, "app_mode": stream.app_mode,
+                    "geofence": json.loads(stream.geofence) if stream.geofence else None}
 
     def list_streams(self, user_id: int, include_revoked: bool = False) -> List[dict]:
         """
@@ -573,6 +666,7 @@ class UserDirectory:
                     "label": d.label,
                     "stream_key": d.stream_key,
                     "app_mode": d.app_mode,
+                    "geofence": json.loads(d.geofence) if d.geofence else None,
                     "revoked_at": d.revoked_at,
                     "created_at": d.created_at,
                 }
@@ -606,6 +700,35 @@ class UserDirectory:
             logger.info(
                 f"Stream mode set: stream_id={stream_id}, "
                 f"app_mode={app_mode or 'deployment default'}"
+            )
+
+    def set_stream_geofence(self, stream_id: int, user_id: int, vertices) -> None:
+        """
+        Set or clear the operating boundary for a slot's flights.
+
+        None or an empty sequence clears it, which disables geofencing for this slot —
+        a supported state, not a degraded one, and what every slot did before the
+        column existed.
+
+        Takes effect on the NEXT flight, for the same reason as the mode: the fence is
+        read when the flight opens and handed to a container that has already started.
+
+        Raises StreamNotFound for a slot that is not the caller's — the same answer as
+        one that does not exist — and ValueError for a boundary that is not one.
+        """
+        geofence = self._clean_geofence(vertices)
+
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            stream = session.query(Stream).filter_by(
+                stream_id=stream_id, user_id=user_id).first()
+            if stream is None:
+                raise StreamNotFound(f"Stream {stream_id} not found")
+            stream.geofence = geofence
+            session.commit()
+            logger.info(
+                f"Stream geofence set: stream_id={stream_id}, "
+                f"points={len(json.loads(geofence)) if geofence else 0}"
             )
 
     def revoke_stream(self, stream_id: int, user_id: int) -> None:
@@ -715,6 +838,9 @@ class UserDirectory:
                 # nothing and base_env wins — which is exactly what happened before
                 # this column existed.
                 "app_mode": stream.app_mode,
+                # Rendered into the app's own spelling here rather than in the
+                # orchestrator, which does not interpret any of this.
+                "geofence_vertexes": geofence_to_env(stream.geofence),
             }
 
     def close_flight(self, flight_id: int) -> bool:
