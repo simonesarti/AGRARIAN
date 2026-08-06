@@ -2612,7 +2612,7 @@ done — so the mode moved without waiting for anything:
 | Landed | |
 | --- | --- |
 | `APP_MODE` per stream slot (§11.1, §11.7) | **[built]** 2026-08-06 |
-| Geofence per stream slot (§11.1, §11.3) | **[built]** 2026-08-06 |
+| Geofence per stream slot, named and reusable (§11.1, §11.3) | **[built]** 2026-08-06 |
 
 Everything else below is **[designed]**. The same route is open to the camera profile,
 and closed to the DEM, which genuinely needs the object-storage work.
@@ -2724,6 +2724,22 @@ message written for a human. Stored as JSON `[[lon, lat], ...]` and rendered int
 that knows both. Structured storage is what lets the app-side parser be retired later
 without a data migration.
 
+**Boundaries are named rows, not columns on a slot.** A `geofences` table belonging to
+the user, and `streams.geofence_id` pointing at one. A boundary outlives the slot flying
+it — a herd owner works the same field for years, often from several slots at once — and
+re-entering the polygon per slot is how two copies of one field drift apart. Editing it
+once updates every slot pointing at it, which is the point of naming it.
+
+**What makes that safe is `flights.geofence`: a snapshot, not a reference.** The
+boundary a flight was judged against is copied onto the flight when it opens. Without
+that, editing a fence would silently restate what every past flight had been checked
+against, and *"which boundary produced this alert?"* — the question a tenant disputing
+one asks — would be answered with today's shape rather than the one that flew. It is
+also what makes a boundary safe to **delete**: nothing in history points at the named
+row, so removal unassigns the slots still using it and leaves every recorded flight
+intact. A foreign key would have had to refuse the delete or null it, and either way the
+past flight loses its answer.
+
 The **app keeps a cheap assertion** at its boundary: at least three points, coordinates
 in range. Not the parser, and not politeness. The app receives this through an
 environment variable, and what fills that variable can be wrong for reasons that have
@@ -2734,13 +2750,21 @@ The same position is already taken twice in this document: §4's unrecognised ac
 arrive closed, and db-writer enforces bcrypt's length bound even though the portal
 could have.
 
-Verified by 27 assertions in `tests/comms/test_geofence.py`. Two are worth naming. The
-rendered string is **parsed back by the app's own regex** and compared to the points
+Verified by 43 assertions in `tests/comms/test_geofence.py`. Three are worth naming.
+The rendered string is **parsed back by the app's own regex** and compared to the points
 that went in, which is the only thing standing between two spellings in two services
-that no single test would otherwise cross. And a slot with no fence **injects nothing
-at all** rather than an empty variable — asserted specifically, because
-`env_ignore_empty` makes the app treat those alike *today* and that is a setting
-somebody could change, while an absent variable is unambiguous.
+that no single test would otherwise cross. A slot with no fence **injects nothing at
+all** rather than an empty variable — asserted specifically, because `env_ignore_empty`
+makes the app treat those alike *today* and that is a setting somebody could change,
+while an absent variable is unambiguous. And the snapshot is checked by **moving the
+boundary and then deleting it**: the next flight gets the new shape, the recorded one
+still reports the old, and the deletion leaves both the recorded flight and the other
+tenant's boundary untouched.
+
+Two sequential ids are now in play — `stream_id` and `geofence_id` — and both are
+matched against the session's user in the query that selects the row. A slot cannot be
+pointed at another tenant's boundary, at creation or afterwards, and both refusals are
+the same 404 as an id that does not exist.
 
 ### 11.4 Getting the raster into the container without changing the app
 

@@ -502,6 +502,10 @@ async def dashboard(request: Request):
     me = await _db.whoami(token)
     streams = await _db.list_streams(token)
     flights = await _db.active_flights(token)
+    # Needed to render the per-slot picker, and cheap: a user has a handful of these.
+    fences = await _db.list_geofences(token)
+    fence_labels = {f["geofence_id"]: f["label"] or f"Boundary {f['geofence_id']}"
+                    for f in fences}
 
     live_by_stream = {f["stream_id"]: f for f in flights}
     rows = [
@@ -511,7 +515,8 @@ async def dashboard(request: Request):
             "stream_key": s["stream_key"],
             "created_at": s["created_at"],
             "app_mode": s.get("app_mode"),
-            "geofence": s.get("geofence"),
+            "geofence_id": s.get("geofence_id"),
+            "geofence_label": fence_labels.get(s.get("geofence_id")),
             "ingest_url": _ingest_url(s["stream_key"]),
             "live": live_by_stream.get(s["stream_id"]),
         }
@@ -520,12 +525,13 @@ async def dashboard(request: Request):
     return templates.TemplateResponse(
         request, "dashboard.html",
         {"email": me.get("email"), "streams": rows, "live_count": len(flights),
-         "app_modes": APP_MODE_CHOICES})
+         "app_modes": APP_MODE_CHOICES, "geofences": fences})
 
 
 @app.post("/streams")
 async def add_stream(request: Request, label: str = Form(default=""),
-                     app_mode: str = Form(default="")):
+                     app_mode: str = Form(default=""),
+                     geofence_id: str = Form(default="")):
     """
     The endpoint that spends money (§4): a slot is what lets a GPU container come
     into existence. db-writer caps it per user; a 409 here is that cap, and it is
@@ -541,7 +547,8 @@ async def add_stream(request: Request, label: str = Form(default=""),
     token = _session_of(request)
     if not token:
         return _redirect("/login")
-    await _db.create_stream(token, label.strip() or None, app_mode.strip() or None)
+    await _db.create_stream(token, label.strip() or None, app_mode.strip() or None,
+                            int(geofence_id) if geofence_id.strip() else None)
     return _redirect("/")
 
 
@@ -563,38 +570,99 @@ async def set_stream_mode(request: Request, stream_id: int,
 
 
 @app.post("/streams/{stream_id}/geofence")
-async def set_stream_geofence(
-    request: Request,
-    stream_id: int,
-    lon: list[str] = Form(default=[]),
-    lat: list[str] = Form(default=[]),
-):
+async def set_stream_geofence(request: Request, stream_id: int,
+                              geofence_id: str = Form(default="")):
     """
-    Set or clear a slot's operating boundary, from the next flight onwards.
+    Point a slot at one of the caller's boundaries, from the next flight onwards.
 
-    Vertices arrive as parallel `lon` and `lat` fields — one pair per row of the
-    editor. Blank rows are dropped rather than rejected, because the editor always
-    renders one empty row for adding the next point and submitting with it untouched
-    must not be an error.
-
-    Nothing here validates a coordinate. db-writer owns the ranges, the three-point
-    floor and the ceiling, and answers 400 with a message written for a human — a
-    second copy of those rules in the portal is a second thing to keep in step, and
-    §11.3 keeps only ONE other copy on purpose, in the app, as a boundary assertion
-    rather than a parser.
+    Empty means none, which disables geofencing for the slot. Both ids are checked
+    against the session's user by db-writer, and a guess at either answers 404.
     """
     _check_origin(request)
     token = _session_of(request)
     if not token:
         return _redirect("/login")
-
-    vertices = [
-        [x.strip(), y.strip()]
-        for x, y in zip(lon, lat)
-        if x.strip() or y.strip()
-    ]
-    await _db.set_stream_geofence(token, stream_id, vertices or None)
+    await _db.set_stream_geofence(
+        token, stream_id, int(geofence_id) if geofence_id.strip() else None)
     return _redirect("/")
+
+
+def _vertices_from(lon: list[str], lat: list[str]) -> list:
+    """
+    Pair up the editor's parallel lon/lat fields, dropping blank rows.
+
+    Blank rows are dropped rather than rejected because the editor always renders one
+    empty row to type the next point into, and submitting without touching it must not
+    be an error.
+
+    Nothing here validates a coordinate. db-writer owns the ranges, the three-point
+    floor and the ceiling, and answers 400 with a message written for a human — a
+    second copy of those rules here is a second thing to keep in step, and §11.3 keeps
+    only ONE other copy on purpose, in the app, as a boundary assertion rather than a
+    parser.
+    """
+    return [[x.strip(), y.strip()] for x, y in zip(lon, lat) if x.strip() or y.strip()]
+
+
+@app.get("/geofences", response_class=HTMLResponse)
+async def geofences_page(request: Request):
+    """The caller's named boundaries, and the form to add one."""
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+    me = await _db.whoami(token)
+    fences = await _db.list_geofences(token)
+    return templates.TemplateResponse(
+        request, "geofences.html", {"email": me.get("email"), "geofences": fences})
+
+
+@app.post("/geofences")
+async def add_geofence(request: Request, label: str = Form(default=""),
+                       lon: list[str] = Form(default=[]),
+                       lat: list[str] = Form(default=[])):
+    _check_origin(request)
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+    await _db.create_geofence(token, label.strip() or None, _vertices_from(lon, lat))
+    return _redirect("/geofences")
+
+
+@app.post("/geofences/{geofence_id}")
+async def edit_geofence(request: Request, geofence_id: int,
+                        label: str = Form(default=""),
+                        lon: list[str] = Form(default=[]),
+                        lat: list[str] = Form(default=[])):
+    """
+    Replace a boundary's points and name.
+
+    Every slot pointing at it flies the new shape from its next flight — which is the
+    reason boundaries are named at all. Flights already recorded keep the boundary they
+    were judged against, because db-writer snapshots it when the flight opens.
+    """
+    _check_origin(request)
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+    await _db.update_geofence(token, geofence_id, label.strip() or None,
+                              _vertices_from(lon, lat))
+    return _redirect("/geofences")
+
+
+@app.post("/geofences/{geofence_id}/delete")
+async def remove_geofence(request: Request, geofence_id: int):
+    """
+    Delete a boundary. Slots using it stop geofencing; past flights are unaffected.
+
+    A hard delete rather than the revoke a stream gets, and safe for one reason:
+    nothing in history points here. Each flight stores what it was judged against.
+    """
+    _check_origin(request)
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+    await _db.delete_geofence(token, geofence_id)
+    return _redirect("/geofences")
 
 
 @app.post("/streams/{stream_id}/rotate")

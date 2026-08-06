@@ -74,16 +74,29 @@ user_id (FK → users.user_id)
 stream_key   # Typed into the controller by hand; doubles as the ingest path
 label        # Operator-facing name ("north field quad")
 app_mode     # Which pipeline this slot's flights run; NULL follows the deployment
-geofence     # JSON [[lon, lat], ...] operating boundary; NULL disables geofencing
+geofence_id  # FK -> geofences; NULL disables geofencing for this slot
 revoked_at   # Non-null retires the slot without destroying flight history
 created_at
 
-app_mode and geofence are CONFIGURATION rather than credential, and they live here
-because until this column existed both were deployment-wide — one mode and one
-polygon for every tenant on the deployment, which made the fence simply wrong for
-everyone but the first. They are read when a flight opens and injected into that
-flight's container; changing either takes effect on the next flight, never the one
-in the air.
+---------
+geofences
+---------
+geofence_id (PK)
+user_id (FK -> users.user_id)
+label        # Operator-facing name ("north pasture")
+vertices     # JSON [[lon, lat], ...]
+created_at
+
+app_mode and geofence_id are CONFIGURATION rather than credential, and they live on
+the slot because both were deployment-wide until they moved — one mode and one polygon
+for every tenant on the deployment, which made the fence simply wrong for everyone but
+the first. They are read when a flight opens and injected into that flight's container;
+changing either takes effect on the next flight, never the one in the air.
+
+A geofence is NAMED and referenced rather than copied onto the slot, because a boundary
+outlives the slot flying it and one field is often flown from several slots. Editing it
+once updates every slot pointing at it. History does not ride on that — see
+flights.geofence.
 
 -------
 flights
@@ -94,6 +107,7 @@ public_uuid  # Random; names the annotated output path (out/<public_uuid>)
 start_time
 end_time     # Non-null once the orchestrator tore the flight down
 output_path  # Media-server path of the annotated output, set when the flight opens
+geofence     # SNAPSHOT of the boundary this flight was judged against; NULL if none
 
 ------
 alerts
@@ -202,6 +216,17 @@ class StreamNotFound(ValueError):
     """
 
 
+class GeofenceNotFound(ValueError):
+    """
+    Raised when a geofence_id names no row the caller owns.
+
+    Separate from StreamNotFound only so a caller can tell which of the two ids in
+    "put this fence on that slot" was wrong. Both are answered 404 by the HTTP layer
+    and both refuse to distinguish "not yours" from "does not exist", because these
+    ids are sequential across every tenant.
+    """
+
+
 Base = declarative_base()
 
 
@@ -216,6 +241,9 @@ class User(Base):
     # No direct flights relationship — they hang off streams. Deleting a user cascades
     # users → streams → flights → alerts down the chain.
     streams = relationship("Stream", back_populates="user", cascade="all, delete-orphan")
+    # Configuration, not credentials, and erased with the account for the same reason
+    # streams are: full account deletion must leave nothing behind.
+    geofences = relationship("Geofence", back_populates="user", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<User(id={self.user_id}, email='{self.email}')>"
@@ -231,6 +259,37 @@ class User(Base):
             plaintext_password.encode('utf-8'),
             self.password.encode('utf-8')
         )
+
+
+class Geofence(Base):
+    """
+    A named operating boundary belonging to a user, reusable across their slots.
+
+    Named rather than inline because a boundary outlives the slot that uses it: a
+    herd owner works the same field for years and may fly it from several slots at
+    once, and re-entering the polygon per slot would be re-entering it wrongly
+    eventually. Editing one here changes every slot pointing at it, which is the
+    point.
+
+    Nothing here is a credential. geofence_id arrives in a request as a guess and is
+    only ever matched against the caller's own user_id, exactly as stream_id is.
+    """
+
+    __tablename__ = 'geofences'
+
+    geofence_id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey('users.user_id'), nullable=False, index=True)
+    label = Column(String(128), nullable=True)
+    # JSON [[lon, lat], ...]. Structured rather than stored in the app's
+    # "(lon, lat), ..." spelling so that geofence_to_env stays the only place that
+    # knows both, and the app-side parser can retire without a data migration.
+    vertices = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="geofences")
+
+    def __repr__(self):
+        return f"<Geofence(id={self.geofence_id}, label='{self.label}')>"
 
 
 class Stream(Base):
@@ -266,14 +325,14 @@ class Stream(Base):
     # the flight because nothing asks a user anything when a flight opens; §10 is
     # what would move it, and this is the same value one level up.
     app_mode = Column(String(32), nullable=True)
-    # The operating boundary for this slot's flights, as a JSON list of [lon, lat]
-    # pairs, or NULL for no geofencing — which is what every row created before this
-    # column existed means and what the app already treats as a supported mode.
+    # Which named boundary this slot's flights are checked against, or NULL for no
+    # geofencing — a supported state, and what every slot did before this existed.
     #
-    # Stored structured and rendered to the app's "(lon, lat), (lon, lat), ..." form
-    # at injection time. The app's own parser is what reads that today; storing the
-    # structured shape here is what lets the parser go later without a data migration.
-    geofence = Column(Text, nullable=True)
+    # A reference rather than a copy, so editing the boundary once updates every slot
+    # flying it. History does not ride on that: open_flight_for_key snapshots the
+    # vertices onto the flight, so a later edit cannot rewrite what a past alert was
+    # judged against.
+    geofence_id = Column(Integer, ForeignKey('geofences.geofence_id'), nullable=True)
     # Revocation is a timestamp, not a delete: flights reference the stream, and the
     # record of what was published when has to survive both rotation and retirement.
     revoked_at = Column(DateTime, nullable=True)
@@ -322,6 +381,15 @@ class Flight(Base):
     # host a viewer should dial is not the host the app publishes to: the portal
     # composes the viewer URL from this path and the public media hostname it knows.
     output_path = Column(String, nullable=True)
+    # The boundary this flight was actually judged against, copied at open time as
+    # JSON [[lon, lat], ...]; NULL means it flew without one.
+    #
+    # A snapshot rather than a reference, and the distinction is the whole reason the
+    # named geofence above is safe to edit or delete. A foreign key would let a later
+    # correction rewrite history — every past alert would appear to have been computed
+    # against a boundary it never saw — and "what was this alert judged against?" is
+    # exactly the question a tenant disputing one asks.
+    geofence = Column(Text, nullable=True)
 
     stream = relationship("Stream", back_populates="flights")
     alerts = relationship("Alert", back_populates="flight", cascade="all, delete-orphan")
@@ -584,8 +652,100 @@ class UserDirectory:
             )
         return mode
 
+    # ── Geofences ─────────────────────────────────────────────────────────────
+    #
+    # Every method takes user_id and matches it IN the query that selects the row,
+    # never fetching first and checking after. That is what makes "not yours" and
+    # "does not exist" the same answer, which they must be: geofence_id is sequential
+    # across every tenant, so distinguishing them would confirm a row exists.
+
+    def create_geofence(self, user_id: int, label: Optional[str], vertices) -> dict:
+        """Store a named boundary for this user. Raises ValueError if it is not one."""
+        stored = self._clean_geofence(vertices)
+        if stored is None:
+            raise ValueError("A geofence needs vertices")
+        if label is not None:
+            label = label.strip() or None
+            if label is not None and len(label) > MAX_STREAM_LABEL_LENGTH:
+                raise ValueError(f"Label must be at most {MAX_STREAM_LABEL_LENGTH} characters")
+
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            fence = Geofence(user_id=user_id, label=label, vertices=stored)
+            session.add(fence)
+            session.commit()
+            logger.info(f"Geofence created: geofence_id={fence.geofence_id}, user_id={user_id}")
+            return {"geofence_id": fence.geofence_id, "label": fence.label,
+                    "vertices": json.loads(fence.vertices)}
+
+    def list_geofences(self, user_id: int) -> List[dict]:
+        """This user's named boundaries, oldest first."""
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            fences = (session.query(Geofence)
+                      .filter_by(user_id=user_id)
+                      .order_by(Geofence.geofence_id)
+                      .all())
+            return [
+                {"geofence_id": f.geofence_id, "label": f.label,
+                 "vertices": json.loads(f.vertices), "created_at": f.created_at}
+                for f in fences
+            ]
+
+    def update_geofence(self, geofence_id: int, user_id: int,
+                        label: Optional[str], vertices) -> None:
+        """
+        Replace a boundary's points and name.
+
+        Every slot pointing at it flies the new shape from its next flight, which is
+        the reason to have named fences at all. Flights already recorded are unaffected
+        because they hold a snapshot, not a reference.
+        """
+        stored = self._clean_geofence(vertices)
+        if stored is None:
+            raise ValueError("A geofence needs vertices")
+
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            fence = session.query(Geofence).filter_by(
+                geofence_id=geofence_id, user_id=user_id).first()
+            if fence is None:
+                raise GeofenceNotFound(f"Geofence {geofence_id} not found")
+            fence.vertices = stored
+            if label is not None:
+                fence.label = label.strip() or None
+            session.commit()
+            logger.info(f"Geofence updated: geofence_id={geofence_id}")
+
+    def delete_geofence(self, geofence_id: int, user_id: int) -> None:
+        """
+        Remove a boundary, and unassign it from any slot using it.
+
+        A hard delete, unlike a stream's revoke, and safe for the same reason the
+        camera profile is: nothing in history points here. flights.geofence holds a
+        snapshot of what each flight was actually judged against, so deleting the
+        named row cannot rewrite a past alert. Slots referencing it simply stop
+        geofencing, which is a state they are already allowed to be in.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            fence = session.query(Geofence).filter_by(
+                geofence_id=geofence_id, user_id=user_id).first()
+            if fence is None:
+                raise GeofenceNotFound(f"Geofence {geofence_id} not found")
+            # Explicitly rather than by ON DELETE SET NULL: SQLite does not enforce
+            # foreign keys unless asked to, so a database-level rule would hold in
+            # PostgreSQL and quietly not in the tests.
+            (session.query(Stream)
+             .filter_by(user_id=user_id, geofence_id=geofence_id)
+             .update({"geofence_id": None}))
+            session.delete(fence)
+            session.commit()
+            logger.info(f"Geofence deleted: geofence_id={geofence_id}")
+
     def create_stream(self, user_id: int, label: Optional[str] = None,
-                      app_mode: Optional[str] = None, geofence=None) -> dict:
+                      app_mode: Optional[str] = None,
+                      geofence_id: Optional[int] = None) -> dict:
         """
         Add a stream slot and mint its ingest key. The key is returned once, here.
 
@@ -596,11 +756,11 @@ class UserDirectory:
 
         app_mode selects the pipeline this slot's flights run; None follows the
         deployment's own setting, which is what every slot did before this existed.
-        geofence is a sequence of (lon, lat) pairs bounding this slot's flights, or
-        None for no geofencing — also a supported state.
+        geofence_id names one of the caller's own boundaries, or None for no
+        geofencing — also a supported state.
 
-        Raises StreamLimitReached at the cap, ValueError for a bad label, mode or
-        geofence.
+        Raises StreamLimitReached at the cap, GeofenceNotFound for a boundary that is
+        not the caller's, ValueError for a bad label or mode.
         """
         if label is not None:
             label = label.strip() or None
@@ -608,7 +768,6 @@ class UserDirectory:
                 raise ValueError(f"Label must be at most {MAX_STREAM_LABEL_LENGTH} characters")
 
         app_mode = self._clean_app_mode(app_mode)
-        geofence = self._clean_geofence(geofence)
 
         SessionFactory = sessionmaker(bind=self._engine)
         with SessionFactory() as session:
@@ -622,6 +781,15 @@ class UserDirectory:
             if owner is None:
                 raise ValueError(f"User {user_id} not found")
 
+            if geofence_id is not None:
+                # Checked inside the same session as the insert, and scoped to the
+                # owner: without this a slot could be pointed at another tenant's
+                # boundary by guessing a sequential id.
+                owned = session.query(Geofence).filter_by(
+                    geofence_id=geofence_id, user_id=user_id).first()
+                if owned is None:
+                    raise GeofenceNotFound(f"Geofence {geofence_id} not found")
+
             active = (session.query(Stream)
                       .filter_by(user_id=user_id)
                       .filter(Stream.revoked_at.is_(None))
@@ -632,7 +800,7 @@ class UserDirectory:
                 )
 
             stream = Stream(user_id=user_id, label=label, app_mode=app_mode,
-                            geofence=geofence, stream_key=generate_stream_key())
+                            geofence_id=geofence_id, stream_key=generate_stream_key())
             session.add(stream)
             session.commit()
             logger.info(
@@ -641,7 +809,7 @@ class UserDirectory:
             )
             return {"stream_id": stream.stream_id, "stream_key": stream.stream_key,
                     "label": stream.label, "app_mode": stream.app_mode,
-                    "geofence": json.loads(stream.geofence) if stream.geofence else None}
+                    "geofence_id": stream.geofence_id}
 
     def list_streams(self, user_id: int, include_revoked: bool = False) -> List[dict]:
         """
@@ -666,7 +834,7 @@ class UserDirectory:
                     "label": d.label,
                     "stream_key": d.stream_key,
                     "app_mode": d.app_mode,
-                    "geofence": json.loads(d.geofence) if d.geofence else None,
+                    "geofence_id": d.geofence_id,
                     "revoked_at": d.revoked_at,
                     "created_at": d.created_at,
                 }
@@ -702,33 +870,35 @@ class UserDirectory:
                 f"app_mode={app_mode or 'deployment default'}"
             )
 
-    def set_stream_geofence(self, stream_id: int, user_id: int, vertices) -> None:
+    def set_stream_geofence(self, stream_id: int, user_id: int,
+                            geofence_id: Optional[int]) -> None:
         """
-        Set or clear the operating boundary for a slot's flights.
-
-        None or an empty sequence clears it, which disables geofencing for this slot —
-        a supported state, not a degraded one, and what every slot did before the
-        column existed.
+        Point a slot at one of the caller's boundaries, or None to stop geofencing.
 
         Takes effect on the NEXT flight, for the same reason as the mode: the fence is
         read when the flight opens and handed to a container that has already started.
 
-        Raises StreamNotFound for a slot that is not the caller's — the same answer as
-        one that does not exist — and ValueError for a boundary that is not one.
+        Both ids are matched against user_id, and both refusals are the same 404 as an
+        id that does not exist — one of these numbers names the caller's slot and the
+        other names their boundary, and a guess at either must learn nothing.
         """
-        geofence = self._clean_geofence(vertices)
-
         SessionFactory = sessionmaker(bind=self._engine)
         with SessionFactory() as session:
             stream = session.query(Stream).filter_by(
                 stream_id=stream_id, user_id=user_id).first()
             if stream is None:
                 raise StreamNotFound(f"Stream {stream_id} not found")
-            stream.geofence = geofence
+
+            if geofence_id is not None:
+                owned = session.query(Geofence).filter_by(
+                    geofence_id=geofence_id, user_id=user_id).first()
+                if owned is None:
+                    raise GeofenceNotFound(f"Geofence {geofence_id} not found")
+
+            stream.geofence_id = geofence_id
             session.commit()
             logger.info(
-                f"Stream geofence set: stream_id={stream_id}, "
-                f"points={len(json.loads(geofence)) if geofence else 0}"
+                f"Stream geofence set: stream_id={stream_id}, geofence_id={geofence_id}"
             )
 
     def revoke_stream(self, stream_id: int, user_id: int) -> None:
@@ -811,7 +981,22 @@ class UserDirectory:
             if stream is None or stream.revoked_at is not None:
                 return None
 
-            flight = Flight(stream_id=stream.stream_id)
+            # SNAPSHOT, not a reference. The named boundary can be edited or
+            # deleted afterwards, and neither may rewrite what this flight was judged
+            # against — "which fence produced this alert?" is exactly the question a
+            # tenant disputing one asks, and a foreign key would answer it with
+            # today's shape rather than the one that flew.
+            fence = None
+            if stream.geofence_id is not None:
+                owned = session.query(Geofence).filter_by(
+                    geofence_id=stream.geofence_id, user_id=stream.user_id).first()
+                # Scoped to the owner even here, where the id came from our own row
+                # rather than from a request: a slot pointing across tenants would be
+                # a bug elsewhere, and this is where it would otherwise take effect.
+                if owned is not None:
+                    fence = owned.vertices
+
+            flight = Flight(stream_id=stream.stream_id, geofence=fence)
             # public_uuid is a column default, so it is not populated until the insert
             # is flushed — the output path cannot be derived before this point.
             session.add(flight)
@@ -839,8 +1024,10 @@ class UserDirectory:
                 # this column existed.
                 "app_mode": stream.app_mode,
                 # Rendered into the app's own spelling here rather than in the
-                # orchestrator, which does not interpret any of this.
-                "geofence_vertexes": geofence_to_env(stream.geofence),
+                # orchestrator, which does not interpret any of this. Read off the
+                # flight's snapshot rather than the live row, so what the container is
+                # told and what history records can never disagree.
+                "geofence_vertexes": geofence_to_env(flight.geofence),
             }
 
     def close_flight(self, flight_id: int) -> bool:

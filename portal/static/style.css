@@ -131,16 +131,24 @@ button:hover, .button:hover { border-color: var(--muted); }
 
 /* ── Geofence editor ───────────────────────────────────────────────────────── */
 
-.fence { margin-top: 8px; font-size: 13px; }
-.fence summary { cursor: pointer; color: var(--muted); }
-.fence-rows { display: grid; gap: 4px; margin: 8px 0; }
+/* One boundary being edited on /geofences. The delete button is a separate form —
+   forms cannot nest — so the two are pulled together with a negative margin rather
+   than by wrapping them, which would have meant nesting. */
+.fence-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 12px;
+}
+.fence-card > input[type="text"] { max-width: 28em; }
+.fence-delete { margin: 6px 0 0; }
+.fence-rows { display: grid; gap: 4px; margin: 10px 0; }
 .fence-row { display: flex; gap: 4px; }
 /* Coordinates are short and fixed-length-ish; the full-width input rule would give
-   each one the whole cell and push the pair onto two lines. */
-.fence-row input { width: 7.5em; padding: 4px 6px; font-size: 13px; }
+   each one the whole row and push the pair onto two lines. */
+.fence-row input { width: 8em; padding: 5px 7px; font-size: 13px; }
 .fence-actions { display: flex; gap: 6px; flex-wrap: wrap; }
-.fence-actions button { padding: 4px 10px; font-size: 13px; }
-.badge.fenced { background: #1d262c; color: var(--muted); border: 1px solid var(--line); }
+.fence-actions button { padding: 5px 12px; font-size: 13px; }
 
 /* ── Slot table ────────────────────────────────────────────────────────────── */
 

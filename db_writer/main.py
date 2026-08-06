@@ -35,6 +35,7 @@ from constants import FLIGHT_HISTORY_PAGE_SIZE
 from db_manager import (
     AlertWriter,
     EmailAlreadyRegistered,
+    GeofenceNotFound,
     StreamLimitReached,
     StreamNotFound,
     UserDirectory,
@@ -124,8 +125,8 @@ class CreateStreamRequest(BaseModel):
     # Omitted or null follows the deployment's own APP_MODE, which is what every
     # slot did before this field existed.
     app_mode: Optional[str] = None
-    # [[lon, lat], ...] operating boundary, or omitted for none.
-    geofence: Optional[list] = None
+    # One of the caller's own geofences, or omitted for no geofencing.
+    geofence_id: Optional[int] = None
 
 
 class StreamModeRequest(BaseModel):
@@ -133,9 +134,14 @@ class StreamModeRequest(BaseModel):
 
 
 class StreamGeofenceRequest(BaseModel):
-    # A list of [longitude, latitude] pairs, or null/empty to disable geofencing for
-    # this slot. Longitude first, matching the app's parser and GeoJSON — not the
-    # "lat, lon" a map UI usually shows.
+    # Which of the caller's boundaries this slot flies, or null for none.
+    geofence_id: Optional[int] = None
+
+
+class GeofenceRequest(BaseModel):
+    label: Optional[str] = None
+    # [[longitude, latitude], ...]. Longitude first, matching the app's parser and
+    # GeoJSON — not the "lat, lon" a map UI usually shows.
     vertices: Optional[list] = None
 
 
@@ -362,11 +368,13 @@ def add_stream(
     """
     user_id = _require_session(authorization)
     try:
-        return _directory.create_stream(user_id, req.label, req.app_mode, req.geofence)
+        return _directory.create_stream(user_id, req.label, req.app_mode, req.geofence_id)
     except StreamLimitReached as e:
         # Before ValueError — it is a subclass, so order matters here as it does
         # in /register.
         raise HTTPException(status_code=409, detail=str(e))
+    except GeofenceNotFound:
+        raise HTTPException(status_code=404, detail="Geofence not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -472,18 +480,87 @@ def set_stream_geofence(
     calls on their own land. Nothing leaked — the app is per-flight and sole-occupant
     — but the answer it computed was somebody else's.
 
-    Null or an empty list disables geofencing for the slot, which is a supported state.
+    Null disables geofencing for the slot, which is a supported state.
     """
     user_id = _require_session(authorization)
     try:
-        _directory.set_stream_geofence(stream_id, user_id, req.vertices)
+        _directory.set_stream_geofence(stream_id, user_id, req.geofence_id)
     except StreamNotFound:
         raise HTTPException(status_code=404, detail="Stream not found")
+    except GeofenceNotFound:
+        # Same 404, deliberately: one of these ids names the caller's slot and the
+        # other their boundary, and a guess at either must learn nothing.
+        raise HTTPException(status_code=404, detail="Geofence not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Unexpected error setting geofence on stream {stream_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to set stream geofence")
+    return {"ok": True}
+
+
+@app.get("/geofences")
+def list_geofences(authorization: Optional[str] = Header(default=None)):
+    """The caller's named operating boundaries."""
+    user_id = _require_session(authorization)
+    return {"geofences": _directory.list_geofences(user_id)}
+
+
+@app.post("/geofences", status_code=201)
+def create_geofence(
+    req: GeofenceRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Store a named boundary. Named because one field is often flown from several
+    slots, and re-entering a polygon per slot is re-entering it wrongly eventually.
+    """
+    user_id = _require_session(authorization)
+    try:
+        return _directory.create_geofence(user_id, req.label, req.vertices)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/geofences/{geofence_id}")
+def update_geofence(
+    geofence_id: int,
+    req: GeofenceRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Replace a boundary's points and name.
+
+    Every slot pointing at it flies the new shape from its next flight. Flights
+    already recorded are unaffected — they hold a snapshot, not a reference.
+    """
+    user_id = _require_session(authorization)
+    try:
+        _directory.update_geofence(geofence_id, user_id, req.label, req.vertices)
+    except GeofenceNotFound:
+        raise HTTPException(status_code=404, detail="Geofence not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True}
+
+
+@app.post("/geofences/{geofence_id}/delete")
+def delete_geofence(
+    geofence_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Remove a boundary and unassign it from any slot using it.
+
+    A hard delete, unlike a stream's revoke, and safe for one reason: nothing in
+    history points here. Each flight stores a snapshot of the boundary it was judged
+    against, so removing the named row cannot rewrite a past alert.
+    """
+    user_id = _require_session(authorization)
+    try:
+        _directory.delete_geofence(geofence_id, user_id)
+    except GeofenceNotFound:
+        raise HTTPException(status_code=404, detail="Geofence not found")
     return {"ok": True}
 
 

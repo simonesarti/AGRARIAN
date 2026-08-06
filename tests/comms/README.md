@@ -292,6 +292,21 @@ single deployment-wide polygon, so every tenant was evaluated against the same f
 and at least one of them got wrong danger calls on their own land. Nothing leaked; the
 answer was simply somebody else's.
 
+Boundaries are named rows a user owns and slots point at, so **two sequential ids are
+in play** — `stream_id` and `geofence_id` — and the pairing is the attack: a slot must
+not be pointable at another tenant's boundary, at creation or afterwards, and both
+refusals must be the same 404 as an id that does not exist.
+
+**The snapshot group is the one that could not be written before boundaries were
+named.** `flights.geofence` records what a flight was judged against rather than
+pointing at whatever the polygon looks like now, and it is checked by *moving the
+boundary and then deleting it*: the next flight gets the new shape, the flight already
+recorded still reports the old one, the slots using the deleted boundary stop
+geofencing rather than dangling, and the other tenant's boundary is untouched. Without
+that column a foreign key would have to refuse the delete or null it, and either way
+the past flight loses the answer to "which fence produced this alert?" — which is
+exactly what a tenant disputing one asks.
+
 Beyond the ranges and the three-point floor, three assertions carry their weight:
 
 - **The rendered string is parsed back by the app's own regex** and compared to the

@@ -64,9 +64,20 @@ def main():
 
     # ── shape ────────────────────────────────────────────────────────────────
     insp = inspect(d._engine)
-    check("tables are users/streams/flights/alerts/recordings",
-          sorted(insp.get_table_names()) == ["alerts", "flights", "recordings", "streams", "users"],
+    # An exact list, not a subset. A table appearing here that nobody added on purpose
+    # is worth failing over — this assertion is what caught `geofences` arriving.
+    check("tables are users/streams/geofences/flights/alerts/recordings",
+          sorted(insp.get_table_names()) ==
+          ["alerts", "flights", "geofences", "recordings", "streams", "users"],
           str(sorted(insp.get_table_names())))
+    # Configuration, and therefore NOT a credential: a geofence is reached only
+    # through its owner, exactly as a stream is.
+    check("geofences hang off a user",
+          "user_id" in [c["name"] for c in insp.get_columns("geofences")])
+    # The snapshot that makes a named boundary safe to edit or delete. Without this
+    # column, history would point at whatever the polygon looks like today.
+    check("flights record the boundary they were judged against",
+          "geofence" in [c["name"] for c in insp.get_columns("flights")])
     flight_cols = [c["name"] for c in insp.get_columns("flights")]
     check("flights carries NO user_id (linear ownership)", "user_id" not in flight_cols,
           str(flight_cols))

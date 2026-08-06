@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Geofences — AGRARIAN{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="cardhead">
+    <h1>Geofences</h1>
+    <a href="/">← All slots</a>
+  </div>
+
+  <p class="muted">
+    An operating boundary a flight's danger analysis is checked against. Name one here
+    and pick it on a slot — one field is often flown from several slots, and re-entering
+    the same polygon on each is how they drift apart.
+  </p>
+
+  {# Longitude first, matching the app's parser and GeoJSON rather than the "lat, lon"
+     a map usually shows. Both boxes are labelled for exactly that reason: a swapped
+     pair is only rejected when the latitude value happens to exceed 90, so most of
+     them would be accepted and silently judge the wrong ground. #}
+  <p class="muted small">
+    Longitude first, then latitude. At least 3 points. Changes apply from each slot's
+    next flight — a flight already in the air keeps the boundary it started with, and so
+    does every flight already recorded.
+  </p>
+
+  {% if geofences %}
+    {% for f in geofences %}
+    <form method="post" action="/geofences/{{ f.geofence_id }}" class="fence-card">
+      <input type="text" name="label" value="{{ f.label or '' }}"
+             placeholder="Name (optional) — e.g. north pasture" maxlength="128">
+      <div class="fence-rows" data-rows>
+        {% for lon, lat in f.vertices %}
+        <div class="fence-row">
+          <input type="text" name="lon" value="{{ lon }}" placeholder="lon" inputmode="decimal">
+          <input type="text" name="lat" value="{{ lat }}" placeholder="lat" inputmode="decimal">
+        </div>
+        {% endfor %}
+        <div class="fence-row">
+          <input type="text" name="lon" placeholder="lon" inputmode="decimal">
+          <input type="text" name="lat" placeholder="lat" inputmode="decimal">
+        </div>
+      </div>
+      <div class="fence-actions">
+        <button type="button" data-add-point>Add point</button>
+        <button type="submit" class="primary">Save</button>
+      </div>
+    </form>
+    {# A separate form: nesting one inside the other is invalid HTML, and a delete
+       button inside the edit form would submit the edit's fields along with it. #}
+    <form method="post" action="/geofences/{{ f.geofence_id }}/delete" class="fence-delete"
+          onsubmit="return confirm('Delete this boundary? Slots using it stop geofencing. Flights already recorded keep the boundary they were judged against.')">
+      <button type="submit" class="danger">Delete</button>
+    </form>
+    {% endfor %}
+  {% else %}
+    <p class="empty">No boundaries yet.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Add a boundary</h2>
+  <form method="post" action="/geofences" class="fence-card">
+    <input type="text" name="label" placeholder="Name (optional) — e.g. north pasture"
+           maxlength="128">
+    <div class="fence-rows" data-rows>
+      {% for _ in range(3) %}
+      <div class="fence-row">
+        <input type="text" name="lon" placeholder="lon" inputmode="decimal">
+        <input type="text" name="lat" placeholder="lat" inputmode="decimal">
+      </div>
+      {% endfor %}
+    </div>
+    <div class="fence-actions">
+      <button type="button" data-add-point>Add point</button>
+      <button type="submit" class="primary">Create</button>
+    </div>
+  </form>
+</div>
+
+{# Delegated from the document, so rows this creates need no wiring of their own. The
+   forms work without it: they post whatever rows are already rendered, which is why
+   the add form starts with the three a polygon needs. #}
+<script>
+  document.addEventListener("click", function (event) {
+    const button = event.target.closest("[data-add-point]");
+    if (!button) return;
+    const rows = button.closest("form").querySelector("[data-rows]");
+    const row = rows.lastElementChild.cloneNode(true);
+    row.querySelectorAll("input").forEach(function (input) { input.value = ""; });
+    rows.appendChild(row);
+    row.querySelector("input").focus();
+  });
+</script>
+{% endblock %}

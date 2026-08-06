@@ -117,9 +117,11 @@ class DbWriterClient:
         return (await self._call("GET", "/streams", token=token))["streams"]
 
     async def create_stream(self, token: str, label: Optional[str],
-                            app_mode: Optional[str] = None) -> dict:
+                            app_mode: Optional[str] = None,
+                            geofence_id: Optional[int] = None) -> dict:
         return await self._call("POST", "/streams",
-                                json={"label": label, "app_mode": app_mode}, token=token)
+                                json={"label": label, "app_mode": app_mode,
+                                      "geofence_id": geofence_id}, token=token)
 
     async def set_stream_mode(self, token: str, stream_id: int,
                               app_mode: Optional[str]) -> dict:
@@ -127,9 +129,27 @@ class DbWriterClient:
                                 json={"app_mode": app_mode}, token=token)
 
     async def set_stream_geofence(self, token: str, stream_id: int,
-                                  vertices: Optional[list]) -> dict:
+                                  geofence_id: Optional[int]) -> dict:
         return await self._call("POST", f"/streams/{stream_id}/geofence",
-                                json={"vertices": vertices}, token=token)
+                                json={"geofence_id": geofence_id}, token=token)
+
+    # ── Geofences ─────────────────────────────────────────────────────────────
+
+    async def list_geofences(self, token: str) -> list:
+        return (await self._call("GET", "/geofences", token=token))["geofences"]
+
+    async def create_geofence(self, token: str, label: Optional[str],
+                              vertices: list) -> dict:
+        return await self._call("POST", "/geofences",
+                                json={"label": label, "vertices": vertices}, token=token)
+
+    async def update_geofence(self, token: str, geofence_id: int,
+                              label: Optional[str], vertices: list) -> dict:
+        return await self._call("POST", f"/geofences/{geofence_id}",
+                                json={"label": label, "vertices": vertices}, token=token)
+
+    async def delete_geofence(self, token: str, geofence_id: int) -> dict:
+        return await self._call("POST", f"/geofences/{geofence_id}/delete", token=token)
 
     async def rotate_stream(self, token: str, stream_id: int) -> dict:
         return await self._call("POST", f"/streams/{stream_id}/rotate", token=token)
