@@ -1341,7 +1341,13 @@ waits on them and neither is work:**
 flying, and the hub tier now has manifests that deploy on a real cluster.** Between them
 those closed every item that has stood at the top of this list.
 
-**There is no code item left here.** What remains is the two asks above, plus the
+**There was no code item left here**, and that stopped being true when §10 was
+written. What this ledger describes is finished; §10 is a decided direction that
+changes the credential model, the flight lifecycle and the media tier's shape, and
+none of it is built. Read this section as the state of what exists and §10 as where
+it goes next.
+
+Setting §10 aside, what remains is the two asks above, plus the
 provider-specific values that only exist once a cluster does — a registry to push the
 five images to, a storage class if the default is not wanted, and the load-balancer
 addresses that `configs/k8s/endpoints.env` needs. None of those is work that can be
@@ -2145,3 +2151,411 @@ translation work.
   now costs one indexed lookup here. A short-TTL cache is the obvious fix and the wrong
   one to reach for blindly: it delays revocation of a credential that has no expiry.
   Replicas first, cache only if measurement demands it.
+
+---
+
+## 10. Ephemeral keys and elastic media capacity **[designed]**
+
+**Nothing in this section is built.** It is a decided direction, recorded here because
+it changes three things §3, §5 and §6 currently state as settled: the stream key stops
+being persistent, the GPU container stops being spawned by the media server, and
+MediaMTX stops being a single instance. Sections above describe what runs today and
+remain accurate as such.
+
+The architecture rests on two pillars that were never examined together: a drone
+**arrives unannounced**, and its key is **stable until revoked**. Each forces real
+structure. Unannounced arrival is why the whole ingest path must stay warm — MediaMTX
+listening, db-writer answering the auth hook, the orchestrator waiting for
+`runOnAvailable`. Key stability is why the media tier cannot be resized: a key printed
+into a controller months ago names a host that must still answer.
+
+They are not equally load-bearing. **Dropping the second dissolves most of the first**,
+and that is the whole of this section.
+
+### 10.1 The key becomes the announcement
+
+A stream key is minted **per flight**, at the moment the operator asks for one, and
+dies when the flight does (§10.2). It is not a slot that persists across months.
+
+The step this appears to add is a step that already exists. §6 records that the key is
+deliberately *not* shown once and hidden — `list_streams` returns it every time,
+**because the operator has to read the ingest URL before every flight**. So an operator
+is already at the portal, immediately before takeoff, asking where to publish. That
+page load *is* an announcement; it was simply never treated as one.
+
+Three things follow, and the third is the one that matters most:
+
+- **The credential stops being permanent.** §3 spends real effort on a key that never
+  expires: instant revocation as the only mitigation, and the residual that the key
+  appears in MediaMTX access logs. A key that lives one flight makes most of that
+  argument unnecessary rather than better-defended.
+- **Shard assignment becomes trivial.** A key created seconds before takeoff is
+  assigned to whichever media cell has capacity *now*. There is no stored binding to
+  keep valid, nothing to rebalance, and no printed URL that can go stale — which is the
+  entire difficulty of sharding a media server that a permanent key creates.
+- **Capacity gets a closed loop.** A key request is a capacity request. This is what
+  the *Open* entry on MediaMTX sharding lacked: under permanent keys, adding an
+  instance relieves nothing, because every key already in circulation is bound
+  elsewhere. The response could not move the signal. Now it can.
+
+**This does not license scaling the hub to zero**, and the reason is worth stating so
+the mistake is not made later. The portal must be up to mint the key, db-writer to
+answer the auth hook the instant the drone connects, Redis and PostgreSQL underneath
+both. What ephemeral keys remove is the *media* tier's obligation to be warm — and the
+remaining warm set still needs a machine, on which MediaMTX's request fits in the
+slack. The saving is single-digit dollars a month against a GPU tier measured in
+hundreds. **Scale-to-zero is worth doing where the GPU is and nowhere else.**
+
+### 10.2 Two timers, not a duration
+
+The key carries no user-chosen lifetime. It lives exactly as long as the work does,
+bounded by two timers with different jobs:
+
+| Timer | Fires when | Action |
+| --- | --- | --- |
+| **Pre-flight**, 15 min | key minted, nothing ever published | tear down, free capacity, revoke |
+| **Post-flight**, N min (≈10) | last disconnect, no reconnection | tear down, free capacity, revoke |
+
+A user-selectable duration was considered and rejected: no flight approaches the
+shortest value anyone would offer, so it is a knob whose every setting means the same
+thing. The timers already know when the work is over.
+
+**The pre-flight timer must be stated on screen** — *"if no stream starts within 15
+minutes this session is discarded"* — with what to do about it. A silent timeout is a
+defect; a stated one is a contract, and recovery is one click. Fifteen rather than ten
+because the interval that actually elapses is not "copy a URL": it is walk to the
+launch point, props on, GPS lock, preflight. A careful operator can spend ten minutes
+without being at fault, and the cost of generosity is cents of idle GPU against a
+re-do in a field.
+
+**`RECONNECT_GRACE_S` does a different job and moves to 120 s.** It decides *flight
+identity* — inside it the same flight, container and `flight_id` continue; outside it
+the next takeoff is a new flight, which §6 already calls the honest description. The
+post-flight timer decides *key and capacity lifetime*, and is deliberately much longer.
+
+The value moves from 30 s because the asymmetry that set it has reversed. It used to be
+one-sided: erring long cost idle GPU and nothing else, so generosity was free. Now that
+a battery swap must be recorded as a separate flight, erring long has a *semantic* cost
+too — a practiced operator with the drone at their feet can be airborne again in under
+three minutes, and a grace window that long would silently merge two flights into one.
+120 s sits in the gap: a dropout behind a treeline is 30–60 s and is comfortably
+covered, while the fastest realistic swap is not. 180 s starts eating into it.
+
+That gap between them is the design's best property and it is easy to miss. A battery
+swap takes two to five minutes, so it falls **outside** the grace window and **inside**
+the post-flight timer. The result: the swap is honestly recorded as a second flight,
+and **the container stays warm across it** — model weights already resident, so the
+second sortie starts immediately instead of paying a cold GPU start. A session-scoped
+key would have kept the credential alive and still torn the container down at grace
+expiry, which is the expensive half.
+
+The cost is idle GPU between sorties — roughly five minutes at swap, and up to N
+minutes for an operator who simply goes home. That is the trade N sets, and it is
+cheap in both directions. An explicit **End session** control in the portal makes the
+common case immediate and leaves the timer as the safety net for people who forget.
+
+**The recording needs nothing from teardown.** MediaMTX always closes and flushes the
+current segment on publisher disconnect regardless of `recordSegmentDuration` (§9), so
+the upload has already run by the time either timer fires. Teardown frees capacity and
+nothing else.
+
+That same flush is what gives the archive its shape, and it makes one invariant free:
+**no recording can ever span two flights.** Every flight boundary is a disconnect — that
+is what ends a flight — and every disconnect closes the segment. The boundary is clean
+at any grace value.
+
+`recordSegmentDuration` therefore rises to **24 h**, from the 1 h that was only ever a
+placeholder: no consumer airframe flies long enough for an hourly split to fire, so the
+setting has never once divided a real flight. With the ceiling raised, one flight
+produces exactly one recording — except when the publisher drops and returns inside the
+grace window, which produces one per connection interval. `flights → recordings` is
+already 1:many, so that case needs nothing.
+
+It is **raised rather than deleted**, and the reason is a mistake this document has
+recorded once already: §4 describes SRT and MoQ running on every start in v1.19 because
+they were enabled *by default* and nobody had decided so. An omitted line inherits
+whatever the next version's default happens to be. The value is also quoted in the
+`recordings` PersistentVolumeClaim comment in `configs/k8s/hub/mediamtx.yaml`, which
+moves with it.
+
+#### Revocation is what makes the key ephemeral
+
+Teardown revokes the key. Without that step nothing else in this section is true: a key
+that outlives its flight is a permanent key, and §10 exists to stop minting those.
+
+**The mechanism is already built.** §5's `revoked_at` retires a slot without deleting
+anything, and the key stops resolving at `/auth/mediamtx` and `/auth/mqtt/*` the moment
+it is set, because both hooks ask the `streams` table live on every connection rather
+than holding a roster (§4). Nothing needs inventing. What changes is *who* sets it and
+*when*: today a user clicks Retire, and under §10 the orchestrator does it as part of
+tearing the flight down, on either timer.
+
+Four properties it has to have, three of which the codebase already establishes
+elsewhere:
+
+- **Revoke before freeing capacity, never after.** The order is not cosmetic. A key that
+  is still valid while its cell has been returned to the pool can be reconnected to, and
+  the flight it opens lands on a cell that no longer expects it.
+- **Idempotent, and never overwritten.** Both timers can fire, and shutdown can arrive
+  on top of either. `revoked_at` takes the same rule §5 already gives `end_time`: the
+  first timestamp is the true one, and a later teardown for a flight already closed
+  changes nothing.
+- **Nothing is deleted.** §5's rule holds unchanged — the flights, their alerts and
+  their recordings all survive revocation, because history is the point of recording
+  them. Only the credential stops working.
+- **The portal has to show it.** A slot that has silently stopped working is worse than
+  one that is gone: the operator retypes a URL that will never authenticate and has
+  nothing on screen explaining why. An expired key should read as expired, with minting
+  the next one as the obvious action.
+
+A missed revocation is not a lost flight — the drone would reconnect, authenticate on a
+key that still resolves, and open a new flight, which is semantically what happened. It
+is a *security* regression rather than an availability one, and that is exactly why it
+needs stating: the failure is invisible from the outside, and the thing quietly lost is
+the property this whole section was written to gain.
+
+### 10.3 What is provisioned on demand, and what is kept warm
+
+Minting a key does two things: **assign a media cell** from the warm pool, and **spawn
+the GPU container**. They look symmetrical and are not.
+
+> **Provision on demand the thing whose wait already exists. Keep warm the thing that
+> is currently instant.**
+
+**The GPU container is provisioned on demand**, and this *moves* a wait rather than
+adding one. Today the sequence is: drone takes off, publishes, `runOnAvailable` fires,
+the orchestrator creates a Job, the node pool has no GPU, the cluster autoscaler
+provisions a machine — one to five minutes during which the drone is airborne and
+nothing is processing its video. §6 notes that a container which fails to start closes
+the flight row immediately, which is to say **a capacity failure is currently
+discovered by a drone already in the air**. Minting the key first turns that into a
+spinner and, if there is genuinely no capacity, an honest refusal before takeoff.
+
+Two supporting facts, both already true: `StreamVideoReader` **reconnects
+indefinitely, idling until the drone starts publishing** — so a container started
+early costs nothing but time and needs no change. And §4's caution that "auth and spawn
+are separate events" dissolves, because an explicit human action is a better spawn
+trigger than a connection attempt that may be aborted and retried.
+
+**The media cell is not provisioned on demand.** A new cell needs a cloud load
+balancer — minutes to provision, unreliable when it is not, and a standing monthly
+cost. That wait does not exist today, so creating it would put a cloud API call
+between an operator and a takeoff. Cells come from a warm pool instead (§10.4).
+
+The two are not fully independent: the cell must be chosen before the container can be
+configured, since the container is told which host to read from and publish to. Same
+trigger, sequential rather than parallel.
+
+`runOnAvailable`/`runOnUnavailable` do not disappear — the flight row still opens and
+closes on them — but they stop *creating* things. A duplicate hook can then no longer
+cause a duplicate spawn, which removes the sharpest edge from the most delicate logic
+in `flights.py`.
+
+### 10.4 The cell, and the growth that ends it
+
+A shard is not a MediaMTX. It is a **cell**: MediaMTX, the recorder sidecar and
+Mosquitto in one pod, behind one address, as one failure domain.
+
+The recorder is already there, for the `ReadWriteOnce` reason in §2. Mosquitto joins it
+for three reasons that all follow from decisions already made. §2 established that
+MediaMTX needs a **single** mixed-protocol Service because WebRTC advertises exactly
+one host candidate — so adding 8883 to an address that already carries RTMPS, RTSPS and
+WebRTC **costs nothing**, and saves a separate load balancer for the broker. Failure
+domains align: a cell dying takes video and telemetry for its own flights, rather than
+a shared broker taking telemetry from every flight at once. And the scaling policy gets
+one concept instead of three.
+
+**Mosquitto's floor is two, not one**, whichever model is in use. Telemetry is not
+decoration: `danger_detection` feeds it into `FrameTelemetryCombiner`, and §9's own
+falsification showed that when telemetry does not arrive at rate, *every frame goes
+unmatched* while every other assertion stays green. A single broker is a silent global
+failure domain for the primary product mode. Note also that **Mosquitto has no
+clustering** — two brokers means two independent brokers with flights assigned to one
+or the other, the same sharding model as MediaMTX, not an HA pair. EMQX or VerneMQ
+cluster if that ever becomes worth paying for.
+
+#### When the cell stops being right
+
+The cell over-provisions Mosquitto on purpose: one broker serves far more flights than
+one MediaMTX, so pairing them 1:1 buys brokers nobody needs. That is the correct trade
+now and the wrong one later, and the crossover is arithmetic rather than taste:
+
+```text
+cell:         N × (an unneeded Mosquitto container)   ≈ N × $5/mo
+independent:  M × (an extra load balancer + cert)     ≈ M × $20/mo
+
+break-even at roughly N = 4M
+```
+
+With two brokers, the cell is cheaper below about **eight media cells** — which is on
+the order of eighty concurrent flights, and therefore eighty GPUs. Past that, the
+wasted brokers outgrow the extra addresses and the tiers should be split: MediaMTX and
+Mosquitto scaled on their own capacities, each with its own policy, because they do not
+saturate at anything like the same load.
+
+**This is deliberately a cheap migration**, which is why it can be deferred without
+being designed for now. What changes is whether a flight's injected broker host equals
+its media host. One environment variable, and the assignment logic that fills it.
+
+### 10.5 Headroom, not thresholds
+
+Capacity is added **ahead of demand**, never in response to a request that is already
+waiting, and the trigger is derived rather than picked:
+
+```text
+headroom needed = peak arrival rate × provisioning time
+```
+
+A cell that takes five minutes to come up, against a peak of one new flight per minute,
+needs five flights of slack — so a ten-flight cell scales at 50%, not at 80%. Both
+inputs are measurable, and neither is a preference.
+
+**Scale-down is real and needs hysteresis.** Scaling up takes minutes; scaling down is
+instant, so symmetric thresholds flap. Scale up at 50%, down at perhaps 25%, with a
+cooldown in tens of minutes.
+
+Draining needs no migration: flag the cell as no longer accepting assignments and wait.
+**Ephemeral keys are what make this bounded** — under permanent keys a cell could hold
+occupied paths indefinitely, so there was no point at which removal was safe. Now the
+two timers cap how long the last flight on a cell can survive, so a drained cell empties
+within a known window.
+
+### 10.6 The viewer cap makes capacity a fixed number
+
+A flight admits a small fixed number of concurrent viewers — **two** is the working
+value: one owner, one collaborator. Three simultaneous viewers on one account is
+account sharing, not a use case.
+
+The point is not policing. It is that an uncapped viewer count is the **only variable
+term** in a media cell's load:
+
+```text
+per flight, fixed:      drone → MediaMTX            1 flow in
+                        MediaMTX → app              1 flow out
+                        app → MediaMTX              1 flow in
+per flight, capped:     MediaMTX → viewers          2 flows out
+                                                  ───────────────
+                                                    5 flows, fixed
+```
+
+Cell capacity becomes `total flows ÷ 5`, and §10.5's policy becomes arithmetic. WebRTC
+is per-peer DTLS-SRTP rather than a multicast fan-out, so every viewer genuinely costs
+its own encryption — this is not a bookkeeping convenience.
+
+**The cap is enforced in `/auth/mediamtx`, not in `mediamtx.yaml`.** The hook already
+fires on every read; §4's four legitimate combinations already contain the row this
+extends. A per-path limit in media-server configuration would be static config for a
+per-tenant policy — the defect §4 rejects in `authInternalUsers` and again in
+Mosquitto's dynamic-security plugin. As a db-writer decision, a plan with a different
+limit is a column rather than a config regeneration across every cell.
+
+Counting concurrency needs state that db-writer deliberately does not hold. **Query
+MediaMTX's API** for the path's current readers rather than keeping a Redis counter:
+the counter drifts when a decrement is missed, and a leaked slot locks an owner out of
+their own stream, while the API is the truth by construction. Read-auth is once per
+WHEP session, not per frame, so the hop is affordable.
+
+Three details decide whether this works in practice:
+
+- **Reconnect churn is the classic failure.** A viewer moving from wifi to cellular
+  reconnects before the old connection is reaped and is refused as their own third
+  viewer. Count by the token's `sub` rather than by connection, or reap aggressively.
+- **This denial must be explicit, unlike every other one.** §4 requires that the reason
+  is logged and never returned, because a caller learning why they were refused learns
+  about another tenant. Here the refusal goes to the **legitimate owner**, and *"you are
+  already watching on two devices"* is something they need told. Refusing a stranger
+  stays opaque; refusing the account holder's third device does not.
+- **The app's read never counts.** It reads `in/<key>` while viewers read
+  `out/<public_uuid>` — separate paths in the regex config. That separation exists for
+  credential reasons (§3) and happens to make this clean.
+
+Flow count is fixed; **bytes are not**. A 4K drone is roughly four times a 1080p one
+over the same five flows. Two of the five are ours (the annotated republish) and three
+are not, so mixed input resolutions would return capacity to being measured in bits.
+
+### 10.7 The session owns the media path, not the flight
+
+A sortie is a flight. Landing to swap a battery brings the drone down and puts it back
+up, so it is two flights however short the interval, and both the `flights` rows and
+the recordings must say so. The grace window exists to stop a few seconds of lost radio
+being misread as a landing — that is all it is for, and it must never be wide enough to
+swallow a swap (§10.2).
+
+That ruling settles the semantics and breaks a structural assumption. §5 gives every
+flight its own `public_uuid` and `output_path`, but the container is handed one output
+path when it spawns and has no way to learn another mid-life. One key spanning several
+sorties therefore cannot give each of them its own path.
+
+**The session becomes the row that owns the key, the `public_uuid`, the output path and
+the container. Flights are intervals inside it.**
+
+```text
+User 1 ──<N Stream 1 ──<N Session 1 ──<N Flight 1 ──<N Alert
+                                    └──<N Recording (via the flight it falls in)
+```
+
+The alternative — a fresh `public_uuid` per sortie — keeps the recording join trivial
+and costs far more: a control channel into a running container and a rebuild of its
+output connection between sorties. The whole appeal of §10.3 is a container that is
+configured once at spawn and told nothing afterwards.
+
+Three consequences, and the third is the one that decided it:
+
+- **`record_upload` must resolve by path *and* time.** Today it is
+  `filter_by(public_uuid=...).first()` — path alone, with no ordering. Two sorties
+  sharing a path would silently attribute every one of the second's segments to the
+  first's flight row. The fix needs no new data on the wire:
+  `recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f` already embeds the segment's
+  start time in the `segment_path` the recorder posts, so the segment resolves to the
+  flight whose interval contains it. Since no recording spans two flights (§10.2), that
+  interval is unambiguous.
+
+  Two details decide whether that actually works.
+
+  **Parse the timestamp once, into a column.** The filename format is defined in
+  `mediamtx.yaml` and read in Python, which is a coupling across two files in different
+  languages — the kind that breaks silently when someone tunes `recordPath`. The
+  recorder already carries `_PUBLIC_UUID_RE` for exactly this reason; it gains a
+  timestamp group, and `recordings` gains a `segment_started_at` column. Resolution
+  then joins on a real datetime instead of doing string surgery per query, and the
+  format is depended upon in one place that can be tested directly. `uploaded_at` is
+  **not** a substitute: it is when the upload finished, which after a storage outage
+  and its backlog can be hours after the flight it belongs to.
+
+  **`end_time` must be stamped at grace expiry, not at teardown.** Today those are one
+  event, so the distinction has never mattered. Under §10 they separate by minutes, and
+  a flight left open until its container is reaped would still be open while the *next*
+  sortie is flying — two overlapping intervals, and a segment falling in both. The
+  resolution is only unambiguous if flight intervals are disjoint, which means the
+  flight closes when the grace window expires and the container's own lifetime is
+  tracked separately.
+- **The auth hook's path check moves from flight to session.** A token naming a flight
+  is checked against the session that owns the path, rather than against a `public_uuid`
+  the flight holds directly.
+- **The viewer token becomes session-scoped**, and this is the argument that settles the
+  choice rather than merely supporting it. A flight-scoped token is invalidated by every
+  battery swap, so anyone watching would have their stream die and have to reload the
+  page at each one — while the flight rows underneath still record each sortie honestly.
+  The session is the unit a viewer cares about; the flight is the unit the archive cares
+  about. Conflating them serves neither.
+
+### 10.8 What this leaves open
+
+- **Key creation now spends money. [open]** §3 already notes that open registration
+  connects an anonymous signup to GPU spend, with `MAX_STREAMS_PER_USER` as the brake.
+  That cap bounds concurrency, not churn — mint, let expire, mint again. Key creation
+  needs a rate limit of its own, in the Redis the portal already uses for `/login` and
+  `/register` (§4).
+- **Nobody has measured a cell's capacity. [open]** Every number in §10.5 and §10.6
+  depends on what one MediaMTX actually holds, and the figure has never been measured —
+  including the standing claim that the GPU tier saturates first. Publishing N
+  synthetic streams into one instance with viewers attached, and finding where frames
+  start dropping, is the prerequisite that turns this section from a sketch into a
+  configuration. **It is the first thing to do here.**
+- **Does the drone controller persist the ingest URL? [open]** Not a question about
+  this codebase. If a controller remembers the URL between flights, per-flight keys
+  cost a transcription the current design does not; if it does not, they cost nothing
+  the operator was not already paying. The design above is deliberately robust either
+  way, but the answer changes how hard §10.2's timers should work to avoid a re-mint.
+  Same shape as the standing question about whether any real drone needs the plaintext
+  fallback (§9): a fact somebody who owns the aircraft can supply in a sentence.
