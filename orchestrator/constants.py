@@ -36,5 +36,16 @@ JOB_DELETE_TIMEOUT_S = 30
 # down instantly would mean a cold GPU start — model weights reloaded — for what was a
 # blip, so teardown waits this long for the same key to come back.
 #
+# This window decides FLIGHT IDENTITY and nothing else: inside it the same flight,
+# container and flight_id continue; outside it the next takeoff is a new flight, which
+# is the honest description of what happened. Landing to swap a battery is therefore
+# two flights, and both the flights rows and the recordings must say so.
+#
+# 120 rather than 30 because the trade is two-sided, which it did not used to be.
+# Erring long costs idle GPU — pennies — but it also risks swallowing a battery swap
+# into a single flight, and a practiced operator with the drone at their feet is back
+# in the air in under three minutes. A dropout behind a treeline is 30-60 s. 120 sits
+# in the gap; 180 starts eating into it.
+#
 # Set to 0 to tear down immediately.
-RECONNECT_GRACE_S = 30
+RECONNECT_GRACE_S = 120

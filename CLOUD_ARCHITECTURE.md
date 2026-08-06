@@ -2156,11 +2156,19 @@ translation work.
 
 ## 10. Ephemeral keys and elastic media capacity **[designed]**
 
-**Nothing in this section is built.** It is a decided direction, recorded here because
-it changes three things §3, §5 and §6 currently state as settled: the stream key stops
-being persistent, the GPU container stops being spawned by the media server, and
-MediaMTX stops being a single instance. Sections above describe what runs today and
-remain accurate as such.
+This is a decided direction, recorded here because it changes three things §3, §5 and
+§6 currently state as settled: the stream key stops being persistent, the GPU container
+stops being spawned by the media server, and MediaMTX stops being a single instance.
+Sections above describe what runs today and remain accurate as such.
+
+**Almost none of it is built.** Items land one at a time and are marked here as they
+do, so that this section never reads as more finished than it is:
+
+| Landed | |
+| --- | --- |
+| `RECONNECT_GRACE_S` 30 s → 120 s (§10.2) | **[built]** 2026-08-06 |
+
+Everything else below is **[designed]**.
 
 The architecture rests on two pillars that were never examined together: a drone
 **arrives unannounced**, and its key is **stable until revoked**. Each forces real
@@ -2228,10 +2236,11 @@ launch point, props on, GPS lock, preflight. A careful operator can spend ten mi
 without being at fault, and the cost of generosity is cents of idle GPU against a
 re-do in a field.
 
-**`RECONNECT_GRACE_S` does a different job and moves to 120 s.** It decides *flight
-identity* — inside it the same flight, container and `flight_id` continue; outside it
-the next takeoff is a new flight, which §6 already calls the honest description. The
-post-flight timer decides *key and capacity lifetime*, and is deliberately much longer.
+**`RECONNECT_GRACE_S` does a different job and has moved to 120 s. [built]** It decides
+*flight identity* — inside it the same flight, container and `flight_id` continue;
+outside it the next takeoff is a new flight, which §6 already calls the honest
+description. The post-flight timer decides *key and capacity lifetime*, and is
+deliberately much longer.
 
 The value moves from 30 s because the asymmetry that set it has reversed. It used to be
 one-sided: erring long cost idle GPU and nothing else, so generosity was free. Now that
