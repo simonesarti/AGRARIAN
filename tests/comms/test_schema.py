@@ -66,10 +66,18 @@ def main():
     insp = inspect(d._engine)
     # An exact list, not a subset. A table appearing here that nobody added on purpose
     # is worth failing over — this assertion is what caught `geofences` arriving.
-    check("tables are users/streams/geofences/flights/alerts/recordings",
+    check("tables are users/streams/geofences/drones/flights/alerts/recordings",
           sorted(insp.get_table_names()) ==
-          ["alerts", "flights", "geofences", "recordings", "streams", "users"],
+          ["alerts", "drones", "flights", "geofences", "recordings", "streams", "users"],
           str(sorted(insp.get_table_names())))
+    # A camera PROFILE, not an aircraft. §5's "nothing in the schema models a physical
+    # drone" survives because nothing here identifies one: no serial, no registration,
+    # nothing unique. Two users flying the same model hold two unrelated rows.
+    drone_cols = [c["name"] for c in insp.get_columns("drones")]
+    check("drones carry optics and no aircraft identity",
+          "focal_len_mm" in drone_cols
+          and not any(c in drone_cols for c in ("serial", "serial_number", "registration")),
+          str(drone_cols))
     # Configuration, and therefore NOT a credential: a geofence is reached only
     # through its owner, exactly as a stream is.
     check("geofences hang off a user",
@@ -78,6 +86,8 @@ def main():
     # column, history would point at whatever the polygon looks like today.
     check("flights record the boundary they were judged against",
           "geofence" in [c["name"] for c in insp.get_columns("flights")])
+    check("...and the optics they were measured with",
+          "camera" in [c["name"] for c in insp.get_columns("flights")])
     flight_cols = [c["name"] for c in insp.get_columns("flights")]
     check("flights carries NO user_id (linear ownership)", "user_id" not in flight_cols,
           str(flight_cols))

@@ -76,6 +76,11 @@ def build_flight_env(opened: dict, base_env: Dict[str, str], stream_key: str) ->
         if value:
             env[env_name] = value
 
+    # The camera profile arrives already rendered into its five variables, or empty.
+    # Merged rather than assigned so an empty one leaves base_env's optics standing,
+    # which is what a slot naming no profile means.
+    env.update(opened.get("camera_env") or {})
+
     return env
 
 

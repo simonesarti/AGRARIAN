@@ -18,6 +18,7 @@ try to run these directly with `python3`.
 | `test_flight_history.py` | nothing | one-liner below |
 | `test_app_mode.py` | nothing | one-liner below |
 | `test_geofence.py` | nothing | one-liner below |
+| `test_camera.py` | nothing | one-liner below |
 | `test_tokens.py` | nothing | one-liner below |
 | `test_session_tokens.py` | nothing | one-liner below |
 | `test_mediamtx_auth.py` | nothing | one-liner below |
@@ -117,6 +118,15 @@ docker run --rm -v "$PWD/db_writer:/w:ro" -v "$PWD/orchestrator:/o:ro" \
   -v "$PWD/tests/comms:/tests:ro" -w /tmp -e DB_WRITER_DIR=/w -e ORCHESTRATOR_DIR=/o \
   python:3.11-slim \
   sh -c "pip install -q sqlalchemy bcrypt; python /tests/test_geofence.py"
+```
+
+Named camera profiles, same mounts:
+
+```bash
+docker run --rm -v "$PWD/db_writer:/w:ro" -v "$PWD/orchestrator:/o:ro" \
+  -v "$PWD/tests/comms:/tests:ro" -w /tmp -e DB_WRITER_DIR=/w -e ORCHESTRATOR_DIR=/o \
+  python:3.11-slim \
+  sh -c "pip install -q sqlalchemy bcrypt; python /tests/test_camera.py"
 ```
 
 Token scope separation and cross-flight replay:
@@ -320,6 +330,18 @@ Beyond the ranges and the three-point floor, three assertions carry their weight
   catchable because latitude is bounded tighter than longitude, so the assertion uses a
   value that exceeds 90 — a swap inside both ranges is undetectable here and always
   will be.
+
+**`test_camera.py`** — the third piece of configuration on that path. Five optical
+constants used to describe one airframe for the whole deployment, so a tenant flying
+anything else got measurements scaled by the ratio between their sensor and somebody
+else's.
+
+Most of it mirrors `test_geofence.py` — ownership over two sequential ids, and the
+snapshot checked by correcting a profile and then deleting it. One assertion is its own:
+**a sensor whose millimetre and pixel aspect ratios disagree is refused.** Every value in
+that case is individually valid and positive; only the ratios conflict. Nothing
+downstream would raise — ground sampling distance would simply come out stretched on one
+axis — which is why the check has to exist at the point the numbers are typed.
 
 **`test_session_tokens.py`** — the portal credential's separation from the other two.
 All three are signed with the same secret, so the `scope` claim is the only thing

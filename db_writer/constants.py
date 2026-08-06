@@ -36,6 +36,22 @@ SUPPORTED_APP_MODES = ("danger_detection", "health_monitoring")
 GEOFENCE_MIN_VERTICES = 3
 GEOFENCE_MAX_VERTICES = 200
 
+# ── Camera profiles ───────────────────────────────────────────────────────────
+# The optics a flight's geo stage computes ground distances from. Held as named
+# profiles on the account for the same reason as the geofence: these were five
+# constants in app/shared/processes/constants.py describing ONE airframe (a Mavic 3
+# Enterprise), so a deployment could serve exactly one kind of camera.
+#
+# A profile is not an aircraft and identifies none. Two users flying the same model
+# hold two independent rows with identical values and no knowledge of each other, and
+# a drone changing hands is one row deleted and another created — which is what keeps
+# §5's "nothing in the schema models a physical drone" true verbatim.
+#
+# The physical and pixel aspect ratios must agree, because ground sampling distance is
+# derived from both and a mismatch silently scales every measurement on one axis. The
+# app asserts this too; see _clean_camera for why that is not duplication.
+CAMERA_ASPECT_RATIO_TOLERANCE = 1e-3
+
 # ── Viewer session tokens ─────────────────────────────────────────────────────
 # Signed here, validated by ws-server. The TTL bounds how long a leaked token is
 # useful — tokens travel in the WebSocket query string and so reach proxy logs.

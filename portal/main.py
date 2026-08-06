@@ -504,6 +504,7 @@ async def dashboard(request: Request):
     flights = await _db.active_flights(token)
     # Needed to render the per-slot picker, and cheap: a user has a handful of these.
     fences = await _db.list_geofences(token)
+    drones = await _db.list_drones(token)
     fence_labels = {f["geofence_id"]: f["label"] or f"Boundary {f['geofence_id']}"
                     for f in fences}
 
@@ -517,6 +518,7 @@ async def dashboard(request: Request):
             "app_mode": s.get("app_mode"),
             "geofence_id": s.get("geofence_id"),
             "geofence_label": fence_labels.get(s.get("geofence_id")),
+            "drone_id": s.get("drone_id"),
             "ingest_url": _ingest_url(s["stream_key"]),
             "live": live_by_stream.get(s["stream_id"]),
         }
@@ -525,13 +527,14 @@ async def dashboard(request: Request):
     return templates.TemplateResponse(
         request, "dashboard.html",
         {"email": me.get("email"), "streams": rows, "live_count": len(flights),
-         "app_modes": APP_MODE_CHOICES, "geofences": fences})
+         "app_modes": APP_MODE_CHOICES, "geofences": fences, "drones": drones})
 
 
 @app.post("/streams")
 async def add_stream(request: Request, label: str = Form(default=""),
                      app_mode: str = Form(default=""),
-                     geofence_id: str = Form(default="")):
+                     geofence_id: str = Form(default=""),
+                     drone_id: str = Form(default="")):
     """
     The endpoint that spends money (§4): a slot is what lets a GPU container come
     into existence. db-writer caps it per user; a 409 here is that cap, and it is
@@ -548,7 +551,8 @@ async def add_stream(request: Request, label: str = Form(default=""),
     if not token:
         return _redirect("/login")
     await _db.create_stream(token, label.strip() or None, app_mode.strip() or None,
-                            int(geofence_id) if geofence_id.strip() else None)
+                            int(geofence_id) if geofence_id.strip() else None,
+                            int(drone_id) if drone_id.strip() else None)
     return _redirect("/")
 
 
@@ -602,6 +606,95 @@ def _vertices_from(lon: list[str], lat: list[str]) -> list:
     parser.
     """
     return [[x.strip(), y.strip()] for x, y in zip(lon, lat) if x.strip() or y.strip()]
+
+
+@app.post("/streams/{stream_id}/drone")
+async def set_stream_drone(request: Request, stream_id: int,
+                           drone_id: str = Form(default="")):
+    """
+    Choose which camera profile a slot's flights are computed with, from the next
+    flight onwards. Empty means the deployment's own optics.
+    """
+    _check_origin(request)
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+    await _db.set_stream_drone(
+        token, stream_id, int(drone_id) if drone_id.strip() else None)
+    return _redirect("/")
+
+
+def _camera_from(form) -> dict:
+    """
+    The five optical values, as typed.
+
+    Passed through as strings without arithmetic or checking. db-writer owns the
+    positivity rule and the aspect-ratio cross-check — the one that matters, because a
+    sensor whose millimetre and pixel ratios disagree does not fail, it silently scales
+    every ground measurement on one axis.
+    """
+    return {name: (form.get(name) or "").strip() or None for name in
+            ("focal_len_mm", "sensor_width_mm", "sensor_height_mm",
+             "sensor_width_px", "sensor_height_px")}
+
+
+@app.get("/drones", response_class=HTMLResponse)
+async def drones_page(request: Request):
+    """The caller's camera profiles, and the form to add one."""
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+    me = await _db.whoami(token)
+    drones = await _db.list_drones(token)
+    return templates.TemplateResponse(
+        request, "drones.html", {"email": me.get("email"), "drones": drones})
+
+
+@app.post("/drones")
+async def add_drone(request: Request):
+    _check_origin(request)
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+    form = await request.form()
+    await _db.create_drone(token, (form.get("label") or "").strip() or None,
+                           _camera_from(form))
+    return _redirect("/drones")
+
+
+@app.post("/drones/{drone_id}")
+async def edit_drone(request: Request, drone_id: int):
+    """
+    Correct a profile's numbers.
+
+    Slots using it compute with the new optics from their next flight. Flights already
+    recorded keep the numbers they measured with — db-writer snapshots them when the
+    flight opens, so a corrected focal length cannot restate a past alert.
+    """
+    _check_origin(request)
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+    form = await request.form()
+    await _db.update_drone(token, drone_id, (form.get("label") or "").strip() or None,
+                           _camera_from(form))
+    return _redirect("/drones")
+
+
+@app.post("/drones/{drone_id}/delete")
+async def remove_drone(request: Request, drone_id: int):
+    """
+    Delete a camera profile. Slots using it fall back to the deployment's optics.
+
+    This is what "I sold that drone" means. A hard delete rather than a revoke,
+    because nothing in history points here: each flight carries what it measured with.
+    """
+    _check_origin(request)
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+    await _db.delete_drone(token, drone_id)
+    return _redirect("/drones")
 
 
 @app.get("/geofences", response_class=HTMLResponse)

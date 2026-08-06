@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import queue
 import secrets
@@ -28,6 +29,7 @@ from constants import (
     MAX_STREAM_LABEL_LENGTH,
     MAX_STREAMS_PER_USER,
     MIN_PASSWORD_LENGTH,
+    CAMERA_ASPECT_RATIO_TOLERANCE,
     GEOFENCE_MAX_VERTICES,
     GEOFENCE_MIN_VERTICES,
     STREAM_KEY_ALPHABET,
@@ -162,6 +164,29 @@ def geofence_to_env(stored: Optional[str]) -> Optional[str]:
     return ", ".join(f"({lon}, {lat})" for lon, lat in points)
 
 
+def camera_to_env(stored: Optional[str]) -> dict:
+    """
+    Render a stored camera profile into the environment the app reads.
+
+    The names are AppSettings' own fields uppercased, and this is the one place that
+    knows them — the orchestrator forwards the dict without interpreting it, exactly
+    as it forwards the rendered geofence.
+
+    Empty dict for no profile, so the deployment's own optics stand and the
+    orchestrator injects nothing.
+    """
+    if not stored:
+        return {}
+    c = json.loads(stored)
+    return {
+        "DRONE_TRUE_FOCAL_LEN_MM":    str(c["focal_len_mm"]),
+        "DRONE_SENSOR_WIDTH_MM":      str(c["sensor_width_mm"]),
+        "DRONE_SENSOR_HEIGHT_MM":     str(c["sensor_height_mm"]),
+        "DRONE_SENSOR_WIDTH_PIXELS":  str(c["sensor_width_px"]),
+        "DRONE_SENSOR_HEIGHT_PIXELS": str(c["sensor_height_px"]),
+    }
+
+
 def normalize_email(email: str) -> str:
     """
     One canonical form per address, applied on every read and every write.
@@ -227,6 +252,15 @@ class GeofenceNotFound(ValueError):
     """
 
 
+class DroneNotFound(ValueError):
+    """
+    Raised when a drone_id names no camera profile the caller owns.
+
+    Same contract as GeofenceNotFound: answered 404, and never distinguishes "not
+    yours" from "does not exist", because these ids are sequential across tenants.
+    """
+
+
 Base = declarative_base()
 
 
@@ -244,6 +278,7 @@ class User(Base):
     # Configuration, not credentials, and erased with the account for the same reason
     # streams are: full account deletion must leave nothing behind.
     geofences = relationship("Geofence", back_populates="user", cascade="all, delete-orphan")
+    drones = relationship("Drone", back_populates="user", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<User(id={self.user_id}, email='{self.email}')>"
@@ -292,6 +327,52 @@ class Geofence(Base):
         return f"<Geofence(id={self.geofence_id}, label='{self.label}')>"
 
 
+class Drone(Base):
+    """
+    A named CAMERA PROFILE belonging to a user — five optical constants, reusable.
+
+    NOT an aircraft, and §5's rule survives verbatim because of it: nothing here
+    identifies a physical drone and none is tracked across owners. Two users flying
+    the same model hold two independent rows with identical values and no knowledge
+    of each other; a drone changing hands is one row deleted and another created.
+    The pipeline wants five numbers, not a serial number.
+
+    Named "drones" because that is what a person calls it when picking one.
+
+    These were five module constants describing one airframe (a Mavic 3 Enterprise),
+    forwarded to every flight container on the deployment, so a deployment served
+    exactly one kind of camera.
+    """
+
+    __tablename__ = 'drones'
+
+    drone_id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey('users.user_id'), nullable=False, index=True)
+    label = Column(String(128), nullable=True)
+    focal_len_mm = Column(Float, nullable=False)
+    sensor_width_mm = Column(Float, nullable=False)
+    sensor_height_mm = Column(Float, nullable=False)
+    sensor_width_px = Column(Integer, nullable=False)
+    sensor_height_px = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="drones")
+
+    def as_dict(self) -> dict:
+        return {
+            "drone_id": self.drone_id,
+            "label": self.label,
+            "focal_len_mm": self.focal_len_mm,
+            "sensor_width_mm": self.sensor_width_mm,
+            "sensor_height_mm": self.sensor_height_mm,
+            "sensor_width_px": self.sensor_width_px,
+            "sensor_height_px": self.sensor_height_px,
+        }
+
+    def __repr__(self):
+        return f"<Drone(id={self.drone_id}, label='{self.label}')>"
+
+
 class Stream(Base):
     """
     One concurrency slot belonging to a user, holding one persistent ingest credential.
@@ -333,6 +414,12 @@ class Stream(Base):
     # vertices onto the flight, so a later edit cannot rewrite what a past alert was
     # judged against.
     geofence_id = Column(Integer, ForeignKey('geofences.geofence_id'), nullable=True)
+    # Which camera profile this slot's flights are computed with, or NULL to use the
+    # deployment's own optics — which is what every slot did before this existed.
+    # A reference, like the geofence, and snapshotted onto the flight for the same
+    # reason: correcting a wrong focal length must not restate what past flights
+    # measured with.
+    drone_id = Column(Integer, ForeignKey('drones.drone_id'), nullable=True)
     # Revocation is a timestamp, not a delete: flights reference the stream, and the
     # record of what was published when has to survive both rotation and retirement.
     revoked_at = Column(DateTime, nullable=True)
@@ -390,6 +477,11 @@ class Flight(Base):
     # against a boundary it never saw — and "what was this alert judged against?" is
     # exactly the question a tenant disputing one asks.
     geofence = Column(Text, nullable=True)
+    # The optics this flight's ground measurements were computed with, copied at open
+    # time as JSON; NULL means it flew on the deployment's own. A snapshot for the
+    # same reason as the boundary above — an alert has to stay explicable by the
+    # numbers that actually produced it.
+    camera = Column(Text, nullable=True)
 
     stream = relationship("Stream", back_populates="flights")
     alerts = relationship("Alert", back_populates="flight", cascade="all, delete-orphan")
@@ -630,6 +722,55 @@ class UserDirectory:
         return json.dumps(cleaned)
 
     @staticmethod
+    def _clean_camera(camera: Optional[dict]) -> Optional[str]:
+        """
+        Validate a camera profile and return it as JSON, or None for none.
+
+        Five numbers, all strictly positive, plus one cross-field rule: the physical
+        and pixel aspect ratios must agree. Ground sampling distance is derived from
+        both, so a mismatch does not fail — it silently scales every measurement on
+        one axis, which is the worst way for a geo pipeline to be wrong.
+
+        The app performs the same check (`_validate_all`). That is not duplication for
+        the same reason the geofence range check is not: this one runs where the user
+        typed the numbers and can fix them, and the app's runs where a wrong value
+        could have arrived from a bad migration or a hand-run container. One is a form
+        error; the other is a container refusing to process ground it cannot measure.
+        """
+        if camera is None:
+            return None
+        if not isinstance(camera, dict):
+            raise ValueError("A camera profile must be a set of named values")
+
+        fields = ("focal_len_mm", "sensor_width_mm", "sensor_height_mm",
+                  "sensor_width_px", "sensor_height_px")
+        values = {}
+        for name in fields:
+            if camera.get(name) in (None, ""):
+                raise ValueError(f"{name} is required")
+            try:
+                value = float(camera[name])
+            except (TypeError, ValueError):
+                raise ValueError(f"{name} must be a number, got {camera[name]!r}")
+            if not value > 0:
+                raise ValueError(f"{name} must be greater than zero, got {value}")
+            if name.endswith("_px"):
+                if value != int(value):
+                    raise ValueError(f"{name} must be a whole number of pixels")
+                value = int(value)
+            values[name] = value
+
+        phys = values["sensor_width_mm"] / values["sensor_height_mm"]
+        pix = values["sensor_width_px"] / values["sensor_height_px"]
+        if not math.isclose(phys, pix, rel_tol=CAMERA_ASPECT_RATIO_TOLERANCE):
+            raise ValueError(
+                f"Sensor aspect ratio mismatch: {phys:.4f} from the millimetre "
+                f"dimensions, {pix:.4f} from the pixel dimensions. Ground distances "
+                "are derived from both, so these have to describe the same sensor."
+            )
+        return json.dumps(values)
+
+    @staticmethod
     def _clean_app_mode(app_mode: Optional[str]) -> Optional[str]:
         """
         Normalise and check a processing mode, or None to follow the deployment.
@@ -743,9 +884,92 @@ class UserDirectory:
             session.commit()
             logger.info(f"Geofence deleted: geofence_id={geofence_id}")
 
+    # ── Camera profiles ───────────────────────────────────────────────────────
+
+    def create_drone(self, user_id: int, label: Optional[str], camera: dict) -> dict:
+        """Store a named camera profile. Raises ValueError if it is not a coherent one."""
+        stored = self._clean_camera(camera)
+        if stored is None:
+            raise ValueError("A camera profile needs its dimensions")
+        if label is not None:
+            label = label.strip() or None
+            if label is not None and len(label) > MAX_STREAM_LABEL_LENGTH:
+                raise ValueError(f"Label must be at most {MAX_STREAM_LABEL_LENGTH} characters")
+
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            drone = Drone(user_id=user_id, label=label, **json.loads(stored))
+            session.add(drone)
+            session.commit()
+            logger.info(f"Camera profile created: drone_id={drone.drone_id}, user_id={user_id}")
+            return drone.as_dict()
+
+    def list_drones(self, user_id: int) -> List[dict]:
+        """This user's camera profiles, oldest first."""
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            drones = (session.query(Drone)
+                      .filter_by(user_id=user_id)
+                      .order_by(Drone.drone_id)
+                      .all())
+            return [dict(d.as_dict(), created_at=d.created_at) for d in drones]
+
+    def update_drone(self, drone_id: int, user_id: int,
+                     label: Optional[str], camera: dict) -> None:
+        """
+        Correct a profile's numbers or name.
+
+        Every slot using it computes with the new optics from its next flight. Flights
+        already recorded are unaffected — they hold a snapshot, not a reference, which
+        is what stops a corrected focal length from restating what past alerts measured
+        with.
+        """
+        stored = self._clean_camera(camera)
+        if stored is None:
+            raise ValueError("A camera profile needs its dimensions")
+
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            drone = session.query(Drone).filter_by(
+                drone_id=drone_id, user_id=user_id).first()
+            if drone is None:
+                raise DroneNotFound(f"Drone {drone_id} not found")
+            for name, value in json.loads(stored).items():
+                setattr(drone, name, value)
+            if label is not None:
+                drone.label = label.strip() or None
+            session.commit()
+            logger.info(f"Camera profile updated: drone_id={drone_id}")
+
+    def delete_drone(self, drone_id: int, user_id: int) -> None:
+        """
+        Remove a camera profile, and unassign it from any slot using it.
+
+        A hard delete, and safe for the same reason deleting a geofence is: nothing in
+        history points here. Each flight carries the optics it was computed with. This
+        is also what "I sold that drone" means in the portal — the row goes, and the
+        buyer creates their own with the same numbers and no connection to this one.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            drone = session.query(Drone).filter_by(
+                drone_id=drone_id, user_id=user_id).first()
+            if drone is None:
+                raise DroneNotFound(f"Drone {drone_id} not found")
+            # Explicit rather than ON DELETE SET NULL: SQLite does not enforce foreign
+            # keys unless asked, so a database-level rule would hold in PostgreSQL and
+            # quietly not here.
+            (session.query(Stream)
+             .filter_by(user_id=user_id, drone_id=drone_id)
+             .update({"drone_id": None}))
+            session.delete(drone)
+            session.commit()
+            logger.info(f"Camera profile deleted: drone_id={drone_id}")
+
     def create_stream(self, user_id: int, label: Optional[str] = None,
                       app_mode: Optional[str] = None,
-                      geofence_id: Optional[int] = None) -> dict:
+                      geofence_id: Optional[int] = None,
+                      drone_id: Optional[int] = None) -> dict:
         """
         Add a stream slot and mint its ingest key. The key is returned once, here.
 
@@ -756,11 +980,12 @@ class UserDirectory:
 
         app_mode selects the pipeline this slot's flights run; None follows the
         deployment's own setting, which is what every slot did before this existed.
-        geofence_id names one of the caller's own boundaries, or None for no
-        geofencing — also a supported state.
+        geofence_id names one of the caller's own boundaries and drone_id one of
+        their camera profiles; None for either means no geofencing / the deployment's
+        own optics, both supported states.
 
-        Raises StreamLimitReached at the cap, GeofenceNotFound for a boundary that is
-        not the caller's, ValueError for a bad label or mode.
+        Raises StreamLimitReached at the cap, GeofenceNotFound or DroneNotFound for a
+        row that is not the caller's, ValueError for a bad label or mode.
         """
         if label is not None:
             label = label.strip() or None
@@ -790,6 +1015,12 @@ class UserDirectory:
                 if owned is None:
                     raise GeofenceNotFound(f"Geofence {geofence_id} not found")
 
+            if drone_id is not None:
+                owned = session.query(Drone).filter_by(
+                    drone_id=drone_id, user_id=user_id).first()
+                if owned is None:
+                    raise DroneNotFound(f"Drone {drone_id} not found")
+
             active = (session.query(Stream)
                       .filter_by(user_id=user_id)
                       .filter(Stream.revoked_at.is_(None))
@@ -800,7 +1031,8 @@ class UserDirectory:
                 )
 
             stream = Stream(user_id=user_id, label=label, app_mode=app_mode,
-                            geofence_id=geofence_id, stream_key=generate_stream_key())
+                            geofence_id=geofence_id, drone_id=drone_id,
+                            stream_key=generate_stream_key())
             session.add(stream)
             session.commit()
             logger.info(
@@ -809,7 +1041,7 @@ class UserDirectory:
             )
             return {"stream_id": stream.stream_id, "stream_key": stream.stream_key,
                     "label": stream.label, "app_mode": stream.app_mode,
-                    "geofence_id": stream.geofence_id}
+                    "geofence_id": stream.geofence_id, "drone_id": stream.drone_id}
 
     def list_streams(self, user_id: int, include_revoked: bool = False) -> List[dict]:
         """
@@ -835,6 +1067,7 @@ class UserDirectory:
                     "stream_key": d.stream_key,
                     "app_mode": d.app_mode,
                     "geofence_id": d.geofence_id,
+                    "drone_id": d.drone_id,
                     "revoked_at": d.revoked_at,
                     "created_at": d.created_at,
                 }
@@ -900,6 +1133,35 @@ class UserDirectory:
             logger.info(
                 f"Stream geofence set: stream_id={stream_id}, geofence_id={geofence_id}"
             )
+
+    def set_stream_drone(self, stream_id: int, user_id: int,
+                         drone_id: Optional[int]) -> None:
+        """
+        Point a slot at one of the caller's camera profiles, or None for the
+        deployment's own optics.
+
+        Takes effect on the NEXT flight: the profile is read when the flight opens and
+        handed to a container that has already started.
+
+        Both ids are matched against user_id and both refusals are the same 404 as an
+        id that does not exist.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            stream = session.query(Stream).filter_by(
+                stream_id=stream_id, user_id=user_id).first()
+            if stream is None:
+                raise StreamNotFound(f"Stream {stream_id} not found")
+
+            if drone_id is not None:
+                owned = session.query(Drone).filter_by(
+                    drone_id=drone_id, user_id=user_id).first()
+                if owned is None:
+                    raise DroneNotFound(f"Drone {drone_id} not found")
+
+            stream.drone_id = drone_id
+            session.commit()
+            logger.info(f"Stream drone set: stream_id={stream_id}, drone_id={drone_id}")
 
     def revoke_stream(self, stream_id: int, user_id: int) -> None:
         """
@@ -996,7 +1258,15 @@ class UserDirectory:
                 if owned is not None:
                     fence = owned.vertices
 
-            flight = Flight(stream_id=stream.stream_id, geofence=fence)
+            optics = None
+            if stream.drone_id is not None:
+                owned = session.query(Drone).filter_by(
+                    drone_id=stream.drone_id, user_id=stream.user_id).first()
+                if owned is not None:
+                    optics = json.dumps({k: v for k, v in owned.as_dict().items()
+                                         if k not in ("drone_id", "label")})
+
+            flight = Flight(stream_id=stream.stream_id, geofence=fence, camera=optics)
             # public_uuid is a column default, so it is not populated until the insert
             # is flushed — the output path cannot be derived before this point.
             session.add(flight)
@@ -1028,6 +1298,11 @@ class UserDirectory:
                 # flight's snapshot rather than the live row, so what the container is
                 # told and what history records can never disagree.
                 "geofence_vertexes": geofence_to_env(flight.geofence),
+                # A dict of five variables, or empty. Rendered here for the same
+                # reason as the fence: the orchestrator forwards and interprets
+                # nothing, and the flight's snapshot is the source so what the
+                # container is told and what history records cannot disagree.
+                "camera_env": camera_to_env(flight.camera),
             }
 
     def close_flight(self, flight_id: int) -> bool:

@@ -150,6 +150,19 @@ button:hover, .button:hover { border-color: var(--muted); }
 .fence-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .fence-actions button { padding: 5px 12px; font-size: 13px; }
 
+/* The five optical values. auto-fit rather than a fixed column count so the row
+   collapses on a phone instead of forcing the card wider than the screen — the
+   defect §9 records finding on /history, which grew the layout viewport rather
+   than overflowing and so could not be seen by the obvious check. */
+.cam-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin: 10px 0;
+}
+.cam-grid label { font-size: 12px; }
+.cam-grid input { padding: 5px 7px; font-size: 13px; }
+
 /* ── Slot table ────────────────────────────────────────────────────────────── */
 
 /* Every .slots table lives inside one of these. A table has a minimum width it

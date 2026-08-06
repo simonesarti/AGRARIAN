@@ -118,10 +118,12 @@ class DbWriterClient:
 
     async def create_stream(self, token: str, label: Optional[str],
                             app_mode: Optional[str] = None,
-                            geofence_id: Optional[int] = None) -> dict:
+                            geofence_id: Optional[int] = None,
+                            drone_id: Optional[int] = None) -> dict:
         return await self._call("POST", "/streams",
                                 json={"label": label, "app_mode": app_mode,
-                                      "geofence_id": geofence_id}, token=token)
+                                      "geofence_id": geofence_id,
+                                      "drone_id": drone_id}, token=token)
 
     async def set_stream_mode(self, token: str, stream_id: int,
                               app_mode: Optional[str]) -> dict:
@@ -150,6 +152,28 @@ class DbWriterClient:
 
     async def delete_geofence(self, token: str, geofence_id: int) -> dict:
         return await self._call("POST", f"/geofences/{geofence_id}/delete", token=token)
+
+    # ── Camera profiles ───────────────────────────────────────────────────────
+
+    async def list_drones(self, token: str) -> list:
+        return (await self._call("GET", "/drones", token=token))["drones"]
+
+    async def create_drone(self, token: str, label: Optional[str], camera: dict) -> dict:
+        return await self._call("POST", "/drones",
+                                json={"label": label, **camera}, token=token)
+
+    async def update_drone(self, token: str, drone_id: int,
+                           label: Optional[str], camera: dict) -> dict:
+        return await self._call("POST", f"/drones/{drone_id}",
+                                json={"label": label, **camera}, token=token)
+
+    async def delete_drone(self, token: str, drone_id: int) -> dict:
+        return await self._call("POST", f"/drones/{drone_id}/delete", token=token)
+
+    async def set_stream_drone(self, token: str, stream_id: int,
+                               drone_id: Optional[int]) -> dict:
+        return await self._call("POST", f"/streams/{stream_id}/drone",
+                                json={"drone_id": drone_id}, token=token)
 
     async def rotate_stream(self, token: str, stream_id: int) -> dict:
         return await self._call("POST", f"/streams/{stream_id}/rotate", token=token)

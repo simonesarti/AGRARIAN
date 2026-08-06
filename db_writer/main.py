@@ -34,6 +34,7 @@ from auth import (
 from constants import FLIGHT_HISTORY_PAGE_SIZE
 from db_manager import (
     AlertWriter,
+    DroneNotFound,
     EmailAlreadyRegistered,
     GeofenceNotFound,
     StreamLimitReached,
@@ -127,6 +128,8 @@ class CreateStreamRequest(BaseModel):
     app_mode: Optional[str] = None
     # One of the caller's own geofences, or omitted for no geofencing.
     geofence_id: Optional[int] = None
+    # One of the caller's own camera profiles, or omitted for the deployment's optics.
+    drone_id: Optional[int] = None
 
 
 class StreamModeRequest(BaseModel):
@@ -136,6 +139,24 @@ class StreamModeRequest(BaseModel):
 class StreamGeofenceRequest(BaseModel):
     # Which of the caller's boundaries this slot flies, or null for none.
     geofence_id: Optional[int] = None
+
+
+class StreamDroneRequest(BaseModel):
+    drone_id: Optional[int] = None
+
+
+class DroneRequest(BaseModel):
+    label: Optional[str] = None
+    focal_len_mm: Optional[float] = None
+    sensor_width_mm: Optional[float] = None
+    sensor_height_mm: Optional[float] = None
+    sensor_width_px: Optional[float] = None
+    sensor_height_px: Optional[float] = None
+
+    def camera(self) -> dict:
+        return {n: getattr(self, n) for n in
+                ("focal_len_mm", "sensor_width_mm", "sensor_height_mm",
+                 "sensor_width_px", "sensor_height_px")}
 
 
 class GeofenceRequest(BaseModel):
@@ -368,13 +389,16 @@ def add_stream(
     """
     user_id = _require_session(authorization)
     try:
-        return _directory.create_stream(user_id, req.label, req.app_mode, req.geofence_id)
+        return _directory.create_stream(user_id, req.label, req.app_mode,
+                                        req.geofence_id, req.drone_id)
     except StreamLimitReached as e:
         # Before ValueError — it is a subclass, so order matters here as it does
         # in /register.
         raise HTTPException(status_code=409, detail=str(e))
     except GeofenceNotFound:
         raise HTTPException(status_code=404, detail="Geofence not found")
+    except DroneNotFound:
+        raise HTTPException(status_code=404, detail="Drone not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -496,6 +520,97 @@ def set_stream_geofence(
     except Exception as e:
         logger.error(f"Unexpected error setting geofence on stream {stream_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to set stream geofence")
+    return {"ok": True}
+
+
+@app.post("/streams/{stream_id}/drone")
+def set_stream_drone(
+    stream_id: int,
+    req: StreamDroneRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Choose which camera profile this slot's flights are computed with.
+
+    Null uses the deployment's own optics, which is what every slot did while those
+    five numbers were module constants describing one airframe.
+    """
+    user_id = _require_session(authorization)
+    try:
+        _directory.set_stream_drone(stream_id, user_id, req.drone_id)
+    except StreamNotFound:
+        raise HTTPException(status_code=404, detail="Stream not found")
+    except DroneNotFound:
+        raise HTTPException(status_code=404, detail="Drone not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True}
+
+
+@app.get("/drones")
+def list_drones(authorization: Optional[str] = Header(default=None)):
+    """The caller's camera profiles."""
+    user_id = _require_session(authorization)
+    return {"drones": _directory.list_drones(user_id)}
+
+
+@app.post("/drones", status_code=201)
+def create_drone(
+    req: DroneRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Store a named camera profile.
+
+    Nothing here identifies an aircraft. Two users flying the same model hold two
+    unrelated rows, and a drone changing hands is one row deleted and another created
+    — which is why §5's "nothing in the schema models a physical drone" still holds.
+    """
+    user_id = _require_session(authorization)
+    try:
+        return _directory.create_drone(user_id, req.label, req.camera())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/drones/{drone_id}")
+def update_drone(
+    drone_id: int,
+    req: DroneRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Correct a profile's numbers or name.
+
+    Slots using it compute with the new optics from their next flight; flights already
+    recorded keep the numbers they measured with.
+    """
+    user_id = _require_session(authorization)
+    try:
+        _directory.update_drone(drone_id, user_id, req.label, req.camera())
+    except DroneNotFound:
+        raise HTTPException(status_code=404, detail="Drone not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True}
+
+
+@app.post("/drones/{drone_id}/delete")
+def delete_drone(
+    drone_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Remove a camera profile and unassign it from any slot using it.
+
+    This is what "I sold that drone" means here. Safe as a hard delete because each
+    flight carries the optics it was computed with, so nothing in history points back.
+    """
+    user_id = _require_session(authorization)
+    try:
+        _directory.delete_drone(drone_id, user_id)
+    except DroneNotFound:
+        raise HTTPException(status_code=404, detail="Drone not found")
     return {"ok": True}
 
 

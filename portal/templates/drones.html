@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Cameras — AGRARIAN{% endblock %}
+
+{% macro fields(d) %}
+  <input type="text" name="label" value="{{ d.label if d else '' }}"
+         placeholder="Name (optional) — e.g. Mavic 3 Enterprise" maxlength="128">
+  <div class="cam-grid">
+    <label>Focal length (mm)
+      <input type="text" name="focal_len_mm" inputmode="decimal"
+             value="{{ d.focal_len_mm if d else '' }}"></label>
+    <label>Sensor width (mm)
+      <input type="text" name="sensor_width_mm" inputmode="decimal"
+             value="{{ d.sensor_width_mm if d else '' }}"></label>
+    <label>Sensor height (mm)
+      <input type="text" name="sensor_height_mm" inputmode="decimal"
+             value="{{ d.sensor_height_mm if d else '' }}"></label>
+    <label>Sensor width (px)
+      <input type="text" name="sensor_width_px" inputmode="numeric"
+             value="{{ d.sensor_width_px if d else '' }}"></label>
+    <label>Sensor height (px)
+      <input type="text" name="sensor_height_px" inputmode="numeric"
+             value="{{ d.sensor_height_px if d else '' }}"></label>
+  </div>
+{% endmacro %}
+
+{% block content %}
+<div class="card">
+  <div class="cardhead">
+    <h1>Cameras</h1>
+    <a href="/">← All slots</a>
+  </div>
+
+  <p class="muted">
+    The optics a flight measures ground distances with. Pick one on a slot. These are
+    properties of the camera, not of a flight, so they are set once per aircraft you
+    fly rather than every time you take off.
+  </p>
+
+  {# Nothing here identifies an aircraft, and that is deliberate: two people flying the
+     same model keep two unrelated profiles, and selling a drone means deleting this row
+     while the buyer creates their own. The pipeline wants five numbers, not a serial. #}
+  <p class="muted small">
+    The millimetre and pixel dimensions must describe the same sensor — their aspect
+    ratios have to match. A mismatch is rejected rather than accepted, because ground
+    distances are derived from both and a disagreement would silently stretch every
+    measurement on one axis. Changes apply from each slot's next flight.
+  </p>
+
+  {% if drones %}
+    {% for d in drones %}
+    <form method="post" action="/drones/{{ d.drone_id }}" class="fence-card">
+      {{ fields(d) }}
+      <div class="fence-actions">
+        <button type="submit" class="primary">Save</button>
+      </div>
+    </form>
+    {# Separate form: forms cannot nest, and a delete inside the edit form would
+       submit the edit's fields with it. #}
+    <form method="post" action="/drones/{{ d.drone_id }}/delete" class="fence-delete"
+          onsubmit="return confirm('Delete this camera? Slots using it fall back to the deployment default. Flights already recorded keep the optics they measured with.')">
+      <button type="submit" class="danger">Delete</button>
+    </form>
+    {% endfor %}
+  {% else %}
+    <p class="empty">No cameras yet.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Add a camera</h2>
+  <form method="post" action="/drones" class="fence-card">
+    {{ fields(None) }}
+    <div class="fence-actions">
+      <button type="submit" class="primary">Create</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

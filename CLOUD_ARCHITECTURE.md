@@ -2613,9 +2613,10 @@ done — so the mode moved without waiting for anything:
 | --- | --- |
 | `APP_MODE` per stream slot (§11.1, §11.7) | **[built]** 2026-08-06 |
 | Geofence per stream slot, named and reusable (§11.1, §11.3) | **[built]** 2026-08-06 |
+| Camera profiles, named and reusable (§11.2) | **[built]** 2026-08-06 |
 
-Everything else below is **[designed]**. The same route is open to the camera profile,
-and closed to the DEM, which genuinely needs the object-storage work.
+Everything else below is **[designed]** — which is now only the DEM, and it is the one
+piece that genuinely needs the object-storage work rather than another column.
 
 ### 11.1 The environment has three halves, not two
 
@@ -2692,12 +2693,30 @@ The rule that must not bend is the one §3 states for every other identifier: **
 from the session claim, and another tenant's id gets the same 404 as one that does not
 exist, exactly as `stream_id` does today.
 
-**The values are snapshotted onto the session, not referenced from it.** A foreign key
-would let a later correction rewrite history: a user who fixes a wrong focal length
-would make every past alert appear to have been computed with a parameter it never saw.
-Copying five floats costs nothing and means an alert can always be explained by the
-numbers that actually produced it — the same reason an invoice records a price rather
-than pointing at the product's current one.
+**The values are snapshotted onto the flight, not referenced from it. [built]** A
+foreign key would let a later correction rewrite history: a user who fixes a wrong focal
+length would make every past alert appear to have been computed with a parameter it
+never saw. Copying five floats costs nothing and means an alert can always be explained
+by the numbers that actually produced it — the same reason an invoice records a price
+rather than pointing at the product's current one. It lands on `flights.camera` rather
+than the session of §10, which does not exist yet; when it does, the snapshot moves with
+the row that owns the configuration.
+
+That snapshot is also what makes a profile safe to **hard delete**, which is what "I
+sold that drone" has to mean. Nothing in history points at the named row, so removal
+unassigns the slots still using it and every recorded flight keeps the optics it
+measured with.
+
+**The aspect-ratio cross-check moved with it.** `_validate_all` asserts that the
+millimetre and pixel dimensions describe the same sensor, and that assertion now also
+runs where the user types the numbers. It is the one rule here worth stating twice: a
+mismatch does not fail anything downstream, it silently scales every ground measurement
+on one axis, and a form error is a far better place to learn that than a flight's
+output.
+
+Verified by 41 assertions in `tests/comms/test_camera.py`. The one worth naming is the
+same shape as the geofence's: **a slot naming no profile leaves the deployment's optics
+standing**, which is what keeps every existing deployment behaving exactly as it did.
 
 The existing cross-field check that physical and pixel aspect ratios agree
 (`_validate_all`) becomes a check at profile-creation time, where the user can see it.
