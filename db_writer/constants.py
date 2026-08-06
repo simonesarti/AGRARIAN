@@ -10,6 +10,20 @@ DB_MANAGER_MAX_OVERFLOW = 10
 DB_MANAGER_QUEUE_WAIT_TIMEOUT = 0.1        # 100 ms
 DB_MANAGER_THREAD_CLOSE_TIMEOUT = 5.0      # 5.0 s
 
+# ── Processing mode ───────────────────────────────────────────────────────────
+# Which pipeline a flight runs. Held on the stream slot, returned by /flight/open,
+# and injected by the orchestrator as APP_MODE — so one deployment can serve a
+# livestock tenant and a terrain tenant at once, which it could not while this was
+# a deployment-wide environment variable.
+#
+# This list MUST stay in step with SUPPORTED_APP_MODES in
+# app/shared/processes/constants.py, which is what app/main.py branches on. The two
+# must be edited together, exactly as STREAM_KEY_ALPHABET below must be edited
+# together with the ingest regex in mediamtx.yaml: a mode accepted here that the app
+# does not recognise is a container that exits at startup, and the flight fails as a
+# drone that publishes into nothing.
+SUPPORTED_APP_MODES = ("danger_detection", "health_monitoring")
+
 # ── Viewer session tokens ─────────────────────────────────────────────────────
 # Signed here, validated by ws-server. The TTL bounds how long a leaked token is
 # useful — tokens travel in the WebSocket query string and so reach proxy logs.

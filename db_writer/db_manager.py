@@ -28,6 +28,7 @@ from constants import (
     MIN_PASSWORD_LENGTH,
     STREAM_KEY_ALPHABET,
     STREAM_KEY_LENGTH,
+    SUPPORTED_APP_MODES,
 )
 
 logger = logging.getLogger("db_writer.manager")
@@ -157,6 +158,19 @@ class StreamLimitReached(ValueError):
     """
 
 
+class StreamNotFound(ValueError):
+    """
+    Raised when a stream_id names no row the caller owns.
+
+    Same reason as the two above: set_stream_mode can fail two ways — the mode is
+    unrecognised (400) or the slot is not the caller's (404) — and the HTTP layer
+    must tell them apart without matching on message text.
+
+    Deliberately does not distinguish "not yours" from "does not exist". stream_id
+    is sequential across every tenant, so the two must answer alike.
+    """
+
+
 Base = declarative_base()
 
 
@@ -211,6 +225,16 @@ class Stream(Base):
     stream_key = Column(String(64), nullable=False, unique=True, index=True,
                         default=generate_stream_key)
     label = Column(String(128), nullable=True)
+    # Which pipeline this slot's flights run. NULL means "whatever the deployment is
+    # configured for", which is what every row created before this column existed
+    # means and what keeps a single-product deployment working unchanged.
+    #
+    # It lives here rather than on the deployment because it was deployment-wide
+    # until now, and that made one cluster serve exactly one product — a livestock
+    # tenant and a terrain tenant could not share it. It lives here rather than on
+    # the flight because nothing asks a user anything when a flight opens; §10 is
+    # what would move it, and this is the same value one level up.
+    app_mode = Column(String(32), nullable=True)
     # Revocation is a timestamp, not a delete: flights reference the stream, and the
     # record of what was published when has to survive both rotation and retirement.
     revoked_at = Column(DateTime, nullable=True)
@@ -449,7 +473,31 @@ class UserDirectory:
                 return None
             return {"stream_id": stream.stream_id, "user_id": stream.user_id, "label": stream.label}
 
-    def create_stream(self, user_id: int, label: Optional[str] = None) -> dict:
+    @staticmethod
+    def _clean_app_mode(app_mode: Optional[str]) -> Optional[str]:
+        """
+        Normalise and check a processing mode, or None to follow the deployment.
+
+        Validated here rather than trusted, because this value becomes an
+        environment variable inside a GPU container: an unrecognised mode is a
+        container that exits at startup, which surfaces as a drone publishing into
+        nothing rather than as an error anyone sees. Checking it at the point a user
+        chooses it puts the message where they are looking.
+        """
+        if app_mode is None:
+            return None
+        mode = app_mode.strip().lower()
+        if not mode:
+            return None
+        if mode not in SUPPORTED_APP_MODES:
+            raise ValueError(
+                f"Unknown processing mode {app_mode!r}. "
+                f"Supported: {', '.join(SUPPORTED_APP_MODES)}"
+            )
+        return mode
+
+    def create_stream(self, user_id: int, label: Optional[str] = None,
+                      app_mode: Optional[str] = None) -> dict:
         """
         Add a stream slot and mint its ingest key. The key is returned once, here.
 
@@ -458,12 +506,17 @@ class UserDirectory:
         cap POST /streams would be unbounded resource creation for anyone who can
         sign up. Retired slots do not count — they cannot publish.
 
-        Raises StreamLimitReached at the cap, ValueError for a bad label.
+        app_mode selects the pipeline this slot's flights run; None follows the
+        deployment's own setting, which is what every slot did before this existed.
+
+        Raises StreamLimitReached at the cap, ValueError for a bad label or mode.
         """
         if label is not None:
             label = label.strip() or None
             if label is not None and len(label) > MAX_STREAM_LABEL_LENGTH:
                 raise ValueError(f"Label must be at most {MAX_STREAM_LABEL_LENGTH} characters")
+
+        app_mode = self._clean_app_mode(app_mode)
 
         SessionFactory = sessionmaker(bind=self._engine)
         with SessionFactory() as session:
@@ -486,11 +539,16 @@ class UserDirectory:
                     f"Already holding the maximum of {_MAX_STREAMS_PER_USER} active streams"
                 )
 
-            stream = Stream(user_id=user_id, label=label, stream_key=generate_stream_key())
+            stream = Stream(user_id=user_id, label=label, app_mode=app_mode,
+                            stream_key=generate_stream_key())
             session.add(stream)
             session.commit()
-            logger.info(f"Stream added: stream_id={stream.stream_id}, user_id={user_id}")
-            return {"stream_id": stream.stream_id, "stream_key": stream.stream_key, "label": stream.label}
+            logger.info(
+                f"Stream added: stream_id={stream.stream_id}, user_id={user_id}, "
+                f"app_mode={stream.app_mode or 'deployment default'}"
+            )
+            return {"stream_id": stream.stream_id, "stream_key": stream.stream_key,
+                    "label": stream.label, "app_mode": stream.app_mode}
 
     def list_streams(self, user_id: int, include_revoked: bool = False) -> List[dict]:
         """
@@ -514,11 +572,41 @@ class UserDirectory:
                     "stream_id": d.stream_id,
                     "label": d.label,
                     "stream_key": d.stream_key,
+                    "app_mode": d.app_mode,
                     "revoked_at": d.revoked_at,
                     "created_at": d.created_at,
                 }
                 for d in streams
             ]
+
+    def set_stream_mode(self, stream_id: int, user_id: int, app_mode: Optional[str]) -> None:
+        """
+        Change which pipeline a slot's flights run. None reverts to the deployment's.
+
+        Takes effect on the NEXT flight, never the one in the air: the mode is read
+        when the flight opens and handed to a container that has already started, so
+        changing it mid-flight would describe a container that is not running.
+
+        user_id is required and checked, like every other stream operation — a
+        stream_id from a request is a guess until it is matched against the owner in
+        the same query.
+        """
+        app_mode = self._clean_app_mode(app_mode)
+
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            stream = session.query(Stream).filter_by(
+                stream_id=stream_id, user_id=user_id).first()
+            if stream is None:
+                # Same silence as revoke_stream: not-yours and not-there are one
+                # answer, because stream_id is sequential across every tenant.
+                raise StreamNotFound(f"Stream {stream_id} not found")
+            stream.app_mode = app_mode
+            session.commit()
+            logger.info(
+                f"Stream mode set: stream_id={stream_id}, "
+                f"app_mode={app_mode or 'deployment default'}"
+            )
 
     def revoke_stream(self, stream_id: int, user_id: int) -> None:
         """
@@ -622,6 +710,11 @@ class UserDirectory:
                 # neither the orchestrator nor the app has to know it.
                 "ingest_path": ingest_path(stream_key),
                 "output_path": flight.output_path,
+                # Which pipeline to run. None means the slot expressed no preference
+                # and the deployment's own setting stands, so the orchestrator injects
+                # nothing and base_env wins — which is exactly what happened before
+                # this column existed.
+                "app_mode": stream.app_mode,
             }
 
     def close_flight(self, flight_id: int) -> bool:

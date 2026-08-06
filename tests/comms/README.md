@@ -16,6 +16,7 @@ try to run these directly with `python3`.
 | --- | --- | --- |
 | `test_schema.py` | nothing | one-liner below |
 | `test_flight_history.py` | nothing | one-liner below |
+| `test_app_mode.py` | nothing | one-liner below |
 | `test_tokens.py` | nothing | one-liner below |
 | `test_session_tokens.py` | nothing | one-liner below |
 | `test_mediamtx_auth.py` | nothing | one-liner below |
@@ -96,6 +97,16 @@ database:
 docker run --rm -v "$PWD/db_writer:/w" -v "$PWD/tests/comms:/tests:ro" \
   -w /tmp -e DB_WRITER_DIR=/w python:3.11-slim \
   sh -c "pip install -q sqlalchemy bcrypt; python /tests/test_flight_history.py"
+```
+
+Per-slot processing mode, from the column to the container's environment — needs the
+orchestrator mounted too, because the last third of it is `build_flight_env`:
+
+```bash
+docker run --rm -v "$PWD/db_writer:/w:ro" -v "$PWD/orchestrator:/o:ro" \
+  -v "$PWD/tests/comms:/tests:ro" -w /tmp -e DB_WRITER_DIR=/w -e ORCHESTRATOR_DIR=/o \
+  python:3.11-slim \
+  sh -c "pip install -q sqlalchemy bcrypt; python /tests/test_app_mode.py"
 ```
 
 Token scope separation and cross-flight replay:
@@ -246,6 +257,24 @@ flight check from the image lookup fails **10 of the 50**; a test that cannot fa
 way is not testing isolation. It also pins that the media path (`public_uuid`) is in none
 of the responses — history reports what happened, it does not hand out a way to reach the
 stream — and that reading history writes nothing, taken as row counts before and after.
+
+**`test_app_mode.py`** — the first piece of *configuration* to travel the orchestrator's
+env path, which until now carried only identity. `APP_MODE` was deployment-wide, so one
+cluster served exactly one product; it now lives on the stream slot.
+
+Three groups, and the third is the one worth having. Validation, because an
+unrecognised mode becomes an environment variable inside a GPU container where it is a
+process that exits at startup — a drone publishing into nothing rather than an error
+anyone sees. Ownership, because setting a mode is a stream operation like any other:
+another tenant's `stream_id` answers exactly as an absent one does, leaves the owner's
+value untouched, and raises `StreamNotFound` rather than a message the HTTP layer would
+have to match on (§3's rule, the same reason `EmailAlreadyRegistered` exists).
+
+And injection: the slot's mode must beat `base_env`, and **no preference must leave
+`base_env` standing.** That second assertion is the one guarding the deployments that
+exist today — a single-product cluster must behave exactly as it did before the column
+existed, and it does only because the orchestrator injects nothing when the slot has no
+opinion.
 
 **`test_session_tokens.py`** — the portal credential's separation from the other two.
 All three are signed with the same secret, so the `scope` claim is the only thing

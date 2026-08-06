@@ -2574,8 +2574,19 @@ Three consequences, and the third is the one that decided it:
 
 ## 11. The configuration plane **[designed]**
 
-**Nothing here is built either.** §11 depends on §10 and is meaningless without it: the
-whole of it follows from a human being present at the moment a flight is provisioned.
+Most of §11 depends on §10 and is meaningless without it: the whole of it follows from
+a human being present at the moment a flight is provisioned.
+
+**One part does not, and it has landed.** Per-slot configuration needs only that
+db-writer can resolve a stream key to its owner when a flight opens, which it has always
+done — so the mode moved without waiting for anything:
+
+| Landed | |
+| --- | --- |
+| `APP_MODE` per stream slot (§11.1, §11.7) | **[built]** 2026-08-06 |
+
+Everything else below is **[designed]**. The same route is open to the camera profile
+and the geofence, and closed to the DEM, which genuinely needs the object-storage work.
 
 ### 11.1 The environment has three halves, not two
 
@@ -2611,8 +2622,10 @@ land. The honest description: **this system is multi-tenant in its credentials a
 single-tenant in its configuration**, and the second half went unnoticed because there
 was nowhere to put per-tenant configuration even if somebody had wanted to.
 
-`APP_MODE` is the same shape and costs more. One deployment serves one product, so a
-livestock customer and a terrain customer cannot share a cluster.
+`APP_MODE` was the same shape and cost more: one deployment served one product, so a
+livestock customer and a terrain customer could not share a cluster. **It is the one
+item in this section that is now built** — see §11.7. The rest of the list above still
+stands.
 
 #### What stays in the environment
 
@@ -2796,10 +2809,27 @@ paragraph expires.**
   identifier becomes a credential, so both sections' rules hold verbatim. What changes
   is that the schema grows a configuration side — camera profiles, geofences, DEM
   references — beside the credential side it has today.
-- **`APP_MODE` moves from the deployment to the key**, which is what turns one cluster
-  serving one product into one cluster serving both. It is the single highest-value item
-  in this section and the cheapest: the app already selects its pipeline from this
-  variable at startup (`app/main.py`), so nothing in the app tier changes at all.
+- **`APP_MODE` has moved from the deployment to the stream slot. [built]** This is what
+  turns one cluster serving one product into one cluster serving both, and it was the
+  cheapest item here: the app already selects its pipeline from this variable at startup
+  (`app/main.py`), and the image carries both, so **nothing in the app tier changed at
+  all**.
+
+  It landed on the *slot* rather than on the key, which is §10's shape one level up and
+  needs none of §10 to work. db-writer already resolves a stream key to its stream and
+  owner when the flight opens, so the identity needed to look up a preference has always
+  been present — `open_flight_for_key` returns `app_mode`, `/flight/open` passes it on,
+  and `build_flight_env` injects it. What §10 would add is choosing *per flight* rather
+  than per slot.
+
+  `NULL` means "follow the deployment", which is what every row created before the
+  column existed means and what makes this change invisible to a single-product
+  deployment. The orchestrator injects nothing in that case and `base_env` stands.
+
+  Verified by 23 assertions in `tests/comms/test_app_mode.py`, no stack required. The
+  one worth naming is not that the slot's mode wins — it is that **no preference leaves
+  the deployment's setting alone**, which is the assertion protecting every deployment
+  that exists today.
 - **The geofence parser leaves `app_settings.py`** and a short range assertion replaces
   it (§11.3).
 - **Object-storage tenancy stops being a recorder-only question** and needs deciding

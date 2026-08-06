@@ -116,8 +116,15 @@ class DbWriterClient:
     async def list_streams(self, token: str) -> list:
         return (await self._call("GET", "/streams", token=token))["streams"]
 
-    async def create_stream(self, token: str, label: Optional[str]) -> dict:
-        return await self._call("POST", "/streams", json={"label": label}, token=token)
+    async def create_stream(self, token: str, label: Optional[str],
+                            app_mode: Optional[str] = None) -> dict:
+        return await self._call("POST", "/streams",
+                                json={"label": label, "app_mode": app_mode}, token=token)
+
+    async def set_stream_mode(self, token: str, stream_id: int,
+                              app_mode: Optional[str]) -> dict:
+        return await self._call("POST", f"/streams/{stream_id}/mode",
+                                json={"app_mode": app_mode}, token=token)
 
     async def rotate_stream(self, token: str, stream_id: int) -> dict:
         return await self._call("POST", f"/streams/{stream_id}/rotate", token=token)

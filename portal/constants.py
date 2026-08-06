@@ -60,3 +60,14 @@ REGISTER_WINDOW_S = 60 * 60
 # is the same scheme spelled a second time, because the portal has to show the
 # operator a URL before any flight exists to ask about.
 INGEST_PATH_PREFIX = "in"
+
+# ── Processing modes ──────────────────────────────────────────────────────────
+#
+# Display names for the slot dropdown, and ONLY that. db-writer owns the list of
+# modes it will accept and answers 400 for anything else, so this is presentation
+# rather than a second validator: a value here that db-writer has dropped fails
+# safe as a rejected form post, not as a container that exits at startup.
+APP_MODE_CHOICES = (
+    ("danger_detection", "Danger detection"),
+    ("health_monitoring", "Herd monitoring"),
+)

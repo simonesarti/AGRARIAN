@@ -84,7 +84,7 @@ h2 { font-size: 16px; margin: 0 0 10px; }
 
 label { display: grid; gap: 5px; font-size: 14px; color: var(--muted); }
 
-input[type="text"], input[type="email"], input[type="password"] {
+input[type="text"], input[type="email"], input[type="password"], select {
   background: #0c1114;
   border: 1px solid var(--line);
   color: var(--text);
@@ -93,7 +93,7 @@ input[type="text"], input[type="email"], input[type="password"] {
   font: inherit;
   width: 100%;
 }
-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 button, .button {
   font: inherit;
@@ -121,6 +121,13 @@ button:hover, .button:hover { border-color: var(--muted); }
 
 .addslot { margin-top: 18px; }
 .addslot input { flex: 1; }
+/* The label takes the room; the mode picker only needs its widest option. */
+.addslot select { width: auto; flex: 0 0 auto; }
+
+/* Sits under the slot's name in the table, so it must not inherit the full-width
+   rule the sign-in forms want. */
+.mode-form { margin-top: 6px; }
+.mode-form select { width: auto; max-width: 100%; padding: 4px 6px; font-size: 13px; }
 
 /* ── Slot table ────────────────────────────────────────────────────────────── */
 

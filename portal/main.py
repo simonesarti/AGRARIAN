@@ -47,6 +47,7 @@ from constants import (
     API_HOST,
     API_PORT,
     HLS_PORT,
+    APP_MODE_CHOICES,
     INGEST_PATH_PREFIX,
     LOGIN_MAX_FAILURES_PER_ACCOUNT,
     LOGIN_MAX_FAILURES_PER_IP,
@@ -509,6 +510,7 @@ async def dashboard(request: Request):
             "label": s["label"],
             "stream_key": s["stream_key"],
             "created_at": s["created_at"],
+            "app_mode": s.get("app_mode"),
             "ingest_url": _ingest_url(s["stream_key"]),
             "live": live_by_stream.get(s["stream_id"]),
         }
@@ -516,21 +518,46 @@ async def dashboard(request: Request):
     ]
     return templates.TemplateResponse(
         request, "dashboard.html",
-        {"email": me.get("email"), "streams": rows, "live_count": len(flights)})
+        {"email": me.get("email"), "streams": rows, "live_count": len(flights),
+         "app_modes": APP_MODE_CHOICES})
 
 
 @app.post("/streams")
-async def add_stream(request: Request, label: str = Form(default="")):
+async def add_stream(request: Request, label: str = Form(default=""),
+                     app_mode: str = Form(default="")):
     """
     The endpoint that spends money (§4): a slot is what lets a GPU container come
     into existence. db-writer caps it per user; a 409 here is that cap, and it is
     shown to the user rather than swallowed.
+
+    app_mode chooses which pipeline this slot's flights run. An empty value means
+    "whatever the deployment is set to", which is what every slot did while the mode
+    was a deployment-wide variable. It is not validated here: db-writer owns the list
+    of supported modes and answers 400, so the portal does not hold a second copy to
+    drift out of step.
     """
     _check_origin(request)
     token = _session_of(request)
     if not token:
         return _redirect("/login")
-    await _db.create_stream(token, label.strip() or None)
+    await _db.create_stream(token, label.strip() or None, app_mode.strip() or None)
+    return _redirect("/")
+
+
+@app.post("/streams/{stream_id}/mode")
+async def set_stream_mode(request: Request, stream_id: int,
+                          app_mode: str = Form(default="")):
+    """
+    Change which pipeline a slot runs, from the next flight onwards.
+
+    Not the one in the air: the mode is read when a flight opens and handed to a
+    container that has already started.
+    """
+    _check_origin(request)
+    token = _session_of(request)
+    if not token:
+        return _redirect("/login")
+    await _db.set_stream_mode(token, stream_id, app_mode.strip() or None)
     return _redirect("/")
 
 

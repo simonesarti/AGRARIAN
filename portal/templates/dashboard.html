@@ -31,6 +31,19 @@
         <td>
           <strong>{{ s.label or "Untitled slot" }}</strong>
           <div class="muted small">added {{ (s.created_at or "")[:10] }}</div>
+          {# Which pipeline this slot's flights run. A change applies from the next
+             flight, never the one in the air — the mode is read when the flight
+             opens and handed to a container that has already started. #}
+          <form method="post" action="/streams/{{ s.stream_id }}/mode" class="mode-form">
+            <select name="app_mode" onchange="this.form.submit()"
+                    title="Applies from the next flight, not one already in the air">
+              {% for value, name in app_modes %}
+              <option value="{{ value }}" {% if s.app_mode == value %}selected{% endif %}>{{ name }}</option>
+              {% endfor %}
+              <option value="" {% if not s.app_mode %}selected{% endif %}>Deployment default</option>
+            </select>
+            <noscript><button type="submit">Set</button></noscript>
+          </form>
         </td>
         <td>
           {# Shown in full, every time. The key is recoverable by design: the
@@ -74,6 +87,12 @@
 
   <form method="post" action="/streams" class="row addslot">
     <input type="text" name="label" placeholder="Label (optional) — e.g. north field" maxlength="128">
+    <select name="app_mode" title="Which pipeline this slot's flights run">
+      {% for value, name in app_modes %}
+      <option value="{{ value }}">{{ name }}</option>
+      {% endfor %}
+      <option value="">Deployment default</option>
+    </select>
     <button type="submit" class="primary">Add slot</button>
   </form>
 </div>

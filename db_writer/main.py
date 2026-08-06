@@ -36,6 +36,7 @@ from db_manager import (
     AlertWriter,
     EmailAlreadyRegistered,
     StreamLimitReached,
+    StreamNotFound,
     UserDirectory,
 )
 from media_auth import Denied, authorize, credential_from
@@ -120,6 +121,13 @@ class CredentialsRequest(BaseModel):
 
 class CreateStreamRequest(BaseModel):
     label: Optional[str] = None
+    # Omitted or null follows the deployment's own APP_MODE, which is what every
+    # slot did before this field existed.
+    app_mode: Optional[str] = None
+
+
+class StreamModeRequest(BaseModel):
+    app_mode: Optional[str] = None
 
 
 class ViewerTokenRequest(BaseModel):
@@ -345,7 +353,7 @@ def add_stream(
     """
     user_id = _require_session(authorization)
     try:
-        return _directory.create_stream(user_id, req.label)
+        return _directory.create_stream(user_id, req.label, req.app_mode)
     except StreamLimitReached as e:
         # Before ValueError — it is a subclass, so order matters here as it does
         # in /register.
@@ -407,6 +415,37 @@ def revoke_stream(
     except Exception as e:
         logger.error(f"Unexpected error revoking stream {stream_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to revoke stream")
+    return {"ok": True}
+
+
+@app.post("/streams/{stream_id}/mode")
+def set_stream_mode(
+    stream_id: int,
+    req: StreamModeRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Choose which pipeline this slot's flights run. Null reverts to the deployment's.
+
+    Takes effect on the next flight, never the one in the air: the mode is read when
+    a flight opens and injected into a container that has already started.
+
+    A bad mode is 400 and a stream that is not the caller's is the same 404 as one
+    that does not exist — `stream_id` is sequential across every tenant, so telling
+    those apart would confirm a row the caller has no business knowing about.
+    """
+    user_id = _require_session(authorization)
+    try:
+        _directory.set_stream_mode(stream_id, user_id, req.app_mode)
+    except StreamNotFound:
+        # Before ValueError — it is a subclass, so order matters here as it does for
+        # StreamLimitReached in /register and /streams.
+        raise HTTPException(status_code=404, detail="Stream not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error setting mode on stream {stream_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to set stream mode")
     return {"ok": True}
 
 
@@ -580,6 +619,11 @@ def open_flight(req: OpenFlightRequest):
         # is a change in one place.
         "ingest_path": f"in/{req.stream_key}",
         "output_path": f"out/{flight['public_uuid']}",
+        # Which pipeline this slot runs, or None to leave the deployment's setting
+        # alone. This is what lets one cluster serve a livestock tenant and a terrain
+        # tenant at once — the mode used to be an environment variable on the
+        # orchestrator, so every flight it ever started ran the same product.
+        "app_mode": flight["app_mode"],
         "publisher_token": mint_publisher_token(flight["flight_id"]),
     }
 
