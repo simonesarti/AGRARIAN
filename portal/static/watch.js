@@ -158,15 +158,32 @@
   }
 
   /*
-   * The frozen-picture case. A peer connection can stay "connected" while no
-   * media arrives, so connectionState alone is not enough to notice that the
-   * publisher went away. currentTime advancing is the only direct evidence that
-   * frames are still being decoded.
+   * The picture stopped, whatever the connection says about itself.
+   *
+   * currentTime advancing is the only direct evidence that frames are being
+   * decoded, and it is needed because connectionState lies in both directions:
+   *
+   *   "connected"    while no media arrives at all — MediaMTX can hold a reader
+   *                  session open after its publisher goes away
+   *   "disconnected" for fifteen to thirty seconds before it admits to "failed",
+   *                  which is how long ICE spends on consent timeout
+   *
+   * The second was measured rather than guessed: a publisher dropped and brought
+   * back inside the grace window recovered, but only after roughly twenty seconds,
+   * because the state handler waits for "failed" and this timer used to skip any
+   * state that was not "connected". Nothing acted during the gap. Watching both
+   * states collapses that to STALL_TIMEOUT_MS.
+   *
+   * "connecting" and "new" are deliberately excluded: currentTime not advancing
+   * during setup is normal, and retrying there would restart a negotiation that
+   * has not finished. "failed" and "closed" belong to the state handler.
    *
    * Guarded on document.hidden because a backgrounded tab has its video
    * throttled or paused by the browser, and reconnecting then would renegotiate
    * a stream nobody is looking at.
    */
+  const STALL_WATCHED_STATES = ["connected", "disconnected"];
+
   function watchForStall() {
     if (stallTimer) window.clearInterval(stallTimer);
     lastMediaTime = 0;
@@ -174,7 +191,7 @@
 
     stallTimer = window.setInterval(function () {
       if (closing || document.hidden) { lastProgressAt = Date.now(); return; }
-      if (!pc || pc.connectionState !== "connected") return;
+      if (!pc || STALL_WATCHED_STATES.indexOf(pc.connectionState) === -1) return;
 
       if (playerEl.currentTime !== lastMediaTime) {
         lastMediaTime = playerEl.currentTime;
@@ -210,12 +227,15 @@
     pc.onconnectionstatechange = function () {
       if (!pc || closing) return;
 
-      // "disconnected" is often transient and ICE recovers by itself, so it is
-      // reported and left alone; the stall watchdog is what catches it if the
-      // picture never comes back. "failed" and "closed" are terminal and there
-      // is nothing to wait for.
+      // "disconnected" is often transient and ICE sometimes recovers by itself,
+      // so this does not renegotiate on it — but it does not wait for "failed"
+      // either, because that takes fifteen to thirty seconds of consent timeout.
+      // The stall watchdog now watches this state too and acts on the picture
+      // rather than on the label, so recovery costs STALL_TIMEOUT_MS whether ICE
+      // admits to failing or not. "failed" and "closed" are terminal and there is
+      // nothing left to wait for.
       if (pc.connectionState === "disconnected") {
-        setStatus("Video interrupted — waiting…", "muted");
+        setStatus("Video interrupted — reconnecting…", "muted");
         return;
       }
       if (pc.connectionState === "failed" || pc.connectionState === "closed") {

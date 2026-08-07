@@ -1335,9 +1335,12 @@ waits on them and neither is work:**
    name buys is a browser somebody else controls — which is why it is still worth
    starting now and not urgent to finish. Prefer a registrar whose DNS has an API
    cert-manager supports: the tier wants a wildcard, and a wildcard needs DNS-01.
-2. **A DEM raster covering the operating area** (`dem/dem.tif`, `dem/dem_mask.tif`). Slope
-   and no-data analysis are skipped without it, so a real part of `danger_detection` has
-   never executed.
+2. **A DEM raster covering the operating area** (`dem/dem.tif`, `dem/dem_mask.tif`).
+   Slope and no-data analysis are skipped without it, so `danger_detection` runs
+   degraded everywhere here. The code itself is *not* the unknown — it was exercised
+   against a real raster during the app's development and worked (see *Known
+   weaknesses*). What a raster buys is a deployment that runs the full geo stage, and
+   the ability to write the regression coverage that cannot exist without one.
 
 **The ingress tier is finished, the product has been watched working in a browser, both
 `FlightRuntime` backends exist, the portal shows what has flown as well as what is
@@ -1998,13 +2001,28 @@ billing).
 Distinct from the section below: these are live weaknesses on this branch right now, not
 work that has yet to start.
 
-- **The DEM is absent, so part of the geo stage is untested.** `dem/dem.tif` and
-  `dem/dem_mask.tif` are gitignored and not on any machine here, and `open_dem_tifs()`
-  returns `None` for a missing raster, so `danger_detection` runs with slope and no-data
-  analysis skipped. Geofencing and the safety radius do run and are exercised. This is a
-  supported degraded mode rather than a fault — the harness reports which of the two it
-  got — but no test has yet driven a real elevation raster through `extract_dem_window`
-  and the window cache.
+- **The DEM is absent from every deployment here, so the geo stage runs degraded.**
+  `dem/dem.tif` and `dem/dem_mask.tif` are gitignored and not on any machine here, and
+  `open_dem_tifs()` returns `None` for a missing raster, so `danger_detection` runs with
+  slope and no-data analysis skipped. Geofencing and the safety radius do run and are
+  exercised. The harness reports which of the two it got, so a green run is never read
+  as full geo coverage.
+
+  **This entry used to say the code path was untested, and that was too strong.** The
+  slope and no-data analysis was exercised with a real raster during the app's own
+  development, and worked. That is a human observation rather than an assertion — the
+  same standing as "a person watched the annotated video play" below — and it changes
+  what is actually missing:
+
+  - **not** the code: `extract_dem_window` and the window cache have run against real
+    elevation data
+  - **yes** a raster in any deployment or harness here, which is why nothing exercises
+    it now
+  - **yes** any automated coverage at all, so a change to the geo stage would break the
+    DEM path silently and every green run would stay green
+
+  The second is an external ask (§9's list); the third is work, and it only becomes
+  possible once the first lands.
 - **Alert images were full 1920×1080 frames. [fixed]** `image_data` is a `LargeBinary`
   column, and `output_alert_streamer._process_alert` wrote the whole annotated frame to
   it unresized. With a **1.0 s** alert cooldown a persisting danger condition wrote up
@@ -2590,13 +2608,25 @@ Three consequences, and the third is the one that decided it:
   synthetic streams into one instance with viewers attached, and finding where frames
   start dropping, is the prerequisite that turns this section from a sketch into a
   configuration. **It is the first thing to do here.**
-- **Does the drone controller persist the ingest URL? [open]** Not a question about
-  this codebase. If a controller remembers the URL between flights, per-flight keys
-  cost a transcription the current design does not; if it does not, they cost nothing
-  the operator was not already paying. The design above is deliberately robust either
-  way, but the answer changes how hard §10.2's timers should work to avoid a re-mint.
-  Same shape as the standing question about whether any real drone needs the plaintext
-  fallback (§9): a fact somebody who owns the aircraft can supply in a sentence.
+- **Whether the drone controller persists the ingest URL is moot. [closed]** It was
+  asked because per-flight keys would cost a transcription that permanent keys did not,
+  *if* the controller remembered the old URL. It does not matter: under §10.1 the key is
+  minted per flight, so the operator visits the portal before every takeoff regardless.
+  A controller that remembers last week's URL remembers a dead one.
+
+  Closing it leaves one thing behind, and it is a UX consequence rather than a design
+  question. **A stale persisted URL becomes a normal operator mistake**, where today it
+  simply keeps working. The operator's muscle memory — set it once, press go — stops
+  being correct, and §4 deliberately returns no reason for a refused publish, because a
+  caller learning why it was refused learns about another tenant.
+
+  That rule was written for a stranger probing stream keys, and it is right for one. It
+  is wrong for the account holder publishing on their own expired key, who gets silence.
+  The same distinction §10.6 draws for the viewer cap applies here: refusing a stranger
+  stays opaque, refusing the owner should not. The portal knowing that a slot's key was
+  presented and refused — and saying so on the page — is the cheap version, and it wants
+  designing alongside the two timers rather than after somebody is standing in a field
+  wondering why nothing happens.
 
 ---
 
