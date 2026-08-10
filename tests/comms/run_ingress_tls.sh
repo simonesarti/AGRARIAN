@@ -37,7 +37,7 @@ NET=ingresstls-net
 DOMAIN=agrarian.local
 IMAGE=dbw-ingresstlstest
 MOSQ_IMAGE=iegomez/mosquitto-go-auth:2.1.0-mosquitto_2.0.15
-MTX_IMAGE=bluenviron/mediamtx:latest-ffmpeg
+MTX_IMAGE=bluenviron/mediamtx:1.19.3-ffmpeg
 # The one client here that can still send a TLS 1.1 ClientHello. Modern curl and
 # OpenSSL 3 refuse to send one at all, so a floor assertion written with those
 # passes against a server that happily accepts 1.1 — it measures the client.

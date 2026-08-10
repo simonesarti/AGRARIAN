@@ -109,7 +109,7 @@ docker run -d --name db-writer --network "$NET" "${ENVV[@]}" "$IMAGE" >/dev/null
 docker run -d --name cr-mediamtx --network "$NET" -p 51936:1936 -p 58322:8322 \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
   -v "$CERTS/server:/certs:ro" \
-  bluenviron/mediamtx:latest-ffmpeg >/dev/null
+  bluenviron/mediamtx:1.19.3-ffmpeg >/dev/null
 docker run -d --name cr-mosquitto --network "$NET" -p 58883:8883 \
   -v "$REPO/configs/mosquitto/mosquitto.conf:/etc/mosquitto/mosquitto.conf:ro" \
   -v "$CERTS/server:/mosquitto/certs:ro" \

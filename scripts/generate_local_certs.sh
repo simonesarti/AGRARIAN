@@ -4,15 +4,29 @@
 #
 # WHY THIS EXISTS
 # ---------------
-# Let's Encrypt will not issue for an IP address, and MEDIAMTX_HOST is an IP
-# today (CLOUD_ARCHITECTURE.md §9). But nothing in the ingress tier actually
-# needs a *publicly trusted* certificate to be built and tested: Traefik,
-# MediaMTX and Mosquitto all read a certificate and a key from disk and none of
-# them knows or cares who signed it. The only thing public trust buys is a
-# browser that belongs to somebody else, and there is not one of those yet.
+# Nothing in the ingress tier needs a *publicly trusted* certificate to be built
+# and tested: Traefik, MediaMTX and Mosquitto all read a certificate and a key
+# from disk and none of them knows or cares who signed it. The only thing public
+# trust buys is a browser that belongs to somebody else.
 #
-# So this script stands in for cert-manager. When a hostname arrives, ACME
-# replaces it and nothing else in the stack changes — which is the point.
+# So this script stood in for cert-manager while there was no domain, and the
+# handover — when one arrived on 2026-08-09 — was three file copies into
+# certificates/server/ with nothing else in the stack moving, which is the point.
+#
+# WHAT THE ORIGINAL VERSION OF THIS COMMENT GOT WRONG
+# ---------------------------------------------------
+# It said Let's Encrypt will not issue for an IP address (true) and treated that
+# as meaning nothing could be issued until a name resolved to the deployment
+# (false). A DNS-01 challenge proves control of a ZONE: the CA reads a TXT record
+# at _acme-challenge and never connects here at all. Owning the domain and a
+# scoped DNS API token was the whole prerequisite. See CLOUD_ARCHITECTURE.md §7.
+#
+# STILL USED, AND DELIBERATELY SO
+# -------------------------------
+# Every test runner that mounts the real mediamtx.yaml or mosquitto.conf issues a
+# throwaway leaf from here, into a temporary directory rather than certificates/.
+# That keeps the suites independent of whatever real certificate is on the machine,
+# and stops a publicly trusted private key being handed to a test container.
 #
 # ONE LEAF FOR ALL THREE TERMINATORS
 # ----------------------------------

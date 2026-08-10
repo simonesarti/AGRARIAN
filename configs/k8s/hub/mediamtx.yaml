@@ -86,7 +86,7 @@ spec:
           # `exec: "wget": executable file not found in $PATH`, logged at INF and
           # otherwise silent. That is why recordings were never uploaded until it
           # was found (§4). This tag is Alpine based and supplies busybox wget.
-          image: bluenviron/mediamtx:latest-ffmpeg
+          image: bluenviron/mediamtx:1.19.3-ffmpeg
           ports:
             - name: rtmps
               containerPort: 1936
@@ -112,7 +112,7 @@ spec:
             # address, not a pod or service IP. It is not knowable until the
             # LoadBalancer below has been provisioned, which is why it comes from
             # a ConfigMap written at deploy time rather than being baked in here.
-            - name: MTX_WEBRTCICEHOSTNAT1TO1IPS
+            - name: MTX_WEBRTCADDITIONALHOSTS
               valueFrom:
                 configMapKeyRef:
                   name: agrarian-endpoints
@@ -193,7 +193,7 @@ spec:
 # MIXED TCP AND UDP ON ONE SERVICE, ON PURPOSE AND WITH A CONSTRAINT
 # -------------------------------------------------------------------
 # 8189 must be reachable over both protocols at the SAME external address, because
-# ICE advertises one host candidate address (MTX_WEBRTCICEHOSTNAT1TO1IPS above) and
+# ICE advertises one host candidate address (MTX_WEBRTCADDITIONALHOSTS above) and
 # both transports have to arrive there. Splitting them into a TCP Service and a UDP
 # Service would allocate two addresses and break the TCP half for exactly the
 # viewers it exists to serve — those on networks that pass no UDP.

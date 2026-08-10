@@ -1134,19 +1134,33 @@ Two consequences of self-termination that are easy to meet by surprise:
 
 #### Certificates before a hostname exists **[built]**
 
-cert-manager cannot issue anything until a name resolves here, and that is an
-external ask with lead time (§9). It is not, however, a reason to wait: all three
-terminators read a certificate and a key from disk and none of them knows who signed
-it. Public trust is only worth anything for a browser somebody else controls, and
-there is not one of those yet.
+This section used to open by saying cert-manager could not issue anything until a name
+resolved here. **That was wrong, and the correction is worth stating precisely because
+it held up a step that turned out to take an afternoon.** Let's Encrypt will not issue
+for an IP address — that half is true, and `MEDIAMTX_HOST` held one. But a DNS-01
+challenge proves control of a **zone**, not of a host: the CA reads a TXT record at
+`_acme-challenge` and never connects to the deployment at all. The prerequisite was
+owning a domain and holding a DNS API credential, and neither of those says anything
+about where the stack runs or what any name resolves to.
 
-`scripts/generate_local_certs.sh` therefore stands in for cert-manager — a local CA
+Building the tier against a local CA was still the right call, for the reason this
+section gave all along: all three terminators read a certificate and a key from disk
+and none of them knows who signed it. Public trust is only worth anything for a
+browser somebody else controls.
+
+`scripts/generate_local_certs.sh` therefore stood in for cert-manager — a local CA
 plus one wildcard leaf covering `<domain>`, `*.<domain>`, `localhost` and the host's
-own IP, since `MEDIAMTX_HOST` holds an IP today. One leaf serves all three
+own IP, since `MEDIAMTX_HOST` held one. One leaf serves all three
 terminators, and it is named `server.crt`/`server.key` because that is what
 `mosquitto.conf` already expected — which is now what it actually reads, along with
 MediaMTX and Traefik. The single-leaf choice was made before there was a second
 consumer and cost nothing when the second and third arrived.
+
+**It has not been retired and should not be.** Every test runner that mounts the real
+`mediamtx.yaml` or `mosquitto.conf` issues a throwaway leaf from it, into a temporary
+directory rather than `certificates/` — which is what keeps the suites independent of
+whatever real certificate happens to be on the machine, and what stops a public leaf's
+private key being handed to a container in a test.
 
 Two details are deliberate rather than convenient. The leaf lasts **397 days**, the
 browser maximum, rather than the decade a throwaway local certificate usually gets: a
@@ -1156,9 +1170,35 @@ file swap that question needed — the CA stays installed in whatever trust stor
 has it. That is what `run_cert_renewal.sh` drives, and the question is now answered
 rather than open; see below.
 
-When a hostname lands, the ACME block at the foot of `configs/traefik/traefik.yml`
-replaces the script. Nothing else in the stack changes, which is the property that
-made building the tier before owning a domain worth doing.
+#### The real leaf, and what the handover actually cost **[built]**
+
+`agrarianlivestock.com` was registered on **2026-08-09** and a Let's Encrypt wildcard
+covering `agrarianlivestock.com` and `*.agrarianlivestock.com` was issued the same day
+over DNS-01 against Cloudflare's API — with no cluster, no load balancer, and no A
+record anywhere in the zone. It replaces the script's output in `certificates/server/`,
+and nothing else in the stack moved, which is the property that made building the tier
+before owning a domain worth doing.
+
+Three things came out of doing it that the plan above did not have:
+
+- **`ca.crt` is a third file, not an afterthought.** `mosquitto.conf` names it as
+  `cafile`, so copying only the leaf and its key would have left one terminator
+  pointing at a CA unrelated to the certificate beside it. The issuer certificate goes
+  there. `require_certificate false` means nothing verifies against it today, which is
+  exactly why the mismatch would have sat there unnoticed.
+- **The lifetime drops from 397 days to 90.** The renewal findings below stop being
+  documentation and become an operational requirement with a date on it. Under compose
+  the ACME client's `--deploy-hook` is where all three reload actions belong.
+- **The leaf is RSA-2048 by choice.** Current ACME clients default to EC256, and taking
+  that default would have changed the key algorithm underneath all three terminators in
+  the same move that changed the issuer. One leaf also serves the drone-facing
+  listeners, where the TLS floor is 1.2 for old ground-station software — so the
+  weakest client governs, and this was not the change to blend in.
+
+The ACME block at the foot of `configs/traefik/traefik.yml` stays commented out, and is
+now unlikely ever to be used: under Kubernetes cert-manager owns issuance and writes the
+`agrarian-tls` Secret, and under compose the certificate arrives as a file from outside.
+Only the mount point was ever load-bearing.
 
 #### Renewal: what each terminator does when the leaf changes **[verified]**
 
@@ -1322,25 +1362,24 @@ The rest of this section is a ledger, ordered by subject rather than by urgency.
 ordering — what to do next and why that one first. It is the entry point for anyone, human
 or otherwise, arriving without the history.
 
-**Two asks with lead time, worth starting before anything else because everything below
-waits on them and neither is work:**
+**One ask with lead time, worth starting before anything else because it is not work
+and cannot be done from here:**
 
-1. **A hostname and control of its DNS.** Let's Encrypt will not issue a certificate for an
-   IP address, and `MEDIAMTX_HOST` is an IP today. What this gates is narrower than it
-   first appeared: **only ACME issuance**, not the ingress tier. Traefik, the TLS
-   listeners and the renewal question all read a certificate from disk and do not care
-   who signed it, so all three were built and the renewal behaviour of all three was
-   measured against a local CA (`scripts/generate_local_certs.sh`); the handover is one
-   config block. That is now the whole of what waits on a name. What a real
-   name buys is a browser somebody else controls — which is why it is still worth
-   starting now and not urgent to finish. Prefer a registrar whose DNS has an API
-   cert-manager supports: the tier wants a wildcard, and a wildcard needs DNS-01.
-2. **A DEM raster covering the operating area** (`dem/dem.tif`, `dem/dem_mask.tif`).
+1. **A DEM raster covering the operating area** (`dem/dem.tif`, `dem/dem_mask.tif`).
    Slope and no-data analysis are skipped without it, so `danger_detection` runs
    degraded everywhere here. The code itself is *not* the unknown — it was exercised
    against a real raster during the app's development and worked (see *Known
    weaknesses*). What a raster buys is a deployment that runs the full geo stage, and
    the ability to write the regression coverage that cannot exist without one.
+
+**The hostname was the other ask on this list and it is closed** (2026-08-09).
+`agrarianlivestock.com` is registered, and a publicly trusted Let's Encrypt wildcard is
+already serving from `certificates/server/` — see §7. It left this list faster than it
+was expected to, for a reason worth carrying forward rather than filing away: **the
+blocker as written was not the blocker that existed.** This list said Let's Encrypt
+will not issue for an IP, which is true, and then treated that as "nothing can be
+issued until a name resolves to this deployment", which does not follow. DNS-01 proves
+control of a zone. Nothing had to resolve anywhere, and no cluster had to exist.
 
 **The ingress tier is finished, the product has been watched working in a browser, both
 `FlightRuntime` backends exist, the portal shows what has flown as well as what is
@@ -1353,11 +1392,20 @@ changes the credential model, the flight lifecycle and the media tier's shape, a
 none of it is built. Read this section as the state of what exists and §10 as where
 it goes next.
 
-Setting §10 aside, what remains is the two asks above, plus the
+Setting §10 aside, what remains is the one ask above, plus the
 provider-specific values that only exist once a cluster does — a registry to push the
 five images to, a storage class if the default is not wanted, and the load-balancer
 addresses that `configs/k8s/endpoints.env` needs. None of those is work that can be
 done here.
+
+Two things the certificate work added rather than closed, both small and both dated:
+**a renewal hook is now due by 2026-10-08**, since a 90-day leaf replaced a 397-day one;
+and `MEDIA_PUBLIC_HOST` needs deciding against the Kubernetes topology before the first
+cluster, because the portal composes HLS and WHEP URLs from it on 8888/8889 while those
+ports live on Traefik's load balancer and 1936/8189 live on MediaMTX's. Under compose
+one host fronts both and the conflict is invisible; `configs/k8s/endpoints.env.example`
+hands out two different addresses and inherits it. Either the two Services share one
+address, or the variable has to split in two.
 
 One claim this list used to make is worth retracting, because it was wrong in a way
 that cost time: it said the hub manifests **"can only be tested against a cluster
@@ -1414,6 +1462,31 @@ billing).
 
 ### Built and tested
 
+- **A publicly trusted wildcard certificate, issued with no deployment to point it at**
+  (§7, 2026-08-09). `agrarianlivestock.com` registered at Cloudflare, and a Let's
+  Encrypt leaf covering the apex and `*.agrarianlivestock.com` obtained over DNS-01
+  against Cloudflare's DNS API. It now serves from `certificates/server/` in place of
+  the local CA's leaf, read unchanged by all three terminators.
+
+  **The finding is that this needed none of the infrastructure the list said it needed.**
+  No cluster, no load balancer, and no A record — the zone had no records at all when the
+  certificate was issued. DNS-01 writes a TXT record and the CA reads it; it never
+  connects to the deployment. What was genuinely required was the domain and a scoped
+  DNS API token, which is the one part of the old wording that survives: *prefer a
+  registrar whose DNS has an API cert-manager supports*.
+
+  Verified by inspection rather than by a runner, and worth listing as such: issuer
+  `O = Let's Encrypt` with no `(STAGING)`, both names present in the SAN, a three
+  certificate fullchain, and the private key confirmed to match the leaf. There is **no
+  automated coverage** — nothing re-checks that the file on disk is the file being
+  served, which is the same standing gap as the browser observations below.
+
+  Four things surfaced only by doing it, all recorded in §7: `mosquitto.conf`'s `cafile`
+  makes this a three-file swap; the ACME client's EC256 default would have changed the
+  key algorithm under three terminators at once; the lifetime drops 397 → 90 days; and a
+  staging certificate left in place makes the production run a silent no-op, because the
+  client reads it as a renewal that is not yet due and exits successfully having issued
+  nothing.
 - **The hub tier as Kubernetes manifests, deployed on a real cluster** (§2, 2026-08-03).
   `configs/k8s/hub/` plus a kustomization at `configs/`, applied with
   `kubectl apply -k configs/`. All eight hub services come up: Redis, db-writer,
@@ -1610,6 +1683,23 @@ billing).
   element is `autoplay muted playsinline`, muted being what makes autoplay legal without
   a click, and both Blink and Gecko accepted it. What it does not settle is the rest of
   the page — see *Open*, which is now two corners rather than the whole thing.
+
+  **Re-confirmed on 2026-08-10 with a hostname as the ICE host**, which was the one
+  thing the move from an IP to `agrarianlivestock.com` left genuinely uncertain.
+  `run_watch_live.sh dev.agrarianlivestock.com` sets both `MEDIA_PUBLIC_HOST` and the
+  ICE host to a name rather than an address, and the video played. So MediaMTX turns a
+  hostname into a candidate a browser can use — the setting is documented as "additional
+  hosts or IPs" and now behaves that way in practice, not just in the manual.
+
+  That mattered because the failure would not have looked like one: a bad ICE host
+  leaves WHEP answering **201** with a permanently black player, which is the symptom
+  this document elsewhere warns is mistakable for an autoplay problem.
+
+  Two limits on the claim, both worth keeping. It is a **human observation** on the same
+  footing as the entry above, with nothing re-checking it. And it does not establish
+  **when** the name is resolved: if MediaMTX resolves once at startup, an address moving
+  under a stable name still breaks playback until a restart. That is invisible on
+  loopback and becomes real the first time a cloud load balancer is recreated.
 - **Certificate renewal, on all three terminators** (§7). The open item with a deadline
   attached — the answer was needed before the first real certificate was issued, not
   before it expired — settled by 15 assertions in `run_cert_renewal.sh`, which issues a
@@ -1681,9 +1771,10 @@ billing).
   stays published and unproxied, because WebRTC media is end-to-end DTLS-SRTP and
   proxying it would terminate the encryption the media path is built on.
 
-  Certificates come from `scripts/generate_local_certs.sh` rather than from ACME, and
-  that is what made the work possible before the hostname arrives: all three terminators
-  read a key from disk and none asks who signed it.
+  Certificates came from `scripts/generate_local_certs.sh` rather than from ACME, and
+  that is what made the work possible before the hostname arrived: all three terminators
+  read a key from disk and none asks who signed it. The same property is what let the
+  real leaf replace it later as a file copy (§7).
 
   Verified by 31 assertions in `run_traefik_tls.sh` — the repo's own Traefik
   configuration in front of a real portal, ws-server, MediaMTX, db-writer and
@@ -2103,11 +2194,14 @@ list nearly empty. Everything here that mattered was portal work.
 ### Designed, not built
 
 - **The cloud L4 load balancer and cert-manager (§7).** Deployment-time pieces with
-  nothing to build locally: the LB is a managed resource and cert-manager replaces
-  `scripts/generate_local_certs.sh` when a hostname resolves here. The manifests
+  nothing to build locally: the LB is a managed resource, and cert-manager is what
+  automates in-cluster what has now been done once by hand. The manifests
   already expect both — three `LoadBalancer` Services, and an `agrarian-tls` Secret
   that `configs/k8s/secrets.README.md` shows as a cert-manager `Certificate` with a
-  hand-made fallback.
+  hand-made fallback. **That fallback is no longer hypothetical**: the leaf in
+  `certificates/server/` is a real one and can be loaded into the Secret directly, so
+  the first cluster does not have to wait for cert-manager to be working to serve
+  trusted TLS.
 
 The hub manifests have left this list — see *Built and tested*. What they leave behind
 is not manifest work: a registry to push five images to, and the load-balancer
@@ -2122,6 +2216,36 @@ translation work.
 
 ### Open
 
+- **Azure GPU vCPU quota has not been requested. [external, longest lead time]** A new
+  subscription carries little or no quota for the NC/ND families, and the request is
+  reviewed rather than granted on the spot — days, not minutes. Everything else on the
+  Azure list is an afternoon once a cluster exists, so this is the item whose start date
+  decides when the first flight can run on rented hardware. It is the Azure-shaped
+  equivalent of §9's DEM ask: not work, and not doable from here.
+- **`MEDIA_HTTP_PUBLIC_HOST` is available and undecided. [built, unset]** The portal can
+  now compose HLS and WHEP from a different host than RTMPS and the ICE candidate, which
+  is what the split-LoadBalancer topology needs; unset, it falls back and every existing
+  deployment is unchanged. **The decision is still owed**, and the two answers are: give
+  Traefik's and MediaMTX's Services one shared address (leave it unset), or set it to the
+  Traefik name. Getting it wrong fails as WHEP answering 201 with a black player, so it
+  wants deciding before the first cluster flight rather than diagnosed after one.
+- **The `/etc/hosts` override on the development machine.** `dev.agrarianlivestock.com`
+  is mapped to `127.0.0.1` locally, which is what makes the name work in a browser while
+  nothing forwards from the router. **It must be removed the day that name points at real
+  infrastructure** — a stale loopback entry outliving the dev stack means the name
+  resolves, something answers, and it is the wrong thing. Same class as the negative DNS
+  cache that stalled the first ACME run, in the opposite direction.
+- **Nothing re-checks the certificate end to end.** `scripts/renew_certs.sh` verifies the
+  serial actually being served on a fresh connection to all three terminators, which is
+  the check that matters — but it only runs when renewal runs. Between renewals nothing
+  would notice an expired or mismatched leaf, and the first report would be a browser
+  warning or a drone that will not connect. `run_cert_renewal.sh` covers the reload
+  behaviour and not the live deployment.
+- **Upgrades of MediaMTX are now a deliberate act.** The image is pinned to
+  `1.19.3-ffmpeg` rather than tracking `latest-ffmpeg`, which is what stops a default
+  changing underneath this stack the way SRT and MoQ did in v1.19 (§4). The cost is the
+  other direction: a security fix now waits for somebody to bump the tag, and nothing
+  here watches for one.
 - **db-writer's own `/login` is still unrated.** The public door is now bounded (§4),
   but the endpoint behind it is not: anything that can reach db-writer directly can still
   guess passwords at bcrypt's pace. That is internal-only by §8 and so is not currently
@@ -2188,11 +2312,29 @@ translation work.
   already written one layer down; this is the same pattern applied a second time, and it
   waits for someone to actually hit the ceiling.
 - Recorder per-tenant upload prefixes
-- **TLS certificate issue.** What remains of what used to be "issue and renewal": the
-  issuing half waits on a hostname, since cert-manager cannot ask Let's Encrypt for an
-  IP. Renewal is no longer open — see the reload table in §7 — and the only thing it
-  leaves for the deployment is that a renewal hook must `touch` a file in Traefik's
-  watched dynamic directory, because Traefik alone does not notice a replaced leaf.
+- **The renewal hook is written and its reload half is tested; nothing schedules it
+  yet.** `scripts/renew_certs.sh` renews over DNS-01 and then does the three different
+  things the three terminators need — `touch` Traefik's watched directory, `SIGHUP`
+  Mosquitto, and deliberately nothing to MediaMTX, which rereads per handshake and dies
+  on `SIGHUP`. `--reload-only` exercised all three against the live stack and all three
+  then served the same serial on fresh connections.
+
+  What is left is a cron entry, and one thing the script cannot cover: **the renewal
+  path itself has never run.** Only the reload half has. The first real renewal is due
+  by **2026-10-08** (expiry **2026-11-07**), and `--force` is how to find out early
+  rather than on the day.
+
+  Two findings from writing it, both about the tool rather than the design. lego v5 has
+  **no `renew` subcommand** — `run` does both, so the obvious spelling fails on every
+  invocation. And `run` against an existing certificate **exits 0 having issued
+  nothing** when renewal is not due, which is correct for a cron job and is exactly the
+  silent no-op that made a staging leaf look like a successful production issuance. The
+  script therefore compares the serial before and after and treats "unchanged" as
+  "nothing to reload" rather than as success.
+
+  **Mosquitto's `SIGHUP` still has no answer under Kubernetes.** cert-manager and the
+  kubelet cover Traefik and MediaMTX there; nothing in the manifests signals Mosquitto,
+  and this script is a compose-side answer only.
 - **Auth-endpoint caching and db-writer replica count.** Every publish and every read
   now costs one indexed lookup here. A short-TTL cache is the obvious fix and the wrong
   one to reach for blindly: it delays revocation of a credential that has no expiry.

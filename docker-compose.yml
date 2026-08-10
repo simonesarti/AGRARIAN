@@ -36,10 +36,13 @@
 # the rtmps:// URL the portal prints, and set encryption to "strict" the day none
 # of them needs the fallback.
 #
-# Certificates come from scripts/generate_local_certs.sh, which stands in for
-# cert-manager until a hostname exists — Let's Encrypt will not issue for an IP,
-# and MEDIAMTX_HOST is one. Run it once before `docker compose up`. All three
-# terminators mount the same leaf from certificates/server/.
+# Certificates: all three terminators mount the same leaf from certificates/server/,
+# and none of them asks who signed it. Since 2026-08-09 that leaf is a real Let's
+# Encrypt wildcard for agrarianlivestock.com, obtained over DNS-01 (§7).
+# scripts/generate_local_certs.sh remains the way to produce one without a domain,
+# and is still what every test runner uses. Either way SOMETHING must be at those
+# paths before `docker compose up`: MediaMTX exits at startup on a missing
+# certificate rather than starting without the encrypted listener.
 #
 # Recording: MediaMTX records the annotated stream to the 'recordings' volume.
 #            The recorder sidecar uploads each segment on completion.
@@ -56,6 +59,7 @@ volumes:
   mosquitto-data:
   mosquitto-log:
   recordings:
+  postgres-data:
 
 services:
 
@@ -139,7 +143,7 @@ services:
     # otherwise silent: the recorder is never told a segment finished, and the
     # orchestrator is never told a stream went live. This tag is Alpine based and
     # provides busybox wget.
-    image: bluenviron/mediamtx:latest-ffmpeg
+    image: bluenviron/mediamtx:1.19.3-ffmpeg
     restart: unless-stopped
     networks: [comms-net]
     depends_on:
@@ -174,7 +178,24 @@ services:
       - "8189:8189/udp"   # WebRTC ICE — actual media flow
       - "8189:8189/tcp"   # WebRTC ICE over TCP — for networks that pass no UDP
     environment:
-      MTX_WEBRTCICEHOSTNAT1TO1IPS: ${MEDIAMTX_HOST}
+      # The address MediaMTX advertises in its ICE candidates. It must be one the
+      # BROWSER can dial: the addresses on MediaMTX's own interfaces are
+      # Docker-internal, and a viewer handed one of those gets a WHEP 201 followed
+      # by a permanently black player — a failure that looks like an autoplay
+      # problem and is not.
+      #
+      # A HOSTNAME IS ACCEPTED HERE, not only an IP, and that is now measured
+      # rather than assumed: the field is documented as "additional hosts or IPs",
+      # MTX_WEBRTCADDITIONALHOSTS=<name> parses into a one-element list, and a
+      # person watched video play with a name in this variable (§9, 2026-08-10).
+      # Prefer a name — the certificate covers names, and an address moves when a
+      # load balancer is recreated.
+      #
+      # The old spelling was MTX_WEBRTCICEHOSTNAT1TO1IPS, which v1.19 still accepts
+      # as a deprecated alias while warning at startup. It is not used here because
+      # the image tag is pinned but upstream will eventually drop the alias, and the
+      # symptom then is not an error — it is this variable silently doing nothing.
+      MTX_WEBRTCADDITIONALHOSTS: ${MEDIAMTX_HOST}
     volumes:
       - ./configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro
       # The same leaf Traefik and Mosquitto mount. Written by
@@ -218,11 +239,54 @@ services:
       - ./certificates/server:/mosquitto/certs:ro
 
   # ── DB writer sidecar ─────────────────────────────────────────────────────────
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  # A DEVELOPMENT database, and the only reason it is in this file at all.
+  #
+  # CLOUD_ARCHITECTURE.md §7 and configs/k8s/secrets.README.md both assume a MANAGED
+  # PostgreSQL outside the cluster — Azure Database for PostgreSQL Flexible Server is
+  # the intended one — which is why DB_HOST is a variable rather than a service name
+  # and why no database appeared here for as long as the stack was pointed at one.
+  # This service exists so the stack can run end to end on one machine with nothing
+  # external. It is NOT the production shape and must not become it: a database in
+  # the same compose project shares its lifecycle, and `docker compose down -v` is
+  # then one keystroke away from deleting every flight ever recorded.
+  #
+  # No published port, deliberately. §8 puts the database on the internal-only list.
+  # Reach it with `docker compose exec postgres psql -U "$DB_WORKER_NAME" "$DB_NAME"`.
+  #
+  # ONE ROLE, WHICH PRODUCTION MUST NOT COPY. secrets.README.md requires the worker
+  # account to hold DML on the five tables and NOT own the schema, because
+  # rebuild_schema.py is destructive by design and belongs to a different identity.
+  # Here the worker is the owner, matching what the test runners do; splitting the
+  # roles is part of standing up the managed instance, not of this file.
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [comms-net]
+    environment:
+      # Same variables db-writer reads, so there is one source of truth for the
+      # credential rather than a server value and a client value drifting apart.
+      POSTGRES_USER:     ${DB_WORKER_NAME}
+      POSTGRES_PASSWORD: ${DB_WORKER_PASSWORD}
+      POSTGRES_DB:       ${DB_NAME}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
   db-writer:
     build:
       context: db_writer
     restart: unless-stopped
     networks: [comms-net]
+    depends_on:
+      postgres:
+        # Not `service_started`: db-writer opens a connection pool at import time, so
+        # racing an initialising PostgreSQL fails the container rather than retrying.
+        condition: service_healthy
     ports:
       - "8002:8000"     # HTTP API — app POSTs alerts here from outside the comms network
     environment:
@@ -290,6 +354,12 @@ services:
       # compose interpolation error aborts the whole file, so the guard that
       # belongs to one service would stop every service from starting.
       MEDIA_PUBLIC_HOST: ${MEDIAMTX_HOST}
+      # Where HLS and WHEP are reachable, when that is not where MediaMTX is.
+      # Unset here and it falls back to MEDIA_PUBLIC_HOST, which is correct for
+      # this stack — one host fronts every port. It exists for Kubernetes, where
+      # those two are served through Traefik's load balancer and MediaMTX's own
+      # carries RTMPS and WebRTC. See configs/k8s/endpoints.env.example.
+      MEDIA_HTTP_PUBLIC_HOST: ${MEDIA_HTTP_PUBLIC_HOST:-}
       WS_PUBLIC_HOST:    ${WS_PUBLIC_HOST:-}
       WS_PORT:           ${WS_PORT:-8765}
       # Both must stay true wherever the browser reaches this over HTTPS. A Secure

@@ -149,6 +149,10 @@ celerybeat.pid
 
 # Environments
 .env
+# Any local variant too — a timestamped backup of .env holds the same secrets
+# it does, and `.env` alone does not match `.env.bak.1786298540`.
+.env.*
+!.env.example
 .venv
 
 # Deployment facts for the Kubernetes hub, filled in once the load balancers have

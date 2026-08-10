@@ -95,6 +95,28 @@ if not _MEDIA_PUBLIC_HOST:
 _WS_PUBLIC_HOST = os.environ.get("WS_PUBLIC_HOST", "").strip() or _MEDIA_PUBLIC_HOST
 _WS_PUBLIC_PORT = int(os.environ.get("WS_PORT", WS_PORT))
 
+# Where MediaMTX's HTTP family — HLS and WHEP signalling — is reachable, which is
+# NOT always where MediaMTX itself is.
+#
+# Under docker-compose one host fronts everything and this equals
+# MEDIA_PUBLIC_HOST, which is why it defaults to it and why no deployment has ever
+# had to set it. Under Kubernetes the two genuinely part company: HLS (8888) and
+# WHEP (8889) are served through Traefik, whose LoadBalancer is a different Service
+# with a different address from the one carrying RTMPS (1936) and WebRTC media
+# (8189). Composing all four from one variable then produces URLs pointing at an
+# address that does not listen on those ports.
+#
+# The alternative is to give both Services one address — on Azure, a single
+# pre-created Standard public IP attached to both, which works because their port
+# sets do not overlap. That needs no code, and leaving this unset is how you take
+# it. This exists so the choice is available rather than forced.
+#
+# It belongs with WS_PUBLIC_HOST rather than with MEDIA_PUBLIC_HOST: the viewer
+# WebSocket is terminated by the same Traefik, so wherever that is, this is too.
+_MEDIA_HTTP_PUBLIC_HOST = (
+    os.environ.get("MEDIA_HTTP_PUBLIC_HOST", "").strip() or _MEDIA_PUBLIC_HOST
+)
+
 # Both default to on, and both are off only for local HTTP testing. A Secure
 # cookie is simply not sent over http://, so leaving this on locally does not
 # fail loudly — it fails as a login that appears to work and then forgets you.
@@ -258,8 +280,13 @@ def _watch_urls(output_path: str, viewer_token: str) -> dict:
         # the hook and does accept the viewer token, so watch.js negotiates the
         # session itself. The media path is still browser-to-MediaMTX end to end
         # (DTLS-SRTP over UDP, §7) — only the signalling moved.
-        "whep_url": f"{_SCHEME}://{_MEDIA_PUBLIC_HOST}:{WEBRTC_PORT}/{output_path}/whep?jwt={viewer_token}",
-        "hls_url": f"{_SCHEME}://{_MEDIA_PUBLIC_HOST}:{HLS_PORT}/{output_path}/index.m3u8?jwt={viewer_token}",
+        #
+        # These two use _MEDIA_HTTP_PUBLIC_HOST, not _MEDIA_PUBLIC_HOST: both are
+        # terminated by Traefik, which is a different load balancer from MediaMTX's
+        # own once this runs on Kubernetes. It defaults to _MEDIA_PUBLIC_HOST, so
+        # every single-address deployment is unchanged.
+        "whep_url": f"{_SCHEME}://{_MEDIA_HTTP_PUBLIC_HOST}:{WEBRTC_PORT}/{output_path}/whep?jwt={viewer_token}",
+        "hls_url": f"{_SCHEME}://{_MEDIA_HTTP_PUBLIC_HOST}:{HLS_PORT}/{output_path}/index.m3u8?jwt={viewer_token}",
         "ws_url": f"{_WS_SCHEME}://{_WS_PUBLIC_HOST}:{_WS_PUBLIC_PORT}/?token={viewer_token}",
     }
 

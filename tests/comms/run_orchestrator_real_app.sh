@@ -194,7 +194,7 @@ docker run -d --name orchreal-mosquitto --network "$NET" \
 docker run -d --name orchreal-mediamtx --network "$NET" -p 41935:1935 \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
   -v "$CERTS/server:/certs:ro" \
-  bluenviron/mediamtx:latest-ffmpeg >/dev/null \
+  bluenviron/mediamtx:1.19.3-ffmpeg >/dev/null \
   || { echo "mediamtx failed to start (is a previous run still holding 41935?)"; exit 1; }
 sleep 6
 

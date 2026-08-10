@@ -59,10 +59,17 @@ spec:
             - name: PUBLIC_TLS
               value: "true"
           envFrom:
-            # MEDIA_PUBLIC_HOST, WS_PUBLIC_HOST, WS_PORT, TRUSTED_PROXY_HOPS and
-            # PORTAL_ALLOWED_ORIGIN_HOSTS. These are deployment facts that are not
-            # known until the load balancer has an address, so they live in a
-            # ConfigMap written at deploy time rather than being baked in here.
+            # MEDIA_PUBLIC_HOST, MEDIA_HTTP_PUBLIC_HOST, WS_PUBLIC_HOST, WS_PORT,
+            # TRUSTED_PROXY_HOPS and PORTAL_ALLOWED_ORIGIN_HOSTS. These are
+            # deployment facts that are not known until the load balancer has an
+            # address, so they live in a ConfigMap written at deploy time rather
+            # than being baked in here.
+            #
+            # MEDIA_HTTP_PUBLIC_HOST is the one that matters most on THIS platform
+            # and mattered not at all under compose: HLS and WHEP are served
+            # through Traefik's LoadBalancer, while RTMPS and WebRTC media are on
+            # MediaMTX's own. Left unset it falls back to MEDIA_PUBLIC_HOST, which
+            # is right only if both Services share one address.
             #
             # TRUSTED_PROXY_HOPS is the dangerous one and is discussed in
             # hub-endpoints.example.yaml: it must count the REAL hops between the

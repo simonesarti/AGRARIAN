@@ -94,7 +94,7 @@ docker run -d --name recup-mediamtx --network "$NET" -p 51935:1935 \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
   -v "$CERTS/server:/certs:ro" \
   -v "$VOL:/recordings" \
-  bluenviron/mediamtx:latest-ffmpeg >/dev/null \
+  bluenviron/mediamtx:1.19.3-ffmpeg >/dev/null \
   || { echo "mediamtx failed to start (is a previous run still holding 51935?)"; exit 1; }
 sleep 6
 

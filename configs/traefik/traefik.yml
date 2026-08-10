@@ -20,11 +20,18 @@
 # ONE ENTRYPOINT PER UPSTREAM, AND NO Host RULES
 # ----------------------------------------------
 # The obvious design is a single :443 with Host(`portal.example.com`) routing. That
-# is where this ends up, and it is deliberately NOT where it starts: there is no
-# hostname yet — that is the open ask at the top of §9 — and a Host rule cannot be
-# written against a name that does not exist. Dedicated entrypoints route on port
-# alone, so the stack works reachable as https://<ip>/ today, which is what
-# MEDIAMTX_HOST actually holds.
+# is where this ends up, and it is deliberately NOT where it started: there was no
+# hostname when this was written, and a Host rule cannot be written against a name
+# that does not exist. Dedicated entrypoints route on port alone, which is what let
+# the tier be built and tested against a bare address.
+#
+# A hostname exists as of 2026-08-09 (agrarianlivestock.com), so the collapse onto
+# :443 is now possible and is deliberately still not done — it is not free. The
+# portal composes its URLs with these port numbers in them (portal/main.py), so
+# moving HLS, WHEP and the viewer WebSocket onto 443 means changing that
+# composition and the port constants beside it, not just this file. Worth doing
+# for the reasons in §9 — fewer ports to open, and the "network that permits only
+# 443" item — but as its own change with its own test run.
 #
 # The port numbers are also the ones §8 already publishes, so the portal's URL
 # composition needs no change at all: it flips http->https and ws->wss from
@@ -87,11 +94,22 @@ log:
 # investigation, with a filter, and turn it off again.
 accessLog: ~
 
-# ACME lands here when a hostname resolves to this deployment. It is deliberately
-# absent rather than commented-in-and-broken: Let's Encrypt will not issue for an
-# IP, so an issuer configured now would fail on every start and teach nothing.
-# Until then certificates come from scripts/generate_local_certs.sh, and the
-# handover is one block here plus one line per router.
+# ACME is deliberately absent here, and as of 2026-08-09 it is likely to stay that
+# way. The certificate this Traefik serves is a real Let's Encrypt wildcard for
+# agrarianlivestock.com, obtained OUT OF BAND over DNS-01 against Cloudflare's API
+# and copied into certificates/server/ — see CLOUD_ARCHITECTURE.md §7.
+#
+# Two reasons not to move issuance in here now that it would work:
+#   - Under Kubernetes cert-manager owns it and writes the agrarian-tls Secret,
+#     which this file's tls.stores block mounts at the same two paths. Configuring
+#     a second issuer under compose would mean two mechanisms for one job.
+#   - MediaMTX and Mosquitto terminate their own TLS (§7) and need the same leaf on
+#     disk. Traefik's ACME store is a private acme.json it does not hand back, so
+#     it could only ever serve one of the three terminators.
+#
+# Only the mount point below was ever load-bearing. If you do enable this, note the
+# challenge must be DNS-01 — a wildcard cannot use HTTP-01 — and the provider is
+# `cloudflare`, taking CF_DNS_API_TOKEN from the environment.
 #
 # certificatesResolvers:
 #   letsencrypt:
@@ -99,4 +117,4 @@ accessLog: ~
 #       email: <ops address>
 #       storage: /etc/traefik/acme/acme.json
 #       dnsChallenge:
-#         provider: <registrar>     # DNS-01, because a wildcard needs it
+#         provider: cloudflare      # DNS-01, because a wildcard needs it

@@ -26,7 +26,7 @@
 # every variable it can.
 #
 # HOST ADDRESS. The portal composes playback URLs from MEDIA_PUBLIC_HOST, and
-# MediaMTX advertises MTX_WEBRTCICEHOSTNAT1TO1IPS in its ICE candidates. Both must
+# MediaMTX advertises MTX_WEBRTCADDITIONALHOSTS in its ICE candidates. Both must
 # be an address YOUR BROWSER can dial. Defaults to 127.0.0.1 for a browser on this
 # machine; pass the LAN IP as the first argument to watch from another device.
 #
@@ -156,10 +156,10 @@ docker run -d --name watch-orchestrator --network "$NET" \
 
 docker run -d --name watch-mediamtx --network "$NET" \
   -p 1935:1935 -p 8888:8888 -p 8889:8889 -p 8189:8189/udp -p 8189:8189/tcp \
-  -e MTX_WEBRTCICEHOSTNAT1TO1IPS="$HOST" \
+  -e MTX_WEBRTCADDITIONALHOSTS="$HOST" \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
   -v "$CERTS/server:/certs:ro" \
-  bluenviron/mediamtx:latest-ffmpeg >/dev/null || { echo "mediamtx failed"; exit 1; }
+  bluenviron/mediamtx:1.19.3-ffmpeg >/dev/null || { echo "mediamtx failed"; exit 1; }
 sleep 6
 
 for c in watch-dbw watch-wss watch-mosquitto watch-portal watch-orchestrator watch-mediamtx; do

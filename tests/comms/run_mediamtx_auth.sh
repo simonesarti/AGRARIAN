@@ -103,7 +103,7 @@ docker run -d --name mtxa-mediamtx --network "$NET" \
   -p 11935:1935 -p 18888:8888 \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
   -v "$CERTS/server:/certs:ro" \
-  bluenviron/mediamtx:latest-ffmpeg >/dev/null \
+  bluenviron/mediamtx:1.19.3-ffmpeg >/dev/null \
   || { echo "mediamtx failed to start (is a previous run still holding 11935/18888?)"; exit 1; }
 sleep 6
 

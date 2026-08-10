@@ -274,7 +274,7 @@ build "$ORC_IMAGE"    orchestrator || exit 1
 build "$REC_IMAGE"    recorder     || exit 1
 
 echo "==> pre-pulling the third-party images"
-for img in redis:7-alpine traefik:v3.3 bluenviron/mediamtx:latest-ffmpeg \
+for img in redis:7-alpine traefik:v3.3 bluenviron/mediamtx:1.19.3-ffmpeg \
            iegomez/mosquitto-go-auth:2.1.0-mosquitto_2.0.15 postgres:16-alpine; do
   docker pull -q "$img" >/dev/null 2>&1
   docker save "$img" | docker exec -i "$SERVER" ctr -n k8s.io images import - >/dev/null

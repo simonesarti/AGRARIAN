@@ -115,7 +115,7 @@ echo "==> starting mediamtx (the real config, so the auth hook is the real one)"
 docker run -d --name tt-mediamtx --network "$NET" --network-alias mediamtx \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
   -v "$CERTS/server:/certs:ro" \
-  bluenviron/mediamtx:latest-ffmpeg >/dev/null
+  bluenviron/mediamtx:1.19.3-ffmpeg >/dev/null
 
 echo "==> waiting for /health"
 for h in tt-dbw tt-ws tt-portal; do

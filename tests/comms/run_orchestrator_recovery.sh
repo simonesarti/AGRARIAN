@@ -118,7 +118,7 @@ start_orchestrator || { echo "orchestrator failed to start"; exit 1; }
 docker run -d --name orchrec-mediamtx --network "$NET" -p 61935:1935 \
   -v "$REPO/configs/mediamtx/mediamtx.yaml:/mediamtx.yml:ro" \
   -v "$CERTS/server:/certs:ro" \
-  bluenviron/mediamtx:latest-ffmpeg >/dev/null \
+  bluenviron/mediamtx:1.19.3-ffmpeg >/dev/null \
   || { echo "mediamtx failed to start (is a previous run still holding 61935?)"; exit 1; }
 sleep 6
 
