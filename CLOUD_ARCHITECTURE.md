@@ -2312,25 +2312,40 @@ translation work.
   already written one layer down; this is the same pattern applied a second time, and it
   waits for someone to actually hit the ceiling.
 - Recorder per-tenant upload prefixes
-- **The renewal hook is written and its reload half is tested; nothing schedules it
-  yet.** `scripts/renew_certs.sh` renews over DNS-01 and then does the three different
-  things the three terminators need — `touch` Traefik's watched directory, `SIGHUP`
-  Mosquitto, and deliberately nothing to MediaMTX, which rereads per handshake and dies
-  on `SIGHUP`. `--reload-only` exercised all three against the live stack and all three
-  then served the same serial on fresh connections.
+- **The renewal hook is written and has been run for real; nothing schedules it yet.**
+  `scripts/renew_certs.sh` renews and then does the three different things the three
+  terminators need — `touch` Traefik's watched directory, `SIGHUP` Mosquitto, and
+  deliberately nothing to MediaMTX, which rereads per handshake and dies on `SIGHUP`.
 
-  What is left is a cron entry, and one thing the script cannot cover: **the renewal
-  path itself has never run.** Only the reload half has. The first real renewal is due
-  by **2026-10-08** (expiry **2026-11-07**), and `--force` is how to find out early
-  rather than on the day.
+  **Rehearsed with `--force` on 2026-08-10, before the deadline rather than on it.** A
+  genuinely new certificate was issued, installed, and all three terminators were then
+  observed serving the **new serial on fresh connections** — the check that matters,
+  since a correct file and a stale listener are indistinguishable from the filesystem.
+  §7's reload table is now confirmed against a real public certificate rather than only
+  against a local CA. Expiry moves to **2026-11-08**.
 
-  Two findings from writing it, both about the tool rather than the design. lego v5 has
-  **no `renew` subcommand** — `run` does both, so the obvious spelling fails on every
-  invocation. And `run` against an existing certificate **exits 0 having issued
-  nothing** when renewal is not due, which is correct for a cron job and is exactly the
-  silent no-op that made a staging leaf look like a successful production issuance. The
-  script therefore compares the serial before and after and treats "unchanged" as
-  "nothing to reload" rather than as success.
+  **The renewal changed the intermediate, and that is what justified the third file.**
+  The first leaf chained through Let's Encrypt `YR2` and the renewed one through `YR1`.
+  `mosquitto.conf` names `ca.crt` as its `cafile`, so a two-file copy would have left it
+  pointing at an intermediate unrelated to the leaf beside it — on the very first
+  renewal, silently, because `require_certificate false` means nothing verifies against
+  it. The three-file copy stopped being a precaution and became load-bearing within a
+  day of being written.
+
+  **What this run did NOT exercise: DNS-01.** Let's Encrypt reported *"Authorization is
+  already valid; skipping the challenge"* for both names, reusing the authorization from
+  the morning's first issuance. So the Cloudflare token and the propagation path were
+  proven earlier that day but not by this run, and the October renewal — past the
+  authorization's lifetime — will be the first to re-exercise them unattended.
+
+  Two findings about the tool rather than the design. lego v5 has **no `renew`
+  subcommand** — `run` does both, so the obvious spelling fails on every invocation. And
+  `run` against an existing certificate **exits 0 having issued nothing** when renewal is
+  not due, which is correct for a cron job and is exactly the silent no-op that made a
+  staging leaf look like a successful production issuance. The script therefore compares
+  the serial before and after and treats "unchanged" as "nothing to reload" rather than
+  as success. Note also that `run` sleeps a random interval before renewing, to spread
+  load across the CA — harmless from cron, surprising when run by hand.
 
   **Mosquitto's `SIGHUP` still has no answer under Kubernetes.** cert-manager and the
   kubelet cover Traefik and MediaMTX there; nothing in the manifests signals Mosquitto,
