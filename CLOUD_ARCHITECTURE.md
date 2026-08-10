@@ -3141,8 +3141,41 @@ paragraph expires.**
   it (§11.3).
 - **Object-storage tenancy stops being a recorder-only question** and needs deciding
   once, for both rasters and recordings (§11.5).
-- **Per-tenant configuration needs the same tenancy tests the credential side already
-  has [open].** §9's flight-history work was checked by *breaking* it — deleting the
-  `user_id` filter and confirming 10 assertions fail. Nothing here is trustworthy until
-  the equivalent exists: another tenant's camera profile, geofence and DEM must all be
-  unreachable, and the test must be shown to fail when the filter is removed.
+- **Per-tenant configuration now has the same falsification the credential side has
+  [built, 2026-08-10].** This entry used to say nothing here was trustworthy until the
+  tests had been shown to fail. They have been.
+
+  `UserDirectory` enforces ownership with `user_id=user_id` inside the query that
+  selects the row, in **ten places** across geofences and camera profiles. Each was
+  removed and the suites re-run, one path at a time rather than all at once — because
+  stripping all ten makes the first breach destroy the fixtures the later assertions
+  need, and the resulting crash tells you less than a clean count does.
+
+  | Path stripped | `test_geofence` | `test_camera` |
+  | --- | --- | --- |
+  | Assignment (`create_stream`, `update_stream`) | 6 fail | 4 fail |
+  | Update (`update_geofence`, `update_drone`) | 7 fail — 36/43 | 7 fail — 34/41 |
+  | Delete (`delete_geofence`, `delete_drone`) | 1 fail | 2 fail |
+
+  Baseline is 43/43 and 41/41. **Every one of the ten predicates is guarded by at least
+  one assertion that fails without it**, which is the property §9's history work
+  established for the credential side and this section was written to demand.
+
+  Two things the exercise turned up that reading the tests would not have.
+
+  **Two of the three paths crash rather than failing cleanly.** When the delete filter
+  goes, the other tenant's delete *succeeds* — so the row is genuinely gone and every
+  later assertion that expects it raises instead of failing. The signal is loud, and it
+  is honest about severity: cross-tenant destruction, not merely cross-tenant reads. But
+  it truncates the run, so somebody testing only that case sees "1 FAIL" and does not
+  learn the suite stopped. The suites are order-dependent on their own fixtures.
+
+  **The failures reach further than ownership.** Removing an ownership filter also fails
+  the *snapshot* assertions — "does NOT change the flight already recorded", "two
+  tenants' flights carry two different fences" — because a tenant able to edit another's
+  boundary also changes what that tenant's next flight is judged against. The two
+  properties §11.2 and §11.3 describe separately are entangled in practice, which is an
+  argument for both rather than a defect in either.
+
+  **Still not covered: the DEM**, which this entry also asked for. There is no DEM
+  ownership path to break, because §11.4's per-tenant raster is not built.
