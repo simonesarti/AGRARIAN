@@ -1462,6 +1462,52 @@ billing).
 
 ### Built and tested
 
+- **Cursor paging over a flight's alerts** (§4, 2026-08-10). The detail page used to
+  show the newest fifty and label the truncation honestly, with no way past it. It now
+  pages by `alerts_before`, an `alert_id` cursor, in the same keyset scheme
+  `flight_history` already used for flights — `next_alerts_before` in the response,
+  an *Older* link in the page, and the unparameterised URL as the way back.
+
+  **The argument for a cursor is stronger here than it was for flights.** History's
+  case against `OFFSET` is that a flight taking off mid-browse shifts every later row
+  down by one. Alerts arrive *while the flight is in the air*, at up to one a second,
+  so that race is not an unlucky interleaving — it is the normal case for anyone
+  reading the alerts of a flight that has not landed.
+
+  `tests/comms/test_alert_paging.py` — **10 assertions**, SQLite, no stack — walks
+  every page and asserts each alert is reached exactly once. **The control is what
+  makes that a fact**: the same rows paged with `OFFSET` while one alert arrives
+  between reads repeats a row, and the cursor over the identical data does not.
+  Also pinned: `alert_total` stays the whole flight rather than the page, a flight of
+  exactly one page offers no *Older* link (the extra row fetched is what decides
+  that), and the new parameter changes nothing about tenancy — another tenant gets
+  `None` with or without a cursor.
+
+  Driven end to end afterwards against the running stack, not only in SQLite: 57
+  alerts through db-writer's own route, then the rendered page over HTTPS. Page one
+  shows 50 with an *Older* link at `alerts_before=8`; page two shows 7, offers
+  *← Newest* and no *Older*. Ids `57..8` then `7..1` — no overlap, no gap.
+- **`scripts/check_certs.sh`, and both certificate jobs on cron** (§7, 2026-08-10).
+  `renew_certs.sh` checks the serial actually being served, but only when renewal
+  runs; between renewals nothing looked. The monitor asks each of the four listeners
+  daily what it is serving, validates the chain against the **system** trust store
+  with no `--cacert`, verifies the name, and reports days remaining.
+
+  **It asks the listener, never the file**, and that distinction is the whole point:
+  §7 measured that Traefik does not reload a replaced leaf on its own and Mosquitto
+  needs `SIGHUP`, so a correct certificate on disk and a stale one in a running
+  process look identical from the filesystem. It also compares all four serials and
+  reports a mismatch, which is exactly what a missed reload looks like.
+
+  Confirmed non-vacuous in all three directions rather than only observed passing: a
+  wrong name gives `INVALID` and exit **2**, a warn threshold above the remaining life
+  gives `DUE` and exit **1**, a stopped Mosquitto gives `NO ANSWER` and exit 1, and
+  the healthy stack gives exit **0**. The exit codes were checked directly — the first
+  attempt measured `tail`'s status through a pipe and read 0 for everything.
+
+  Both cron lines were run under `env -i` with a minimal `PATH` before being trusted.
+  The first draft of the renewal line had **no `cd`**, which would have failed on
+  every firing since cron starts in `$HOME` and every path here is repo-relative.
 - **A publicly trusted wildcard certificate, issued with no deployment to point it at**
   (§7, 2026-08-09). `agrarianlivestock.com` registered at Cloudflare, and a Let's
   Encrypt leaf covering the apex and `*.agrarianlivestock.com` obtained over DNS-01
@@ -2235,12 +2281,8 @@ translation work.
   infrastructure** — a stale loopback entry outliving the dev stack means the name
   resolves, something answers, and it is the wrong thing. Same class as the negative DNS
   cache that stalled the first ACME run, in the opposite direction.
-- **Nothing re-checks the certificate end to end.** `scripts/renew_certs.sh` verifies the
-  serial actually being served on a fresh connection to all three terminators, which is
-  the check that matters — but it only runs when renewal runs. Between renewals nothing
-  would notice an expired or mismatched leaf, and the first report would be a browser
-  warning or a drone that will not connect. `run_cert_renewal.sh` covers the reload
-  behaviour and not the live deployment.
+- **Nothing re-checks the certificate between renewals — [closed 2026-08-10].**
+  `scripts/check_certs.sh` asks the listeners daily from cron. See *Built and tested*.
 - **Upgrades of MediaMTX are now a deliberate act.** The image is pinned to
   `1.19.3-ffmpeg` rather than tracking `latest-ffmpeg`, which is what stops a default
   changing underneath this stack the way SRT and MoQ did in v1.19 (§4). The cost is the
@@ -2306,13 +2348,12 @@ translation work.
   db-writer minting pre-signed URLs, which is a small feature and a real decision about
   which service owns storage credentials. Neither is a history feature, which is why
   this is here and not in what was built.
-- **A flight's alert list stops at fifty.** The detail page shows the most recent page
-  and says how many there are, so a truncated list never passes for a whole one, but
-  there is no *older alerts* control the way there is for flights. The cursor paging is
-  already written one layer down; this is the same pattern applied a second time, and it
-  waits for someone to actually hit the ceiling.
+- **A flight's alert list is no longer capped — [closed 2026-08-10].** See
+  *Built and tested*; the cursor paging pattern was applied a second time.
 - Recorder per-tenant upload prefixes
-- **The renewal hook is written and has been run for real; nothing schedules it yet.**
+- **The renewal hook is written, has been run for real, and is now scheduled**
+  (weekly renewal at 03:00 Monday, daily check at 06:30, both `cd`-ing into the repo
+  because cron runs from `$HOME`).
   `scripts/renew_certs.sh` renews and then does the three different things the three
   terminators need — `touch` Traefik's watched directory, `SIGHUP` Mosquitto, and
   deliberately nothing to MediaMTX, which rereads per handshake and dies on `SIGHUP`.

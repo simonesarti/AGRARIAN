@@ -63,7 +63,7 @@
   <div class="cardhead">
     <h2>Alerts</h2>
     {% if flight.alert_total > alerts_shown %}
-      <span class="muted small">showing the {{ alerts_shown }} most recent of {{ flight.alert_total }}</span>
+      <span class="muted small">showing {{ alerts_shown }} of {{ flight.alert_total }}</span>
     {% endif %}
   </div>
 
@@ -87,8 +87,25 @@
     </li>
     {% endfor %}
   </ul>
+
+  {# Same shape as history.html's pager, and for the same reason: an "older" link
+     is a URL rather than a position this process remembers for somebody. There is
+     no page number — the cursor runs one way, and the way back is the
+     unparameterised page. #}
+  <div class="row pager">
+    {% if alerts_paged %}<a href="/flights/{{ flight.flight_id }}">← Newest</a>{% endif %}
+    {% if next_alerts_before %}
+      <a href="/flights/{{ flight.flight_id }}?alerts_before={{ next_alerts_before }}">Older →</a>
+    {% endif %}
+  </div>
   {% else %}
-    <p class="empty">No alerts were raised on this flight.</p>
+    <p class="empty">
+      {% if alerts_paged %}
+        Nothing older to show. <a href="/flights/{{ flight.flight_id }}">Back to the newest alerts</a>
+      {% else %}
+        No alerts were raised on this flight.
+      {% endif %}
+    </p>
   {% endif %}
 </div>
 {% endblock %}

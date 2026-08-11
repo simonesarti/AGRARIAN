@@ -1528,11 +1528,24 @@ class UserDirectory:
             .all()
         )
 
-    def flight_detail(self, flight_id: int, user_id: int) -> Optional[dict]:
+    def flight_detail(self, flight_id: int, user_id: int,
+                      alerts_before: Optional[int] = None) -> Optional[dict]:
         """
-        One of this user's flights, with its recordings and its most recent
+        One of this user's flights, with its recordings and a page of its
         alerts. None if the flight does not exist OR belongs to someone else —
         the caller cannot tell which, and must not be able to.
+
+        **Alerts page by cursor, exactly as flight_history() does.** `alerts_before`
+        is an alert_id and the page is everything below it; the response carries
+        `next_alerts_before` for the following page, or None at the end. The
+        reasoning is flight_history's verbatim and is not restated here beyond the
+        one difference that matters: alerts arrive *while a flight is in the air*,
+        so a viewer reading page 1 of a live flight is exactly the case OFFSET gets
+        wrong, and it is more likely here than in a list of past flights.
+
+        alert_id descending for the same reason flight_history orders by flight_id:
+        `datetime` has no unique constraint, and two alerts written in the same tick
+        would have no defined order between them for a page boundary to land on.
 
         Alert IMAGE BYTES are deliberately absent. A flight with two hundred
         alerts holds two hundred JPEGs, and inlining them would make one page
@@ -1577,19 +1590,30 @@ class UserDirectory:
             # Named columns, not the mapped entity: image_data must not be in
             # this result set. Whether a crop exists is answered by the database
             # as a boolean, so the bytes never leave it.
-            alerts = (session.query(
-                          Alert.alert_id,
-                          Alert.alert_msg,
-                          Alert.frame_id,
-                          Alert.datetime,
-                          Alert.image_width,
-                          Alert.image_height,
-                          Alert.image_data.isnot(None).label("has_image"),
-                      )
-                      .filter(Alert.flight_id == flight_id)
-                      .order_by(Alert.alert_id.desc())
-                      .limit(FLIGHT_ALERTS_PAGE_SIZE)
-                      .all())
+            alert_query = (session.query(
+                               Alert.alert_id,
+                               Alert.alert_msg,
+                               Alert.frame_id,
+                               Alert.datetime,
+                               Alert.image_width,
+                               Alert.image_height,
+                               Alert.image_data.isnot(None).label("has_image"),
+                           )
+                           .filter(Alert.flight_id == flight_id))
+            if alerts_before is not None:
+                alert_query = alert_query.filter(Alert.alert_id < int(alerts_before))
+
+            # One more than the page, so the extra row is what says whether an
+            # "older" link should exist at all. Same trick as flight_history: a full
+            # last page that still offers a link leads to an empty page, which reads
+            # as a bug rather than as the end.
+            alert_rows = (alert_query
+                          .order_by(Alert.alert_id.desc())
+                          .limit(FLIGHT_ALERTS_PAGE_SIZE + 1)
+                          .all())
+            has_more = len(alert_rows) > FLIGHT_ALERTS_PAGE_SIZE
+            alerts = alert_rows[:FLIGHT_ALERTS_PAGE_SIZE]
+            next_alerts_before = alerts[-1].alert_id if (has_more and alerts) else None
 
             recordings = (session.query(Recording)
                           .filter(Recording.flight_id == flight_id)
@@ -1603,6 +1627,10 @@ class UserDirectory:
                 "start_time": flight.start_time,
                 "end_time": flight.end_time,
                 "alert_total": alert_total,
+                # The cursor for the next (older) page, or None at the end. Named
+                # to match flight_history's next_before rather than inventing a
+                # second spelling for the same idea.
+                "next_alerts_before": next_alerts_before,
                 "alerts": [
                     {
                         "alert_id": a.alert_id,

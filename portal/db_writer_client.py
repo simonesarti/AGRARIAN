@@ -206,9 +206,18 @@ class DbWriterClient:
         return await self._call("GET", "/flights/history" + (f"?{query}" if query else ""),
                                 token=token)
 
-    async def flight_detail(self, token: str, flight_id: int) -> dict:
-        """One flight, its recordings, and a page of its alerts — without images."""
-        return await self._call("GET", f"/flights/{flight_id}", token=token)
+    async def flight_detail(self, token: str, flight_id: int,
+                            alerts_before: Optional[int] = None) -> dict:
+        """
+        One flight, its recordings, and a page of its alerts — without images.
+
+        `alerts_before` is an alert_id cursor; the response carries
+        next_alerts_before for the next (older) page.
+        """
+        path = f"/flights/{flight_id}"
+        if alerts_before is not None:
+            path += f"?alerts_before={int(alerts_before)}"
+        return await self._call("GET", path, token=token)
 
     async def alert_image(self, token: str, flight_id: int, alert_id: int) -> bytes:
         """

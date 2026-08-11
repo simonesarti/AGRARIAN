@@ -732,9 +732,16 @@ def flight_history(
 
 
 @app.get("/flights/{flight_id}")
-def flight_detail(flight_id: int, authorization: Optional[str] = Header(default=None)):
+def flight_detail(flight_id: int,
+                  alerts_before: Optional[int] = None,
+                  authorization: Optional[str] = Header(default=None)):
     """
-    One flight: when it flew, what it recorded, and its most recent alerts.
+    One flight: when it flew, what it recorded, and a page of its alerts.
+
+    `alerts_before` is an alert_id cursor, the same keyset scheme /flights/history
+    uses for flights. The response carries next_alerts_before for the next page.
+    A cursor naming another flight's alert simply matches nothing: the query is
+    already filtered to this flight, which is itself filtered to this user.
 
     404 for a flight belonging to another user, identical to the 404 for one
     that does not exist. flight_ids are sequential, so a distinguishable
@@ -747,7 +754,7 @@ def flight_detail(flight_id: int, authorization: Optional[str] = Header(default=
     rather than one enormous one it cannot.
     """
     user_id = _require_session(authorization)
-    detail = _directory.flight_detail(flight_id, user_id)
+    detail = _directory.flight_detail(flight_id, user_id, alerts_before=alerts_before)
     if detail is None:
         raise HTTPException(status_code=404, detail="Flight not found")
     return detail

@@ -899,9 +899,15 @@ async def history_page(
 
 
 @app.get("/flights/{flight_id}", response_class=HTMLResponse)
-async def flight_page(request: Request, flight_id: int):
+async def flight_page(request: Request, flight_id: int,
+                      alerts_before: Optional[int] = None):
     """
     One flight: what it recorded, and the alerts it raised.
+
+    Alerts page by cursor in the query string, the same shape /history uses for
+    flights — an "older" link is a URL, not a position this process is
+    remembering on somebody's behalf. That statelessness is the same property the
+    signed session cookie buys, applied one level down.
 
     A 404 from db-writer means "not yours or not there", and the global handler
     renders it as a plain error page — the two are not distinguished here
@@ -912,16 +918,22 @@ async def flight_page(request: Request, flight_id: int):
         return _redirect("/login")
 
     me = await _db.whoami(token)
-    flight = await _db.flight_detail(token, flight_id)
+    flight = await _db.flight_detail(token, flight_id, alerts_before=alerts_before)
 
     return templates.TemplateResponse(
         request, "flight.html",
         {
             "email": me.get("email"),
             "flight": _history_row(flight),
-            # The list is capped, so the page has to be able to say so rather
+            # The list is one page, so the page has to be able to say so rather
             # than presenting a page of alerts as the whole flight.
             "alerts_shown": len(flight["alerts"]),
+            # Cursor for the next (older) page, None at the end — which is what
+            # decides whether an "Older" link is rendered at all.
+            "next_alerts_before": flight.get("next_alerts_before"),
+            # Whether this is a later page, so the first can be linked back to
+            # without keeping a stack of cursors. Mirrors /history's `paged`.
+            "alerts_paged": alerts_before is not None,
         })
 
 
