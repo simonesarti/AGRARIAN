@@ -5,11 +5,11 @@
 different design (one MediaMTX, Mosquitto, ws-server and Traefik *per user session*)
 and is no longer the direction. Nothing in that document should be treated as current.
 
-Sections are marked with their implementation state:
-
-- **[built]** — implemented and tested on this branch
-- **[designed]** — decided, specified here, not yet written
-- **[open]** — not yet decided
+**How to read this.** Sections 1–8 describe the system as it runs today; anything in
+them that is *not* built says so in place. Section 9 is the current state — what backs
+each claim, known weaknesses, open questions, and what to do next. Sections 10 and 11
+are decided direction rather than description: 10 is unbuilt, 11 is mostly built and
+carries its own split at the top.
 
 ---
 
@@ -125,7 +125,7 @@ when nothing is flying** — but that is exactly when people register, add strea
 rotate keys. A drone flies at 10am; the account was created at 11pm the night before.
 An app-tier portal would exist only while a drone was airborne, which inverts its purpose.
 
-### Platform: Kubernetes **[built]**
+### Platform: Kubernetes
 
 The target is **managed Kubernetes** (AKS/EKS/GKE — not self-hosted; self-managing etcd is
 not where a small team should spend attention). The compose stack on a single host remains
@@ -161,7 +161,7 @@ two deployment models to operate at once — worse than either alone. This const
 non-obvious and eliminates the option that otherwise looks best for a small team, so it is
 recorded here rather than rediscovered later.
 
-#### Migration is mechanical, with two real changes **[built]**
+#### Migration is mechanical, with two real changes
 
 Every hub service already has a Dockerfile and takes configuration from environment
 variables, so compose services convert to Deployments directly. This section predicted
@@ -193,6 +193,20 @@ platform it finally is one. The `runOnRecordSegmentComplete` hook still points a
 `http://recorder:8000`, resolved by a Service that selects the same pod, so one
 `mediamtx.yaml` serves both deployments.
 
+**Two kustomize defects were found by deploying, and neither is visible by reading.**
+Both are recorded here rather than in a changelog because both would recur for anyone
+editing `configs/kustomization.yaml`:
+
+- **The `namespace:` transformer rewrites `Namespace` objects themselves**, collapsing
+  `agrarian-flights` into `agrarian` — which would have given the orchestrator's Role
+  authority over Jobs in the namespace holding db-writer, Redis and Mosquitto, undoing
+  the entire argument of `orchestrator-rbac.yaml`. kustomize reports it as an "ID
+  conflict", which does not sound like what it is. There is now no global namespace
+  transformer; every manifest names its own.
+- **A `configMapGenerator` without an explicit namespace generates into `default` *and*
+  silently declines to stamp its content hash into the references.** The build succeeds
+  and every mount dangles, surfacing only as pods stuck in `ContainerCreating`.
+
 Kubernetes does **not** reverse-proxy anything itself: `Ingress` and the Gateway API are
 interfaces, and a controller has to be installed to implement them. That controller is
 Traefik here, and it is the same Traefik the compose stack already runs, which is why the
@@ -203,7 +217,7 @@ Managed Kubernetes also brings cert-manager, which is what closes the TLS item i
 all three terminators at once: Traefik for the HTTP family, and Secrets mounted by
 MediaMTX and Mosquitto for the protocols they terminate themselves.
 
-#### Build the orchestrator against an interface, not a cluster **[built]**
+#### Build the orchestrator against an interface, not a cluster
 
 The orchestrator targets a three-method abstraction:
 
@@ -252,7 +266,7 @@ memory-backed `emptyDir` mounted at `/dev/shm`, sized with a *quantity* (`256Mi`
 `APP_SHM_SIZE` is kept, written in Docker's spelling, and translated. A pod without the
 volume gets 64 MB, which the test measures as a control.
 
-##### The service account is the point **[verified]**
+##### The service account is the point
 
 The strongest standing argument for this backend was never scheduling — it was that the
 Docker one holds `/var/run/docker.sock`, which is root on the host. `configs/k8s/orchestrator-rbac.yaml`
@@ -289,7 +303,7 @@ this container may write to flight 7, this browser tab may watch flight 7. None 
 answers *"this person owns account 3"*, which is the only question the portal ever asks.
 That gap is why a fourth type exists rather than reusing the viewer token.
 
-### Stream keys **[built]**
+### Stream keys
 
 The operator types the ingest URL into the drone controller before every flight. That
 single constraint determines the design: the credential must be short enough to type
@@ -320,7 +334,7 @@ every viewer.
 The residual cost is that the key appears in MediaMTX access logs. Revocability is what
 covers that.
 
-### Viewer tokens **[built]**
+### Viewer tokens
 
 A short-lived JWT (HS256), minted by db-writer, naming exactly one `flight_id`. Obtained
 from `POST /viewer/token` by presenting a **session token** — a deliberate credential
@@ -346,7 +360,7 @@ carry headers.
 `flight_id` is an autoincrement primary key and therefore guessable. **The signature, not
 the identifier, carries authority.** No identifier in this system is ever a credential.
 
-### Publisher tokens **[built]**
+### Publisher tokens
 
 An app container presents a **per-flight JWT**, minted by db-writer when the flight opens
 and returned once from `/flight/open`, the endpoint the orchestrator calls with the
@@ -364,7 +378,7 @@ claim** (`view` / `publish`) that is checked on every path. That check is load-b
 without it a viewer token would be a valid publisher token for the flight being watched,
 letting anyone with read access inject alerts into it.
 
-### Session tokens **[built]**
+### Session tokens
 
 The portal's credential, and the third value of the same `scope` claim: `session`. Where
 a viewer token says *"bearer may watch flight 7"*, a session token says *"bearer is user
@@ -417,12 +431,13 @@ invented alongside it.
 It is the shortest-lived of the three (8 h, against the viewer token's 12) because it is
 the most powerful and there is no refresh: it is the whole session.
 
-### Registration is open **[built]**
+### Registration is open
 
 Anyone may create an account. The consequence to keep in view: an account can mint stream
 keys, and a stream key is the thing that causes a GPU container to be created. Open
 registration therefore connects an anonymous signup to GPU spend, and the limit on that
-is **concurrent flights per user**, which nothing enforces yet — see §9.
+is **concurrent flights per user**; `MAX_STREAMS_PER_USER` bounds concurrency but
+not duration, which is the quota question in §9.
 
 `UserDirectory.create_user` is the only way an account comes into existence, including
 from `rebuild_schema.py --seed-user`, which used to build the rows itself. A seeded
@@ -458,17 +473,17 @@ until it bites:
 > they do **not** mean a copy of that service exists per flight. Exactly one row in this
 > table is instanced per flight.
 
-| Component | Instances | Tenancy mechanism | State |
-| --- | --- | --- | --- |
-| **GPU app** | **One per active flight** | Sole occupant — no internal tenancy needed | container **[built]**, lifecycle **[built]**, paths **[verified]** against a real GPU in **both** modes |
-| MediaMTX | Shared, replicated on load | Regex paths + HTTP auth hook | **[built]** |
-| Mosquitto | Shared, replicated on load | Per-stream credentials + topic ACLs | **[built]** |
-| ws-server | Shared, replicated on load | Per-flight JWT (view + publish scopes); Redis pub/sub fan-out | **[built]** |
-| db-writer | Shared, replicated on load | Stateless per request; bcrypt user auth | **[built]** |
-| Redis | Shared | Channel per flight (`flight:{id}`); rate-limit counters on db 1 | **[built]** |
-| Recorder | Shared | Segment → flight_id resolved via `recordings` table; `tenants/<user_id>/…` key prefix | **[built]** |
-| Orchestrator | Shared | Spawns/stops app containers | **[built]** |
-| Portal | Shared, replicated on load | Session token → `user_id`, read from the claim not the URL | **[built]** |
+| Component | Instances | Tenancy mechanism |
+| --- | --- | --- |
+| **GPU app** | **One per active flight** | Sole occupant — no internal tenancy needed |
+| MediaMTX | Shared, replicated on load | Regex paths + HTTP auth hook |
+| Mosquitto | Shared, replicated on load | Per-stream credentials + topic ACLs |
+| ws-server | Shared, replicated on load | Per-flight JWT (view + publish scopes); Redis pub/sub fan-out |
+| db-writer | Shared, replicated on load | Stateless per request; bcrypt user auth |
+| Redis | Shared | Channel per flight (`flight:{id}`); rate-limit counters on db 1 |
+| Recorder | Shared | Segment → flight_id resolved via `recordings` table; `tenants/<user_id>/…` key prefix |
+| Orchestrator | Shared | Spawns/stops app containers |
+| Portal | Shared, replicated on load | Session token → `user_id`, read from the claim not the URL |
 
 A single MediaMTX serves every drone publishing and every viewer watching; a single
 Mosquitto carries every publisher's telemetry. They are separated by path regex, credentials
@@ -480,7 +495,7 @@ and ACLs — not by having one broker each.
 > keep database latency off the caller's hot path — and it is flight-agnostic, so a
 > replica accepts alerts for flights it has never seen.
 
-### ws-server **[built]**
+### ws-server
 
 Previously broadcast every alert — including the JPEG and position — to every connected
 client. Now maintains a per-flight session map, and because horizontal replicas cannot
@@ -490,7 +505,7 @@ Replicas **subscribe selectively** to the flights they actually have viewers for
 than pattern-subscribing to everything. With base64 JPEGs in the payload, pattern
 subscription would ship every tenant's imagery to every replica.
 
-#### Redis failure behaviour **[verified]**
+#### Redis failure behaviour
 
 Tested against two live replicas with a viewer connected throughout — first a fast restart,
 then a sustained full outage (Redis stopped, ~15 s down, restarted).
@@ -517,7 +532,7 @@ alert carries its timestamp.
 Two ports, and the separation is a security boundary: the WebSocket port is proxied
 externally; the alert-write API port must never be routed from outside the cluster.
 
-### MediaMTX **[built]**
+### MediaMTX
 
 MediaMTX's built-in `authInternalUsers` is a **static list in the config file**. That does
 not survive user 101 arriving while 100 people are streaming. The fix is to give MediaMTX
@@ -597,11 +612,24 @@ to `?cookieCheck=1` and only the followed request reaches the auth hook. Any cli
 test — that does not follow redirects and keep cookies sees 302 for everything and never
 learns whether it was authorised.
 
+**MediaMTX's own reader page cannot be used, and this is not a configuration problem.**
+`GET /<path>/` answers **401 with `WWW-Authenticate: Basic` and never calls
+`/auth/mediamtx` at all** — not for `?jwt=`, `?token=`, `?user=&pass=`, `Authorization:
+Bearer`, or HTTP Basic. That page is gated behind the internal user roster which
+`authMethod: http` replaced, so no credential this system can mint would ever open it.
+The watch page therefore negotiates WHEP itself against a `<video>` element; the media
+path is still browser-to-MediaMTX DTLS-SRTP and only the signalling moved. Embedding
+that page again is the one thing that must never quietly come back.
+
+**WHEP checks the content type before the credential**, so a POST without
+`application/sdp` is refused before the hook is consulted — a 400 that looks like an
+authorisation result and is not.
+
 **Auth and spawn are separate events.** The auth hook fires on every connection attempt,
 including aborted and retried ones. Spawning GPU containers from it would spawn them for
 drones that never stream. The spawn belongs on `runOnAvailable`.
 
-#### The image tag is load-bearing **[built]**
+#### The image tag is load-bearing
 
 The stack must run **`bluenviron/mediamtx:latest-ffmpeg`**, and not for ffmpeg.
 
@@ -617,12 +645,12 @@ MediaMTX logs that at INF and carries on. **This is why recordings were never up
 `runOnRecordSegmentComplete` pointed at the recorder sidecar from the start but never
 once fired until this was found. The `-ffmpeg` tag is Alpine based and supplies busybox
 `wget`, which posts `application/x-www-form-urlencoded` — the encoding the orchestrator's
-`Form(...)` endpoints expect. Fixed and verified end to end — see §9.
+`Form(...)` endpoints expect. Fixed, and covered by `run_recording_upload.sh`.
 
 The same constraint rules out shell syntax in any hook: no pipes, no `&&`, no redirects.
 `-O /dev/null` is an argument, which is why it works.
 
-### Mosquitto **[built]**
+### Mosquitto
 
 Was `allow_anonymous true` with no ACLs, and every telemetry topic flat
 (`telemetry/latitude`) with no per-flight scoping at all — so two concurrently active
@@ -644,7 +672,7 @@ reuses its existing publisher token to subscribe, the same token already authori
 video ingest read, the annotated-output publish, and writing alerts. See §9 for what was
 verified and the caveat that the upstream plugin project is now archived.
 
-### Portal **[built]**
+### Portal
 
 "The portal" is two things that land in different places, and conflating them is the
 easiest way to get this wrong:
@@ -679,7 +707,7 @@ returns exactly what `/viewer/token` disambiguates over, deliberately — the pa
 offers the button and the call that authorises pressing it must agree on what is active,
 and two different queries would eventually disagree.
 
-#### The read side: flight history **[built]**
+#### The read side: flight history
 
 Three more routes answer what *has* flown, which is a different question from what is
 flying and is deliberately not served by the same query:
@@ -779,7 +807,7 @@ in both directions: Jinja autoescaping server-side, `textContent` rather than `i
 in the alert renderer. A label is the one field a tenant controls that the portal renders
 back to them.
 
-#### Rate limiting the two anonymous endpoints **[built]**
+#### Rate limiting the two anonymous endpoints
 
 `/login` and `/register` are the only endpoints in the system that anyone on the internet
 can reach without a credential — and they cannot be given one, since a sign-in form is
@@ -913,12 +941,12 @@ Strictly linear. A flight carries **no `user_id`** — the owner is reached thro
 `streams.user_id`. A redundant column could contradict the stream's, and nothing in
 the schema would say which one was authoritative.
 
-| Table | Key columns | Notes |
-| --- | --- | --- |
-| `users` | `user_id` PK, `email`, `password` (bcrypt) | **[built]** |
-| `streams` | `stream_id` PK, `user_id` FK, `stream_key` unique, `label`, `revoked_at` | **[built]**, capped per user (§4) |
-| `flights` | `flight_id` PK, `stream_id` FK (NOT NULL), `public_uuid` unique, `output_path`, `end_time` | **[built]** |
-| `alerts` | `alert_id` PK, `flight_id` FK, JPEG, dimensions, timestamps | **[built]** |
+| Table | Key columns |
+| --- | --- |
+| `users` | `user_id` PK, `email`, `password` (bcrypt) |
+| `streams` | `stream_id` PK, `user_id` FK, `stream_key` unique, `label`, `revoked_at` — capped per user (§4) |
+| `flights` | `flight_id` PK, `stream_id` FK (NOT NULL), `public_uuid` unique, `output_path`, `end_time` |
+| `alerts` | `alert_id` PK, `flight_id` FK, JPEG, dimensions, timestamps |
 
 `flight` is the tenancy unit throughout — it scopes alert rows, WebSocket delivery, Redis
 channels and the output path. One user running two feeds at the same time holds two
@@ -958,17 +986,17 @@ existing ones.
 
 ## 6. Flight lifecycle
 
-**Every step is now [built], end to end.** Step 6 is verified against a real GPU in both
+**Every step runs, end to end.** Step 6 is verified against a real GPU in both
 modes, and step 7 now ends where it was always supposed to: a person signed in, pressed
 Watch, and saw the annotated video play in Chrome and in Firefox. Nothing in this
 lifecycle is unobserved any more — though that last step is a human's report on one
 afternoon rather than an assertion, and §9 says what it does and does not cover.
 
 1. User registers on the portal → row in `users`, and logs in for a session token.
-   Registration is open to anyone. **[built]** — the portal's `/register` and `/login`
+   Registration is open to anyone. — the portal's `/register` and `/login`
    pages over db-writer's routes of the same names.
 2. User adds a stream → row in `streams` with a generated `stream_key`. The portal
-   offers rotate and retire. **[built]** — `GET/POST /streams`, `/rotate`, `/revoke`
+   offers rotate and retire. — `GET/POST /streams`, `/rotate`, `/revoke`
    on db-writer, capped per user (§4), driven from the slots page.
    The key is *not* shown once and then hidden: `list_streams` returns it every time,
    because the operator has to retype the ingest URL before every flight.
@@ -986,7 +1014,7 @@ afternoon rather than an assertion, and §9 says what it does and does not cover
 7. Viewer opens the portal and — holding a session token from step 1 — calls
    `POST /viewer/token`, receiving a JWT scoped to that one flight, which it presents for
    the WebRTC/HLS read and the WebSocket connection alike. MediaMTX validates it through
-   the same auth endpoint with `action: "read"`. **[built]** — the watch page fetches it
+   the same auth endpoint with `action: "read"`. — the watch page fetches it
    at load; with more than one flight active the call must name a `stream_id` rather than
    being guessed for.
 8. Publisher disconnects. `runOnUnavailable` → container stopped, `end_time` stamped.
@@ -997,7 +1025,7 @@ container that processes untrusted video. The orchestrator now opens the flight 
 injects only the result — which also removes the "DB session start failed → abort the
 run" coupling, since the app no longer authenticates anyone.
 
-### A dropped stream is not usually a finished flight **[built]**
+### A dropped stream is not usually a finished flight
 
 MediaMTX fires `runOnUnavailable` the instant a publisher disconnects, and it reports a
 momentary radio glitch exactly the way it reports a landing. Tearing down immediately
@@ -1047,7 +1075,7 @@ prints its URL — before this, the `rtmps://…:1936` address on the slots page
 listener that was not running, so the only ingest URL the product ever showed an
 operator was one nothing would answer.
 
-### TLS termination **[built]**
+### TLS termination
 
 Two layers, split by protocol.
 
@@ -1129,78 +1157,54 @@ Two consequences of self-termination that are easy to meet by surprise:
   rather than from a setting, because neither MediaMTX nor Mosquitto exposes one that
   works. Mosquitto's `tls_version` is deliberately left unset: in this build it caps
   the version rather than flooring it, so setting `tlsv1.2` would refuse the 1.3
-  clients it should prefer and admit nothing new below. Measured rather than assumed —
-  see §9.
+  clients it should prefer and admit nothing new below. Measured rather than assumed,
+  in `run_ingress_tls.sh` — with an OpenSSL old enough to still offer TLS 1.1, because
+  modern curl refuses to *send* a 1.1 ClientHello and an assertion driving it measures
+  the client rather than the server.
 
-#### Certificates before a hostname exists **[built]**
+#### The certificate: one leaf, three terminators
 
-This section used to open by saying cert-manager could not issue anything until a name
-resolved here. **That was wrong, and the correction is worth stating precisely because
-it held up a step that turned out to take an afternoon.** Let's Encrypt will not issue
-for an IP address — that half is true, and `MEDIAMTX_HOST` held one. But a DNS-01
-challenge proves control of a **zone**, not of a host: the CA reads a TXT record at
-`_acme-challenge` and never connects to the deployment at all. The prerequisite was
-owning a domain and holding a DNS API credential, and neither of those says anything
-about where the stack runs or what any name resolves to.
+A real Let's Encrypt wildcard for `agrarianlivestock.com` and `*.agrarianlivestock.com`
+sits in `certificates/server/` as `server.crt`, `server.key` and `ca.crt`. All three
+terminators mount those files and none asks who signed them, which is the property that
+let the whole tier be built and measured against a local CA first.
 
-Building the tier against a local CA was still the right call, for the reason this
-section gave all along: all three terminators read a certificate and a key from disk
-and none of them knows who signed it. Public trust is only worth anything for a
-browser somebody else controls.
+**Issuance needed none of the infrastructure it appeared to wait on.** Let's Encrypt
+will not issue for an IP address, and it is easy to read that as "nothing can be issued
+until a name resolves here" — which does not follow. A DNS-01 challenge proves control
+of a **zone**: the CA reads a TXT record at `_acme-challenge` and never connects to the
+deployment. The certificate was obtained with no cluster, no load balancer and no A
+record anywhere in the zone. What is genuinely required is a domain and a DNS API
+credential the issuer supports.
 
-`scripts/generate_local_certs.sh` therefore stood in for cert-manager — a local CA
-plus one wildcard leaf covering `<domain>`, `*.<domain>`, `localhost` and the host's
-own IP, since `MEDIAMTX_HOST` held one. One leaf serves all three
-terminators, and it is named `server.crt`/`server.key` because that is what
-`mosquitto.conf` already expected — which is now what it actually reads, along with
-MediaMTX and Traefik. The single-leaf choice was made before there was a second
-consumer and cost nothing when the second and third arrived.
+Four things about the handover are load-bearing:
 
-**It has not been retired and should not be.** Every test runner that mounts the real
-`mediamtx.yaml` or `mosquitto.conf` issues a throwaway leaf from it, into a temporary
-directory rather than `certificates/` — which is what keeps the suites independent of
-whatever real certificate happens to be on the machine, and what stops a public leaf's
-private key being handed to a container in a test.
+- **It is a three-file copy.** `mosquitto.conf` names `ca.crt` as its `cafile`, so
+  copying only the leaf and key leaves one terminator pointing at an intermediate
+  unrelated to the certificate beside it. `require_certificate false` means nothing
+  verifies against it, so the mismatch is silent — and it is not hypothetical: the
+  first renewal changed the intermediate from `YR2` to `YR1`.
+- **The leaf is RSA-2048 by choice.** ACME clients default to EC256, and taking that
+  default would change the key algorithm underneath all three terminators in the same
+  move that changes the issuer. One leaf also serves the drone-facing listeners, where
+  the TLS floor is 1.2 for old ground-station software, so the weakest client governs.
+- **The lifetime is 90 days, not the local CA's 397**, which turns renewal from a
+  document into a dated obligation. `scripts/renew_certs.sh` does it and does the three
+  different reloads below; `scripts/check_certs.sh` asks the listeners daily what they
+  are actually serving, because a correct file and a stale process are indistinguishable
+  from disk.
+- **The ACME block in `configs/traefik/traefik.yml` stays commented out.** Under
+  Kubernetes cert-manager owns issuance and writes the `agrarian-tls` Secret; under
+  compose the certificate arrives as a file from outside. Traefik's own ACME store is a
+  private `acme.json` it does not hand back, so it could only ever serve one of the
+  three terminators. Only the mount point was ever load-bearing.
 
-Two details are deliberate rather than convenient. The leaf lasts **397 days**, the
-browser maximum, rather than the decade a throwaway local certificate usually gets: a
-certificate that never expires is a way to never discover the renewal problem. And
-`--renew-leaf` reissues against the same CA without touching it, which is exactly the
-file swap that question needed — the CA stays installed in whatever trust store already
-has it. That is what `run_cert_renewal.sh` drives, and the question is now answered
-rather than open; see below.
+`scripts/generate_local_certs.sh` is **not retired**: every test runner that mounts the
+real `mediamtx.yaml` or `mosquitto.conf` issues a throwaway leaf from it into a
+temporary directory, which keeps the suites independent of whatever real certificate is
+on the machine and stops a public leaf's private key reaching a test container.
 
-#### The real leaf, and what the handover actually cost **[built]**
-
-`agrarianlivestock.com` was registered on **2026-08-09** and a Let's Encrypt wildcard
-covering `agrarianlivestock.com` and `*.agrarianlivestock.com` was issued the same day
-over DNS-01 against Cloudflare's API — with no cluster, no load balancer, and no A
-record anywhere in the zone. It replaces the script's output in `certificates/server/`,
-and nothing else in the stack moved, which is the property that made building the tier
-before owning a domain worth doing.
-
-Three things came out of doing it that the plan above did not have:
-
-- **`ca.crt` is a third file, not an afterthought.** `mosquitto.conf` names it as
-  `cafile`, so copying only the leaf and its key would have left one terminator
-  pointing at a CA unrelated to the certificate beside it. The issuer certificate goes
-  there. `require_certificate false` means nothing verifies against it today, which is
-  exactly why the mismatch would have sat there unnoticed.
-- **The lifetime drops from 397 days to 90.** The renewal findings below stop being
-  documentation and become an operational requirement with a date on it. Under compose
-  the ACME client's `--deploy-hook` is where all three reload actions belong.
-- **The leaf is RSA-2048 by choice.** Current ACME clients default to EC256, and taking
-  that default would have changed the key algorithm underneath all three terminators in
-  the same move that changed the issuer. One leaf also serves the drone-facing
-  listeners, where the TLS floor is 1.2 for old ground-station software — so the
-  weakest client governs, and this was not the change to blend in.
-
-The ACME block at the foot of `configs/traefik/traefik.yml` stays commented out, and is
-now unlikely ever to be used: under Kubernetes cert-manager owns issuance and writes the
-`agrarian-tls` Secret, and under compose the certificate arrives as a file from outside.
-Only the mount point was ever load-bearing.
-
-#### Renewal: what each terminator does when the leaf changes **[verified]**
+#### Renewal: what each terminator does when the leaf changes
 
 A certificate on disk is only half an answer. cert-manager will replace that file
 every sixty days or so, and a service that does not reread it turns renewal into a
@@ -1329,7 +1333,7 @@ off it: the browser talks to the portal, the portal talks to db-writer over the 
 network (§4). Routing db-writer's user-facing endpoints directly to the browser would be
 simpler by one hop and would break this line.
 
-> - **[built]** The port constants in `app/shared/processes/constants.py` are corrected.
+> -  The port constants in `app/shared/processes/constants.py` are corrected.
 >   `RTMPS_PORT` and `RTSPS_PORT` now carry MediaMTX's actual defaults (1936, 8322)
 >   rather than 8443 and 441, and `HTTPS_PORT`/`WSS_PORT` are 443 rather than 8443,
 >   which is what this table says Traefik terminates and what removes the collision
@@ -1337,1145 +1341,148 @@ simpler by one hop and would break this line.
 >   ws-server's WebSocket listener (8765) and had nothing to do with HTTPS. None of
 >   these names is read by any code path today (the app reaches its services through
 >   `app_settings.py`), so this was latent throughout and is now simply correct.
-> - **[built]** SRT and MoQ are disabled explicitly in `mediamtx.yaml` — see §4.
+> -  SRT and MoQ are disabled explicitly in `mediamtx.yaml` — see §4.
 > - **[note]** compose publishes ws-server's alert-write API on host `8001` and db-writer
 >   on `8002`, which this section says must never be routed from outside. That is the
 >   interim laptop-app deployment described in §7, not the target topology.
 
 ---
 
-## 9. Outstanding work
-
-> Tests backing the claims below live in **`tests/comms/`**, with a README covering what
-> each one guards and how to run it. The shell runners stand up the required containers
-> and clean up after themselves. The host interpreter has none of the dependencies, so
-> everything runs in throwaway containers — except `run_mediamtx_auth.sh`, which needs
-> `ffmpeg` and `curl` on the host to drive real publishes and reads.
->
-> Every runner that mounts the real `mediamtx.yaml` or `mosquitto.conf` now issues a
-> throwaway certificate first, because both services terminate their own TLS and
-> MediaMTX will not start without one.
-
-### Where to pick up next
-
-The rest of this section is a ledger, ordered by subject rather than by urgency. This is the
-ordering — what to do next and why that one first. It is the entry point for anyone, human
-or otherwise, arriving without the history.
-
-**One ask with lead time, worth starting before anything else because it is not work
-and cannot be done from here:**
-
-1. **A DEM raster covering the operating area** (`dem/dem.tif`, `dem/dem_mask.tif`).
-   Slope and no-data analysis are skipped without it, so `danger_detection` runs
-   degraded everywhere here. The code itself is *not* the unknown — it was exercised
-   against a real raster during the app's development and worked (see *Known
-   weaknesses*). What a raster buys is a deployment that runs the full geo stage, and
-   the ability to write the regression coverage that cannot exist without one.
-
-**The hostname was the other ask on this list and it is closed** (2026-08-09).
-`agrarianlivestock.com` is registered, and a publicly trusted Let's Encrypt wildcard is
-already serving from `certificates/server/` — see §7. It left this list faster than it
-was expected to, for a reason worth carrying forward rather than filing away: **the
-blocker as written was not the blocker that existed.** This list said Let's Encrypt
-will not issue for an IP, which is true, and then treated that as "nothing can be
-issued until a name resolves to this deployment", which does not follow. DNS-01 proves
-control of a zone. Nothing had to resolve anywhere, and no cluster had to exist.
-
-**The ingress tier is finished, the product has been watched working in a browser, both
-`FlightRuntime` backends exist, the portal shows what has flown as well as what is
-flying, and the hub tier now has manifests that deploy on a real cluster.** Between them
-those closed every item that has stood at the top of this list.
-
-**There was no code item left here**, and that stopped being true when §10 was
-written. What this ledger describes is finished; §10 is a decided direction that
-changes the credential model, the flight lifecycle and the media tier's shape, and
-none of it is built. Read this section as the state of what exists and §10 as where
-it goes next.
-
-Setting §10 aside, what remains is the one ask above, plus the
-provider-specific values that only exist once a cluster does — a registry to push the
-five images to, a storage class if the default is not wanted, and the load-balancer
-addresses that `configs/k8s/endpoints.env` needs. None of those is work that can be
-done here.
-
-Two things the certificate work added rather than closed, both small and both dated:
-**a renewal hook is now due by 2026-10-08**, since a 90-day leaf replaced a 397-day one;
-and `MEDIA_PUBLIC_HOST` needs deciding against the Kubernetes topology before the first
-cluster, because the portal composes HLS and WHEP URLs from it on 8888/8889 while those
-ports live on Traefik's load balancer and 1936/8189 live on MediaMTX's. Under compose
-one host fronts both and the conflict is invisible; `configs/k8s/endpoints.env.example`
-hands out two different addresses and inherits it. Either the two Services share one
-address, or the variable has to split in two.
-
-One claim this list used to make is worth retracting, because it was wrong in a way
-that cost time: it said the hub manifests **"can only be tested against a cluster
-nobody is running"**, and that this made them not worth starting. `run_k8s_runtime.sh`
-had already disproved it next door — k3s in a container is a real API server, a real
-scheduler and a real kubelet, and it starts in seconds. The manifests were written and
-verified without a cloud account, and the two defects that turned up in doing so
-(§2, and the entry in *Built and tested*) would both have shipped straight into the
-first paid cluster.
-
-Five things left this list rather than being completed by it, and the distinction
-matters because each leaves a residue:
-
-- **Certificate renewal** is answered (§7), and leaves one line for whoever writes the
-  deployment hook: **it must `touch` a file in Traefik's watched directory**, because
-  Traefik is the terminator that does not notice a replaced leaf on its own. That
-  applies to the compose deployment. Under the manifests it does not: cert-manager
-  rewrites the `agrarian-tls` Secret, the kubelet refreshes the projected files in
-  place, and Traefik's file watcher sees it. **Mosquitto's `SIGHUP` still has no
-  answer on either platform** — nothing in the manifests sends one, so that remains a
-  job for whatever drives renewal.
-- **The watch page** has been loaded in Chrome and Firefox and the video plays, which
-  was the whole question. The smaller half it left behind — the alert aside and the
-  page on a phone — has since been looked at too, along with the two history pages,
-  and is closed rather than pending; the three defects that pass found are in *Built
-  and tested*.
-- **The ingress tier** is built on both sides. It leaves the choice of when to make TLS
-  compulsory, which is below and is not work.
-- **The Kubernetes `FlightRuntime` backend** is built, and with it the service account
-  that retires the Docker socket (§2). The rest of the migration it used to leave — the
-  hub services having no manifests — is now built too, and both are above.
-  It also leaves a knob this platform offers and Docker does not: `activeDeadlineSeconds`
-  would cap a single flight's GPU hours. It is deliberately unset, because a backend that
-  ends flights the other one would not is a backend the abstraction no longer hides. It
-  belongs with quota (*Open*), not here.
-- **Flight history** is built (§4, *Built and tested*), and it turned out to be the read
-  side of everything the system already recorded rather than a feature of its own: no
-  table changed, no column was added, and the orchestrator was not touched. What it
-  leaves is smaller than the item was and is in *Open*: a recording is shown as a
-  storage location rather than offered as a download, because handing one over means the
-  portal holding object-storage credentials or db-writer signing URLs, and neither is a
-  history feature.
-
-Not on that list, and worth saying why: **making TLS compulsory on the drone side.**
-Every encrypted listener now exists, and the plaintext ones remain by design (§7, §8).
-Turning `optional` into `strict` is a two-line change, and the thing gating it is not
-work — it is knowing whether any drone that will actually fly here needs the fallback.
-That is a question for whoever owns the aircraft, not a task.
-
-Everything else in *Open* is either genuinely conditional (MediaMTX sharding, TURN over 443,
-auth-endpoint caching — all of which want a measurement or a user complaint first) or paired
-with a feature that does not exist yet (email verification with password reset, quota with
-billing).
-
-### Built and tested
-
-- **One MediaMTX carries at least 48 concurrent flights, and the ceiling was not
-  found** (§10.8, 2026-08-10). `tests/comms/run_media_capacity.sh` builds §10.6's
-  five-flow model per flight — publish `in/N`, a relay standing in for the GPU app
-  republishing to `out/N`, and two readers — and ramps until readers stop receiving
-  everything the publisher sent.
-
-  | flights | flows | in Mbps | out Mbps | MediaMTX CPU | mem | worst ratio |
-  | --- | --- | --- | --- | --- | --- | --- |
-  | 8 | 40 | 66 | 100 | 40% | 29 MB | 1.0000 |
-  | 16 | 80 | 133 | 199 | 80% | 36 MB | 1.0000 |
-  | 32 | 160 | 266 | 400 | 175% | 44 MB | 1.0000 |
-  | 48 | 240 | 400 | 599 | 261% | 60 MB | 1.0000 |
-
-  **Nothing degraded.** At 48 flights every reader received every byte, MediaMTX
-  logged not one warning, and it was using 261% of the 2400% this 24-core host has —
-  about a ninth of the machine — for a gigabit of combined throughput. The ramp then
-  failed at 64, and **that failure was the harness, not the server**: twelve relays
-  never started and only 136 of 192 readers attached, because 320 ffmpeg containers
-  is more than this host will run. The run reports that case separately for exactly
-  that reason; an earlier version of the script called it "degradation at 64", which
-  would have written a host limit into this document as a capacity.
-
-  **So 48 is a floor and the real number is higher.** What it settles is the claim
-  §9 has been making without evidence: *the GPU tier saturates first, by orders of
-  magnitude*. Forty-eight concurrent flights is forty-eight GPUs, and one MediaMTX
-  was at a ninth of one machine. That claim now has a measurement under it, and
-  MediaMTX sharding stays correctly filed as not urgent.
-
-  **Read it as an upper bound on the real deployment**, and the gap is not small.
-  Readers here are RTMP; real viewers arrive over WebRTC, where §10.6 notes every
-  one costs its own DTLS-SRTP encryption. The publisher is plaintext; a real drone
-  uses RTMPS. And both ends sit on one loopback bridge, which removes the jitter,
-  loss and reordering that actually make a reader fall behind. §10.5's headroom
-  formula and §10.6's `total flows ÷ 5` now have a number to work from, but a
-  conservative one is still owed before either becomes a scaling policy.
-
-  Two harness defects were found and fixed before any of the above was believed,
-  and both had inflated capacity rather than deflating it: blind `sleep`s sampled
-  half-built flights, and viewers exited seconds after attaching because ffmpeg was
-  prompting to overwrite `/dev/null` without `-y` — passing the readiness gate and
-  then vanishing, so the ramp measured one reader per flight instead of three.
-- **Per-tenant upload prefixes for recordings** (§4, §11.5, 2026-08-10). Segments now
-  land under `tenants/<user_id>/recordings/<public_uuid>/`, which is §11.5's scheme
-  and the same one the DEM work will use — one storage account, tenants separated by
-  key prefix rather than by holding anybody's cloud credentials.
-
-  **The ordering is the whole of the change.** The recorder used to upload and then
-  report; a prefix has to be chosen *before* the object is written, because there is
-  no retroactive move that is not a copy and a delete. It cannot derive `user_id`
-  itself either — MediaMTX hands it an output path and §5 keeps ownership on
-  `streams`, a join away — so db-writer answers `GET /recording/tenant/{public_uuid}`
-  and the recorder builds the prefix. That keeps this service something that only
-  ever writes, which is the property §11.5 cites for letting it keep its own
-  credentials instead of being moved onto minted URLs.
-
-  **It fails closed**, and that is the assertion worth having: an unresolvable tenant
-  stops the upload rather than falling back to a shared location, the segment stays
-  on the volume, and `DELETE_LOCAL_ON_SUCCESS` cannot fire because nothing succeeded.
-  Verified with a control — `_azure` is called zero times for an unknown uuid and
-  exactly once for a known one, so the refusal is a statement about the tenant rather
-  than about `_upload` being broken for everything. The deployment's own
-  `RECORDING_AZURE_BLOB_PREFIX` now wraps the tenant prefix instead of replacing it.
-  `run_recording_upload.sh` still passes 8/8 on the `local` backend, which is exempt
-  because it moves nothing.
-- **Rate limiting on db-writer's own `/login`** (§9, 2026-08-10). The inner door. §4
-  bounds the public one at the portal; this bounds the case §9 named — a caller
-  already on the private network guessing at bcrypt's pace.
-
-  **One counter, per account, and deliberately not two.** The portal keeps a
-  per-address counter as well because neither bound implies the other. Here that
-  would be actively harmful: every request db-writer sees arrives from the portal, so
-  an address counter would put every tenant on earth in one bucket and the first
-  attacker would lock out everybody — the same failure §8 describes for
-  `TRUSTED_PROXY_HOPS` set too low, reached by a different route. The limit is also
-  an order of magnitude looser than the portal's, because an inner door that rejects
-  what the outer door approved is a fault rather than a defence.
-
-  Driven against real Redis: 100 failures return 401 and the 101st returns **429**
-  with a `Retry-After`, a **correct** password is still refused while blocked (the
-  check runs before `authenticate()`, so an over-limit attempt costs no bcrypt), a
-  different account is unaffected, and a success clears the budget — 60 failures, one
-  success, 60 more failures, still 401. **It fails open**: with Redis stopped a
-  correct sign-in returns 200 and a wrong one 401 rather than 500, and it recovers
-  when Redis returns. `REDIS_URL` is optional here rather than required, so a
-  deployment that has not been updated keeps working, with a warning at startup that
-  says the endpoint is unrated.
-- **Cursor paging over a flight's alerts** (§4, 2026-08-10). The detail page used to
-  show the newest fifty and label the truncation honestly, with no way past it. It now
-  pages by `alerts_before`, an `alert_id` cursor, in the same keyset scheme
-  `flight_history` already used for flights — `next_alerts_before` in the response,
-  an *Older* link in the page, and the unparameterised URL as the way back.
-
-  **The argument for a cursor is stronger here than it was for flights.** History's
-  case against `OFFSET` is that a flight taking off mid-browse shifts every later row
-  down by one. Alerts arrive *while the flight is in the air*, at up to one a second,
-  so that race is not an unlucky interleaving — it is the normal case for anyone
-  reading the alerts of a flight that has not landed.
-
-  `tests/comms/test_alert_paging.py` — **10 assertions**, SQLite, no stack — walks
-  every page and asserts each alert is reached exactly once. **The control is what
-  makes that a fact**: the same rows paged with `OFFSET` while one alert arrives
-  between reads repeats a row, and the cursor over the identical data does not.
-  Also pinned: `alert_total` stays the whole flight rather than the page, a flight of
-  exactly one page offers no *Older* link (the extra row fetched is what decides
-  that), and the new parameter changes nothing about tenancy — another tenant gets
-  `None` with or without a cursor.
-
-  Driven end to end afterwards against the running stack, not only in SQLite: 57
-  alerts through db-writer's own route, then the rendered page over HTTPS. Page one
-  shows 50 with an *Older* link at `alerts_before=8`; page two shows 7, offers
-  *← Newest* and no *Older*. Ids `57..8` then `7..1` — no overlap, no gap.
-- **`scripts/check_certs.sh`, and both certificate jobs on cron** (§7, 2026-08-10).
-  `renew_certs.sh` checks the serial actually being served, but only when renewal
-  runs; between renewals nothing looked. The monitor asks each of the four listeners
-  daily what it is serving, validates the chain against the **system** trust store
-  with no `--cacert`, verifies the name, and reports days remaining.
-
-  **It asks the listener, never the file**, and that distinction is the whole point:
-  §7 measured that Traefik does not reload a replaced leaf on its own and Mosquitto
-  needs `SIGHUP`, so a correct certificate on disk and a stale one in a running
-  process look identical from the filesystem. It also compares all four serials and
-  reports a mismatch, which is exactly what a missed reload looks like.
-
-  Confirmed non-vacuous in all three directions rather than only observed passing: a
-  wrong name gives `INVALID` and exit **2**, a warn threshold above the remaining life
-  gives `DUE` and exit **1**, a stopped Mosquitto gives `NO ANSWER` and exit 1, and
-  the healthy stack gives exit **0**. The exit codes were checked directly — the first
-  attempt measured `tail`'s status through a pipe and read 0 for everything.
-
-  Both cron lines were run under `env -i` with a minimal `PATH` before being trusted.
-  The first draft of the renewal line had **no `cd`**, which would have failed on
-  every firing since cron starts in `$HOME` and every path here is repo-relative.
-- **A publicly trusted wildcard certificate, issued with no deployment to point it at**
-  (§7, 2026-08-09). `agrarianlivestock.com` registered at Cloudflare, and a Let's
-  Encrypt leaf covering the apex and `*.agrarianlivestock.com` obtained over DNS-01
-  against Cloudflare's DNS API. It now serves from `certificates/server/` in place of
-  the local CA's leaf, read unchanged by all three terminators.
-
-  **The finding is that this needed none of the infrastructure the list said it needed.**
-  No cluster, no load balancer, and no A record — the zone had no records at all when the
-  certificate was issued. DNS-01 writes a TXT record and the CA reads it; it never
-  connects to the deployment. What was genuinely required was the domain and a scoped
-  DNS API token, which is the one part of the old wording that survives: *prefer a
-  registrar whose DNS has an API cert-manager supports*.
-
-  Verified by inspection rather than by a runner, and worth listing as such: issuer
-  `O = Let's Encrypt` with no `(STAGING)`, both names present in the SAN, a three
-  certificate fullchain, and the private key confirmed to match the leaf. There is **no
-  automated coverage** — nothing re-checks that the file on disk is the file being
-  served, which is the same standing gap as the browser observations below.
-
-  Four things surfaced only by doing it, all recorded in §7: `mosquitto.conf`'s `cafile`
-  makes this a three-file swap; the ACME client's EC256 default would have changed the
-  key algorithm under three terminators at once; the lifetime drops 397 → 90 days; and a
-  staging certificate left in place makes the production run a silent no-op, because the
-  client reads it as a renewal that is not yet due and exits successfully having issued
-  nothing.
-- **The hub tier as Kubernetes manifests, deployed on a real cluster** (§2, 2026-08-03).
-  `configs/k8s/hub/` plus a kustomization at `configs/`, applied with
-  `kubectl apply -k configs/`. All eight hub services come up: Redis, db-writer,
-  ws-server, portal, orchestrator, MediaMTX (with the recorder beside it), Mosquitto
-  and Traefik.
-
-  **The ConfigMaps are generated from the config files the compose stack already
-  mounts**, not copied from them. That is why the kustomization sits at `configs/`
-  rather than in `k8s/` — kustomize refuses to read above its own root, and the root
-  has to contain `mediamtx/`, `mosquitto/` and `traefik/`. Obeying that constraint
-  beats working around it with `--load-restrictor`: two copies of `mediamtx.yaml` is
-  the same defect §4 rejects in `authInternalUsers` and in Mosquitto's
-  dynamic-security plugin — a second store kept in sync by hand, wrong silently.
-
-  Verified by **37 assertions** in `tests/comms/run_hub_manifests.sh`, against k3s in
-  a container with the five service images built and imported. Seventeen read the
-  render before anything runs; twenty ask the live cluster.
-
-  **Two defects were found that reading the manifests could not have caught**, and
-  both were silent:
-
-  - **kustomize's `namespace:` transformer rewrites `Namespace` objects themselves.**
-    It collapsed `agrarian-flights` into `agrarian`, which would have given the
-    orchestrator's Role authority over Jobs in the namespace holding db-writer, Redis
-    and Mosquitto — undoing the entire security argument of
-    `orchestrator-rbac.yaml`. kustomize reports this as an "ID conflict", which does
-    not sound like what it is. There is now no global namespace transformer; every
-    manifest names its own.
-  - **A `configMapGenerator` without an explicit namespace generates into `default`
-    *and* silently declines to stamp its content hash into the references.** The build
-    succeeds and every mount dangles. The failure surfaces only as pods stuck in
-    `ContainerCreating`.
-
-  The second one also broke the assertion written to catch it, which is worth
-  recording because it is the failure mode this whole test directory is built against.
-  The first version compared reference names against a regex for the unhashed
-  spelling; the bare name sits at the end of a line, the pattern required a trailing
-  character, and so it **matched nothing whether or not the bug was present** — it
-  passed the control. It now resolves every `configMapRef`, `configMapKeyRef` and
-  `configMap` volume against the ConfigMaps actually in the render, in the same
-  namespace, and reports one dangling reference against the reintroduced bug and zero
-  without it.
-
-  Both defects were confirmed by reintroducing them. The namespace one fails loudly at
-  build time; the generator one is the quiet one and is why the referential check
-  exists.
-
-  Also asserted, each pinning a claim made elsewhere in this document: the portal
-  manifest carries neither the session secret nor the database secret while
-  db-writer's carries the first (§7, as a manifest property and again as the running
-  pod's environment); db-writer, the alert-write API, Redis and the orchestrator are
-  all `ClusterIP` (§8); Traefik's Service does not carry 8189 (§8); the orchestrator
-  mounts no Docker socket, runs `FLIGHT_RUNTIME=kubernetes`, and under its own
-  ServiceAccount may create Jobs in the flight namespace but not in the hub namespace
-  and cannot read a Secret (§2); the recorder is a container in the MediaMTX pod with
-  both containers mounting the claim, and no separate recorder Deployment exists; and
-  MediaMTX opens **RTMPS** on 1936, which is the strongest evidence available that the
-  TLS Secret mounted and parsed — it exits at startup when the file is missing, so the
-  plaintext listener alone would prove nothing.
-
-  **Not covered: the GPU, the load balancers and the cloud.** k3s's ServiceLB assigns
-  node addresses rather than provisioning anything, so a `LoadBalancer` here proves the
-  Service spec is accepted and routes — not that a provider will carry mixed TCP and
-  UDP on one address. That constraint is real and the first paid cluster is where it
-  stops being spec. The images are placeholders (`ghcr.io/REPLACE_ME/…`) that the
-  runner substitutes, and the flight app is never started, because there is no GPU and
-  no device plugin — the same gap `run_k8s_runtime.sh` already records.
-- **Every page looked at in a browser, at desktop and phone width** (§4, 2026-08-03).
-  The last of the "asserted but unobserved" UI items, and the one that closes the
-  *Open* entry that used to sit here naming two corners of the watch page and the two
-  history pages. Driven against `run_watch_live.sh` — a real flight on a real GPU —
-  with Chrome under playwright at 1440px and at 390px, alerts injected on the Redis
-  channel for the live aside and 57 written through db-writer's own alert route for
-  the flight page.
-
-  **Two of the three corners were fine and one was not.** The alert aside renders,
-  newest first, with the crop decoding and `<script>alert(1)</script>` arriving as
-  text — the `textContent` path holds. The watch page stacks correctly on a phone,
-  because it is the one page anyone made responsive: its breakpoint was the *only*
-  `@media` rule in the stylesheet. Playback re-confirmed in passing — `readyState 4`,
-  1920×1080, `currentTime` advancing, exactly one WHEP POST answering 201, no request
-  to the reader page.
-
-  Three defects were found and fixed, and the first is the one worth remembering:
-
-  - **`/history` widened the layout viewport and zoomed the whole page out.** A
-    six-column table with a `nowrap` timestamp cannot fit 390px, and a browser does
-    not clamp it — it grows the layout viewport instead. Measured: `innerWidth` came
-    back **663** on a 390px device, every word on the page at 59%. **The obvious check
-    cannot see this**, because `scrollWidth > innerWidth` never fires when
-    `innerWidth` is the thing that grew; the first pass of this work asserted no
-    overflow and was wrong. Fixed with a `.table-wrap` scroll container — which was
-    inert until `.card` also got `min-width: 0`, since a grid item refuses to shrink
-    below its content by default.
-  - **The ingest URL broke mid-key.** `word-break: break-all` rendered it as an
-    eleven-line ribbon four characters wide. This is the one string a human
-    transcribes by hand before every flight (§3) and a stream key has no safe break
-    point, so it is now `nowrap` and scrolls inside its own box.
-  - **The alert grid stretched every card to the tallest in its row**, turning the
-    ~1-in-5 alerts with no image into large empty bordered boxes. `align-items: start`.
-
-  Fixing the first one moved **Watch** — the primary action of the product — off
-  screen behind a horizontal scroll with nothing to say so, so the slot table stops
-  being a table below 640px (`.slots-stack`). The history table deliberately does not:
-  its columns are bare numbers that mean nothing without their headers, so it stays a
-  table and its first column became a link instead.
-
-  **One thing this turned up that is not a UI matter at all: an alert image is not a
-  crop.** `output_alert_streamer._process_alert` stores the *full-resolution annotated
-  frame* — `height, width = frame.shape[:2]`, no resize before `cv2.imencode` — so
-  every alert row holds a 1920×1080 JPEG at quality 85. This document calls them crops
-  throughout. It strengthens §4's reasoning for making alert images a route rather than
-  a field, and it means a flight page loads fifty full-HD frames: ~78 KB each for the
-  test pattern measured here, and several times that for real aerial imagery, which
-  compresses far worse than colour bars.
-
-  `run_portal.sh` (118/118) and `run_portal_auth.sh` (51/51) both still pass against
-  the changed templates. What is still not covered is that **nothing re-checks any of
-  this** — it is the same standing gap as the video observation below, and a change to
-  the stylesheet can undo it silently.
-- **Flight history in the portal** (§4, 2026-08-03). Three read routes on db-writer, two
-  pages on the portal, and no schema change of any kind — every row this reads was
-  already being written. Covered twice, at the two levels where it can be wrong:
-
-  `tests/comms/test_flight_history.py` — **50 assertions**, SQLite in memory, no stack —
-  is the query layer. `tests/comms/run_portal.sh` — now **118 assertions**, up from 88 —
-  drives the pages through real HTTP against real PostgreSQL: alerts written by the app's
-  own route, a segment logged by the recorder's, the flight closed by the orchestrator's,
-  and then the history read the way a browser reads it.
-
-  Two properties carry **controls that fail**, because both are the kind of claim that
-  passes vacuously against small data:
-
-  - **Cursor paging does not repeat a row** when a flight takes off mid-browse. The
-    control runs `OFFSET` over the same rows at the same moment and *does* repeat one —
-    so the property is a fact about this data, not a belief about paging.
-  - **Alert and recording counts do not inflate each other.** The control is the single
-    joined query, which reports a flight with 3 alerts and 2 recordings as having **6 and
-    6**.
-
-  Tenancy was checked by breaking it: deleting the `user_id` filter from the history
-  query, and the flight check from the image lookup, fails 10 of the 45 — including
-  "another tenant's flight is absent" and "a real alert id under the wrong flight is
-  refused". A test that cannot fail this way is not testing isolation.
-
-  What was **not** covered at the time: nobody had looked at either page in a browser.
-  The markup is asserted, the crop is byte-compared through two services, and neither of
-  those is the same claim as "the grid of fifty images looks right". Both pages have
-  since been looked at, at desktop and phone width — see the entry above, which is also
-  where the three defects that found are recorded.
-
-- **The Kubernetes `FlightRuntime` backend, against a real API server** (§2, 2026-08-03).
-  `KubernetesFlightRuntime` creates one Job per flight; `FLIGHT_RUNTIME` selects it.
-  `tests/comms/run_k8s_runtime.sh` — **65 assertions** — stands up a k3s cluster in a
-  container and drives the real thing: a real API server, a real scheduler, a real
-  kubelet. No mock has an opinion about whether a Job spec is schedulable.
-
-  The result that matters most is the one that cost nothing to state and would have cost
-  a lot to miss: **`flights.py` did not change**. Reconnects, duplicate hooks, failed
-  starts and crash recovery all run unmodified on the second backend, which is what §2
-  claimed in advance and can now stop claiming.
-
-  Three properties were **falsified rather than asserted**, because each is the kind that
-  passes vacuously:
-
-  - `/dev/shm` is 256 MB in a running flight pod. The control is the same image in a Job
-    without the `emptyDir`: **64 MB**, the value that SIGBUSes the annotation worker.
-    Without the control this measures Alpine, not the volume.
-  - `stop()` removes the pod, not just the Job. Rebuilt with `propagation_policy="Orphan"`
-    and confirmed the check fails — the Job disappears and a pod keeps running with
-    nothing owning it, which on a GPU node pool is the most expensive mistake in the file.
-  - The RBAC manifest is load-bearing. The test holds the orchestrator's **own service
-    account token**, so removing `list` from the Role was confirmed to fail `recover()`
-    with a 403 rather than passing quietly under admin credentials.
-
-  Not covered, and it is the obvious gap: **there was no GPU and no device plugin.** The
-  `nvidia.com/gpu` limit, the node selector and the toleration are checked as spec — the
-  Job body the API server would receive — because a cluster with no GPU cannot schedule a
-  pod that asks for one. The first real cluster is where those three stop being spec.
-- **A person watched the annotated video play, in Chrome and in Firefox** (§6 step 7,
-  2026-08-03). The oldest open item on this branch, and the only one no automated test
-  could ever reach. `run_watch_live.sh` put a real flight in the air on a real GPU;
-  signing in at the portal and pressing **Watch** produced moving video in both engines.
-
-  This is a **human observation, not an assertion**, and it is listed here rather than
-  quietly folded into the playback entry below because the distinction is the whole
-  point of the item: everything underneath was already verified — WHEP returns 201, a
-  real client decodes 1920×1080, the URL shape is pinned by 88 assertions — and none of
-  that answered whether a browser would show a picture. It now has, once, on one
-  afternoon. Nothing re-checks it, so a change to `watch.js` or the `<video>` element
-  can break it silently; that is the price of the only claim here a machine cannot make.
-
-  What it settles is the specific risk §9 had been carrying: **autoplay policy**. The
-  element is `autoplay muted playsinline`, muted being what makes autoplay legal without
-  a click, and both Blink and Gecko accepted it. What it does not settle is the rest of
-  the page — see *Open*, which is now two corners rather than the whole thing.
-
-  **Re-confirmed on 2026-08-10 with a hostname as the ICE host**, which was the one
-  thing the move from an IP to `agrarianlivestock.com` left genuinely uncertain.
-  `run_watch_live.sh dev.agrarianlivestock.com` sets both `MEDIA_PUBLIC_HOST` and the
-  ICE host to a name rather than an address, and the video played. So MediaMTX turns a
-  hostname into a candidate a browser can use — the setting is documented as "additional
-  hosts or IPs" and now behaves that way in practice, not just in the manual.
-
-  That mattered because the failure would not have looked like one: a bad ICE host
-  leaves WHEP answering **201** with a permanently black player, which is the symptom
-  this document elsewhere warns is mistakable for an autoplay problem.
-
-  Two limits on the claim, both worth keeping. It is a **human observation** on the same
-  footing as the entry above, with nothing re-checking it. And it does not establish
-  **when** the name is resolved: if MediaMTX resolves once at startup, an address moving
-  under a stable name still breaks playback until a restart. That is invisible on
-  loopback and becomes real the first time a cloud load balancer is recreated.
-- **Certificate renewal, on all three terminators** (§7). The open item with a deadline
-  attached — the answer was needed before the first real certificate was issued, not
-  before it expired — settled by 15 assertions in `run_cert_renewal.sh`, which issues a
-  leaf, stands the three services up against it, reissues with `--renew-leaf` under a
-  **live authorised flight**, and asks each of them what it is serving on a fresh
-  connection.
-
-  The result was the opposite of what this document assumed, in both directions.
-  **MediaMTX — the service whose restart would drop every flight in the air — rereads
-  the file by itself within seconds, and the flight in the air is undisturbed.**
-  **Traefik, which §7 asserted picks up a changed file, does not**: `watch: true`
-  watches the routing directory and the certificate is mounted outside it, so nothing
-  fires. Mosquitto behaves as documented, on `SIGHUP`.
-
-  Three of the assertions are the ones holding the rest up. The renewal is checked to
-  have issued a *different* serial, without which every later assertion passes while
-  measuring nothing. The publish is checked to have been *authorised* before the
-  renewal, because an earlier version of this ran without db-writer and "the publisher
-  survived" was a statement about ffmpeg retrying a refused connection. And **SIGHUP is
-  asserted to kill MediaMTX**, recorded as a test rather than a warning so that nobody
-  reaches for the obvious symmetry with Mosquitto when writing the renewal hook.
-- **RTMPS, RTSPS and MQTTS — the drone-facing half of the ingress tier** (§7, §8).
-  MediaMTX and Mosquitto terminate their own TLS, reading the same leaf Traefik does,
-  so a stream key no longer has to cross the internet in plain text. That key is the
-  ingest path as well as the credential, is typed into a controller before every
-  flight, and never expires, which is why it was the last thing worth encrypting.
-
-  Verified by **42 assertions** in `run_ingress_tls.sh`, against the repo's own
-  `mediamtx.yaml` and `mosquitto.conf` with a real db-writer and PostgreSQL behind
-  them, two tenants throughout. The assertions split into two independent claims, and
-  the second is the one a transport change is most likely to break quietly:
-
-  - **The transport.** Each of the three listeners serves the leaf this run issued,
-    refuses a client that does not hold the CA, and floors at TLS 1.2 — 1.0 and 1.1
-    refused, 1.2 and 1.3 accepted. ffmpeg publishing with a *different* run's CA is
-    refused, and the identical publish with the right CA succeeds, so the refusal is a
-    statement about the certificate rather than about anything else in that container.
-  - **Authorisation is unchanged by it.** A revoked key cannot publish over RTMPS or
-    RTSPS, an unknown one cannot either, a publish to another flight's output path is
-    still refused, and over MQTTS the drone still cannot publish under another tenant's
-    key nor the app subscribe to another tenant's telemetry. Encrypted and authorised
-    are independent properties, and it is entirely possible to gain one while silently
-    losing the other.
-  - **The plaintext fallback still works**, on both planes, which §7 requires — a change
-    that broke it would ground exactly the drones the fallback exists for.
-
-  Two things the work turned up, both about tests rather than about TLS.
-
-  **The TLS-floor assertion in `run_traefik_tls.sh` was vacuous, and is fixed.** It
-  drove `curl --tlsv1.1` and asserted the failure — but modern curl refuses to *send*
-  a TLS 1.1 ClientHello, so that assertion fails identically against a server that
-  happily accepts TLS 1.1. It measured the client. Both runners now use an OpenSSL old
-  enough to still offer it, with a control that proves so against a server pinned to
-  1.1 in the same container; without that control it would be the same vacuous
-  assertion with a different binary. The reading is handshake-completed rather than
-  reported version, because OpenSSL's `New, TLSv1.x` line names the era of the
-  negotiated *cipher* and not the protocol — a TLS 1.1 connection can print `TLSv1.0`.
-
-  **MediaMTX exits at startup when its certificate file is missing**, rather than
-  starting without the encrypted listener. Six other runners mount the real
-  `mediamtx.yaml` and none of them supplied a certificate, so this change broke all of
-  them at once — caught because `run_traefik_tls.sh` went from 30 passing to two 502s.
-  They now issue a throwaway leaf each, into a temporary directory rather than into
-  `certificates/`, whose CA may already be installed in a browser.
-- **Traefik, terminating TLS for everything a browser touches** (§7, §8). The portal,
-  HLS, WHEP signalling and the viewer WebSocket are now reachable only over HTTPS/WSS
-  through `configs/traefik/`, and the four upstreams no longer publish a port of their
-  own — a direct publish would have been a plaintext path around the terminator. 8189
-  stays published and unproxied, because WebRTC media is end-to-end DTLS-SRTP and
-  proxying it would terminate the encryption the media path is built on.
-
-  Certificates came from `scripts/generate_local_certs.sh` rather than from ACME, and
-  that is what made the work possible before the hostname arrived: all three terminators
-  read a key from disk and none asks who signed it. The same property is what let the
-  real leaf replace it later as a file copy (§7).
-
-  Verified by 31 assertions in `run_traefik_tls.sh` — the repo's own Traefik
-  configuration in front of a real portal, ws-server, MediaMTX, db-writer and
-  PostgreSQL. Three are worth naming:
-
-  - **The Secure session cookie survives a real round trip.** This is the §8 corollary
-    finally discharged. Every other runner drives the portal over plain HTTP with
-    `COOKIE_SECURE` left on, which asserts the cookie's *attributes* and never that a
-    browser would send it back — and a `Secure` cookie is not returned over `http://`.
-    Here it is set over TLS and accepted on the next request.
-  - **Two clients hold two rate-limit buckets.** `PORTAL_TRUSTED_PROXY_HOPS` had to
-    change from 0 to 1 the moment a proxy landed, because the peer address the portal
-    sees is now always Traefik's. Confirmed non-vacuous by `PORTAL_HOPS=0`, which fails
-    exactly this assertion and nothing else. The existing danger — a hop count set too
-    *high* — is covered separately by a forged `X-Forwarded-For` that mints no fresh
-    bucket.
-  - **A client without the CA is refused.** Asserted alongside the successful one, since
-    a TLS test that passes against any certificate is asserting nothing. The TLS floor is
-    pinned the same way — 1.2 and 1.3 accepted, 1.1 refused — though that half of it was
-    asserting nothing until the drone-side work above found and fixed it.
-
-  Two assertions failed on the first run and both were the test's fault, in ways the
-  document had already warned about. HLS answered 302 because MediaMTX redirects to
-  `?cookieCheck=1` *before* it authenticates (§4) and the client refused redirects —
-  the exact trap that section describes. WHEP answered 400 because MediaMTX checks the
-  content type before the credential, so a POST without `application/sdp` never reaches
-  the hook. Driven properly both return 401 from `/auth/mediamtx`, which is what proves
-  the request crossed Traefik rather than dying in it.
-
-  What this does not cover is whether video plays through the proxy: no stream is
-  published, so HLS and WHEP are driven only as far as the authorization decision.
-- **Rate limiting on `/login` and `/register`** (§4). The two endpoints anyone on the
-  internet can reach without a credential, and until now the only brake on guessing a
-  password was bcrypt's own cost. Verified by 25 assertions inside `run_portal.sh`.
-
-  Three of them were checked by breaking the thing they test, because a rate-limit
-  assertion that passes for the wrong reason is worse than none:
-
-  - **The counters are shared across replicas.** Confirmed non-vacuous by pointing the
-    two replicas at different Redis databases — that assertion, and only that one, then
-    fails. This is what an in-process counter would look like: a limit of N × the number
-    written down.
-  - **A forged `X-Forwarded-For` mints no fresh bucket** where no proxy is trusted, while
-    the same header is believed by the replica configured for one hop. The two replicas
-    run with different trust settings on purpose. Confirmed non-vacuous by setting both
-    to trust one hop and watching the first half fail.
-  - **The limiter fails open.** With Redis stopped, a correct sign-in still returns 303
-    and a wrong one still returns 401 rather than 500 — asserted in the runner, since it
-    has to stop a container.
-
-  Also pinned: the per-account and per-address limits are genuinely separate in both
-  directions (one locked-out account does not lock out its neighbours on the same NAT;
-  twelve *different* accounts sprayed from one address are still refused); a success
-  clears the account's counter but not the address's; registration counts eight
-  *malformed* attempts, since a 409 on a taken address is an existence oracle whether or
-  not a row is created; and the 429 carries a `Retry-After` a client can obey alongside a
-  wait a person can read.
-- **The portal front-end** (§4). The service in `portal/`, and with it the last piece of
-  the flight lifecycle: every step in §6 now has something that calls it. Verified by 69
-  assertions in `run_portal.sh`, driving it the way a browser does — form posts, a session
-  cookie, an `Origin` header — against a real db-writer and real PostgreSQL, on **two
-  portal replicas**.
-
-  Three of those assertions are the ones worth naming, because each pins a claim made
-  elsewhere in this document:
-
-  - **The rendered HTML never contains the session token.** Searched for on the dashboard
-    and the watch page. `httpOnly` buys nothing if the token is also printed into the
-    document it protects.
-  - **What the watch page receives cannot act as a session.** The token in the video URL
-    is checked to differ from the cookie's, then spent against db-writer and refused —
-    both as a session and as a request for another viewer token. The downgrade in §3 with
-    no path back, tested from the far end.
-  - **The replicas hold no secret and no database credentials.** They are started with
-    neither `SESSION_JWT_SECRET` nor any `DB_*` variable and still serve every page, which
-    is how §7's claim is falsifiable rather than merely stated.
-
-  Also pinned: a cookie issued by one replica is accepted by the other (statelessness,
-  the property this design keeps re-earning); cross-site POSTs to add, revoke and login
-  are refused, as is one carrying neither `Origin` nor `Referer`, and the refusals are
-  shown to have created nothing; a slot labelled `<script>alert(1)</script>` comes back
-  escaped; and a rotated key vanishes from the page in the same request that replaces it.
-
-  Not covered: whether video actually plays. That is WebRTC between the browser and
-  MediaMTX, and the portal composes a URL rather than sitting in the path — the URL's
-  shape is asserted, the picture is not.
-- **`/viewer/token` takes a session token, not a password** (§3). The last route outside
-  `/login` that accepted one, so a password now reaches exactly one endpoint in the whole
-  system. Verified inside `run_mediamtx_auth.sh` (27/27, up from 22): email and password
-  are refused where they used to work, no credential is refused, and — the two that
-  matter — **a viewer token cannot mint another viewer token** and neither can a
-  publisher token. The first would be a self-renewing credential that never expires in
-  practice; the second is held inside a container processing untrusted video. A second
-  tenant's session token still cannot reach the first's flight even when naming its
-  `stream_id`. The disambiguation behaviour is unchanged and still verified: one active
-  flight resolves silently, two force a 409 rather than a guess.
-- **Stream slot CRUD — `GET/POST /streams`, `/rotate`, `/revoke`** (§4). The portal's
-  operations, finally reachable, each scoped by the session claim rather than by
-  anything in the request. Verified by 22 assertions in `test_schema.py` on the cap and
-  27 more end-to-end in `run_portal_auth.sh` (49 total there): every route 401s without
-  a token and with a garbage one; another tenant gets the **same 404** for a stream that
-  is not theirs as for one that does not exist, and their failed rotate leaves the
-  owner's key untouched; a rotated key is what the *other* replica then reports; revoke
-  hides the slot while `include_revoked=true` still shows it with `revoked_at` set and
-  nothing deleted. The cap is verified three ways — sequentially, against the
-  revoke → add → rotate revival bypass, and under **20 simultaneous adds across two
-  replicas**, which create exactly 10. That last one was confirmed non-vacuous by
-  removing the row lock and watching it create 11.
-- **Portal authentication — `/register`, `/login`, `/me`** (§3 session tokens). The
-  third scope on the existing JWT mechanism, so no new infrastructure. Verified by 21
-  assertions on the token itself (`test_session_tokens.py`) and 20 end-to-end over real
-  HTTP against real PostgreSQL with **two replicas** (`run_portal_auth.sh`). The two
-  that matter most: a **viewer token is refused as a session token** — it carries a
-  `sub` claim naming its user, so the scope check is the only thing between "may watch
-  flight 7" and "is user 3" — and a **token minted on replica 1 is accepted on replica
-  2**, which is the stateless property the whole design rests on and what an in-memory
-  session store would silently break. Also pinned: a session token carries no
-  `flight_id` claim, so it is refused by `flight_id_from_credential` and by ws-server
-  in both of ws-server's scopes; forged signatures, expiry, `alg:none`, missing and
-  non-numeric subjects, five malformed `Authorization` headers; and the status codes
-  the portal will branch on (409 duplicate, 400 malformed, 401 bad credentials) with a
-  failed login never disclosing whether the account exists.
-- **Account registration** (`UserDirectory.create_user`, §3). Verified by 22 assertions
-  against SQLite in `test_schema.py` — email normalisation on both write and read,
-  duplicate refusal including a differing case and surrounding whitespace, the bcrypt
-  72-**byte** boundary measured in bytes rather than characters, the 8-character floor,
-  malformed and over-long addresses, and that a rejected registration leaves no row —
-  plus 6 against **real PostgreSQL**, which is where the duplicate path actually
-  matters: psycopg2's `IntegrityError` (not SQLite's) is what the race guard catches,
-  the case-variant duplicate is refused by a genuinely case-sensitive unique index, and
-  the directory keeps working after a rejected insert rather than being poisoned by it.
-  `rebuild_schema.py --seed-user` was rewritten onto the same path and re-verified end
-  to end, including that it now refuses to seed an account the portal would reject.
-- ws-server per-flight isolation, Redis fan-out across replicas, and viewer JWT
-  validation. Verified by 11 tenancy tests and 2 cross-replica tests, including
-  confirmation that a second tenant's viewer receives nothing.
-- **MediaMTX authorization on both publish and read.** db-writer's `/auth/mediamtx`
-  endpoint, the regex paths, and the removal of the shared `drone`/`annot` paths.
-  Verified by 40 assertions on the decision itself and 16 end-to-end against a real
-  MediaMTX with real RTMP publishes and HLS reads, two tenants throughout: a live key
-  publishes, an unknown or revoked one does not, an authorised viewer receives the HLS
-  manifest of a live stream, and a second tenant's *valid* viewer token is refused on
-  the same path.
-- **Per-flight publisher tokens on both write paths.** db-writer's alert and
-  flight-close endpoints now require one, as does ws-server's alert endpoint. Verified
-  by 17 tests across both implementations: scope separation both ways, cross-flight
-  replay, forged signatures, expiry, malformed and scopeless tokens.
-- **Flight lifecycle end to end** (§6). The orchestrator, its Docker backend, db-writer's
-  `/flight/open` and `/flight/{id}/close`, and MediaMTX's availability hooks. Verified by
-  39 assertions on the event logic against fakes — duplicate hooks, reconnect inside and
-  outside the grace window, revoked keys, a container that fails to start, shutdown with
-  a teardown pending — and 21 end-to-end with real MediaMTX hooks, a real Docker daemon
-  and real PostgreSQL: ffmpeg starts publishing and a container appears carrying the
-  flight's paths and token and **no** end-user credentials; the publisher drops and
-  returns and the same container survives; it lands and the container is gone with
-  `end_time` stamped; a revoked key spawns nothing.
-- **Redis reconnect and outage recovery** (§4). 3/3 on fast restart, 7/7 on a sustained
-  outage: automatic resubscribe, viewer never reconnects, publishes fail loudly while down,
-  no replay afterwards.
-- **db-writer replica safety.** The per-flight `DatabaseManager` dict was replaced by a
-  process-wide `AlertWriter` and stateless endpoints. Verified against two live replicas
-  and a real PostgreSQL instance: a flight opened on replica 1 (via `/flight/open`, the
-  same call the orchestrator makes) accepted an alert and a close on replica 2, all rows
-  reached the database, and 40 interleaved alerts across two concurrent flights and both
-  replicas persisted with no loss and no cross-contamination. Auth held across replicas
-  throughout.
-- **The real app tier, driven by the orchestrator, in BOTH modes.**
-  `run_orchestrator_real_app.sh` builds the actual GPU app image (not the sleeping stub)
-  and runs it with `--gpus all` behind the orchestrator: a live publish spawns it with
-  the injected `FLIGHT_ID`/`PUBLISHER_TOKEN`/paths, it reads `in/<key>`, runs the full
-  pipeline on the GPU with zero `CRITICAL` log lines, publishes annotated video to its
-  own `out/<uuid>` (confirmed by MediaMTX's own "is publishing to path" log line), and is
-  torn down cleanly on landing with the flight row closed. `danger_detection` 15/15,
-  `health_monitoring` 9/9, real MediaMTX/Mosquitto/db-writer/ws-server/Redis/Postgres
-  throughout. No alert was expected or produced in either: the input is an ffmpeg
-  `testsrc` pattern with nothing in it to flag.
-
-  The mode is now the runner's first argument and **defaults to `danger_detection`**. It
-  was hardcoded to `health_monitoring`, which is the whole reason the primary product mode
-  had never executed once. Three things had to be true before that could be fixed, and
-  only the first was known:
-
-  - **The TensorRT claim was wrong twice over.** This document already corrected the
-    first half; the run settles it. `danger_detection_stream.py` resolves each model by
-    looking for an `engine/<stem>.engine` and falling back to the `.pt` detector and
-    `.onnx` segmenter named in `configs/danger_detection/*.yaml`. That fallback is the
-    path the test takes. An engine is an accelerator, never a prerequisite.
-  - **Nothing the workers log was observable.** Fifteen modules ended their logger setup
-    with a hardcoded `setLevel(logging.WARNING)`, and `app/main.py` installs no
-    `StreamHandler` at all — so `docker logs` on a flight container is near-empty and the
-    old `docker logs | grep -c CRITICAL` assertion could not fail under any circumstance.
-    Assertions now read `/app/logs/*.log` copied out of the live container, and the level
-    comes from `LOG_LEVEL` (default `WARNING`, so production is unchanged; the harness
-    sets `INFO`). An operator could not previously turn on the diagnostics the workers
-    were already writing.
-  - **The telemetry plane needed a real publisher.** See below.
-- **Playback works, and the way it was built did not.** The watch page used to embed
-  MediaMTX's own reader page in an `<iframe>`, on the reasoning that reimplementing WHEP
-  would put the portal in the middle of a media path that should be
-  browser-to-MediaMTX. The reasoning was right and the mechanism was impossible:
-  `GET /<path>/` answers **401 with `WWW-Authenticate: Basic` and never calls
-  `/auth/mediamtx` at all**. Not for `?jwt=`, `?token=`, `?user=&pass=`, `Authorization:
-  Bearer`, or HTTP Basic — five forms tried, five 401s, and db-writer logged no decision
-  for any of them. That page is gated behind MediaMTX's internal user roster, which is
-  exactly what `authMethod: http` replaced (§4), so no credential this system can mint
-  would ever have opened it. The earlier guess — that MediaMTX was dropping the query
-  string on its way to WHEP — was wrong in an instructive way: it never got that far.
-
-  Everything underneath the page was already correct. HLS with `?jwt=` serves real
-  annotated media (`ffprobe`: H.264 1920×1080), and the WHEP endpoint authorises the same
-  token and reaches the hook as `protocol='webrtc'`. So the fix was to drop the iframe and
-  negotiate WHEP in `watch.js` against a `<video>` element — non-trickle, all candidates
-  gathered before the offer, one POST and no PATCH. Verified with a real WebRTC client
-  (`aiortc`): **201 on the offer, then decoded 1920×1080 video frames.** The media path is
-  still end-to-end DTLS-SRTP browser-to-MediaMTX; only the signalling moved into our code.
-
-  `run_portal.sh` pins the new shape at 88 assertions, including a regression check that
-  the URL is the WHEP endpoint and *not* the reader page — the one thing that must never
-  quietly come back.
-- **The telemetry plane carries a real message from the real app.** `run_mqtt_auth.sh`
-  proves Mosquitto's authorisation — who may publish where, and that one flight cannot
-  read another's topics — but it proves nothing about the plane as a *pipe*, because no
-  app is listening at the other end. `danger_detection` is the only mode that consumes
-  telemetry (`health_monitoring` instantiates no `FrameTelemetryCombiner`), so until this
-  run, §4's Mosquitto work, the `TELEMETRY_LISTENER_STREAM_KEY` the orchestrator injects,
-  and the app's reuse of its publisher token as an MQTT username had been exercised only
-  by synthetic clients.
-
-  The harness now starts the broker with the **real `mosquitto.conf` against the real
-  db-writer ACL endpoint**, plus `tests/comms/telemetry_publisher.py` authenticating as
-  the drone with its stream key — two different credentials admitted to the same topics
-  from opposite directions, which is the arrangement §3 describes.
-
-  **The load-bearing assertion is that telemetry reaches the combiner, and it was checked
-  by breaking it.** `FRAMETELCOMB_MAX_TIME_DIFF` is 150 ms, so a publisher can connect,
-  authenticate, be admitted, and deliver every message on time — and still leave every
-  frame unmatched if it publishes below ~7 Hz. Dropping the publisher to 1 Hz leaves all
-  fourteen other assertions green and fails only this one, with 192 starved matches in the
-  last 200 log lines. That is the failure an authorisation test cannot see: a plane that
-  is correctly secured and carries nothing.
-- **The recording upload path, end to end, with database traceability.**
-  `runOnRecordSegmentComplete` pointed at the recorder sidecar from the start but never
-  fired until the `-ffmpeg` tag fix (see the auth section above); until now nothing had
-  driven it. `run_recording_upload.sh` publishes to a real `out/<uuid>`, disconnects
-  (which always flushes the current segment regardless of `recordSegmentDuration`), and
-  confirms MediaMTX's hook fires, the recorder receives it and uploads to the `local`
-  backend, and — new this pass — the segment is resolved back to its `flight_id` and
-  logged in a new `recordings` table via a new `POST /recording` endpoint, rather than
-  only existing as an anonymous file under a UUID nobody can join to a flight. 8/8
-  assertions, including the file actually present on the shared volume. Azure/AWS
-  backends remain unverified — no credentials are configured to test against them.
-- **Mosquitto authorisation and per-flight telemetry isolation.** Previously
-  `allow_anonymous true` with no ACLs, and every telemetry topic flat
-  (`telemetry/latitude`) regardless of which drone or flight it belonged to — so two
-  concurrently active flights would each receive the other's GPS and gimbal data on
-  the shared broker. Topics are now namespaced per stream
-  (`telemetry/<stream_key>/<field>`), and a new `mosquitto-go-auth` HTTP backend
-  (`db_writer/mqtt_auth.py`, `/auth/mqtt/user` + `/auth/mqtt/acl`) mirrors
-  `/auth/mediamtx` exactly: the drone's stream key is the publish credential, and the
-  app container reuses its existing publisher token to subscribe — a fourth thing
-  that one token now authorises, not a new credential. Requires the
-  `iegomez/mosquitto-go-auth` image in place of stock `eclipse-mosquitto`, since the
-  plugin does not ship in the stock image. Verified by 27 assertions on the decision
-  itself (`test_mqtt_auth.py`) and 9 end-to-end against a real broker
-  (`run_mqtt_auth.sh`): CONNECT refused for an unknown/revoked key or garbage
-  credential, SUBSCRIBE denied for another tenant's topic, PUBLISH denied for another
-  tenant's key (checked via the broker's own log line — MQTT gives no client-side
-  signal for a denied QoS-0 publish, the same trap as ffmpeg's exit code against
-  MediaMTX), and a subscribed app genuinely receiving the exact value its own drone
-  published. The upstream plugin project is archived (no longer maintained) as of
-  mid-2025; it still works and is pinned to a specific image tag, but has no
-  security-patch path if a CVE surfaces.
-- **Orchestrator restart recovery.** Flight state lived only in orchestrator memory;
-  a crash or a forced kill — anything that skips the graceful-shutdown hook, which is
-  what an OOM kill, `docker kill`, or the host rebooting all do — left running flight
-  containers orphaned (never torn down, using GPU forever) and their flight rows open
-  forever (no teardown was ever coming to close them). Recovery needs no database:
-  `PUBLISHER_TOKEN` and the stream paths the orchestrator itself injected at
-  container-start time are still sitting in the container's own environment, the one
-  piece of state a restart cannot lose, so `FlightOrchestrator.recover()` reads them
-  back via the `agrarian.flight_id` Docker label instead. It runs before the HTTP
-  server accepts its first request, so no online/offline hook can race it. A container
-  still running is reattached and behaves exactly like any other live flight from then
-  on; one that already exited while nothing was watching is closed out and removed by
-  recovery itself, since no offline hook will ever arrive for it. Verified by 9 new
-  assertions on `FlightOrchestrator.recover()` against a fake runtime (reattachment,
-  closing an already-exited container, skipping a container with incomplete env rather
-  than guessing, no duplicate spawn) and 13 end-to-end (`run_orchestrator_recovery.sh`):
-  two real flights running, the real orchestrator container `docker kill`ed (not
-  stopped — no graceful shutdown runs), one flight's container separately stopped
-  while the orchestrator is down, a fresh orchestrator started, and confirmation that
-  the still-running flight is tracked again with no duplicate container while the
-  exited one is closed in PostgreSQL and removed — then the recovered flight lands
-  normally afterwards, same as any flight the orchestrator opened itself.
-- **`/viewer/token` no longer guesses which flight.** It used to return whichever
-  flight a user started most recently — wrong two different ways at once: it could
-  hand out a token for a flight that had already landed (start time is not a liveness
-  signal), and it silently picked one out of several once a second stream could be
-  active at the same time, rather than asking which, now that concurrent flights are
-  a real supported case. Both were the same underlying bug (`latest_flight_id`
-  conflated "most recent" with "active"), fixed by one query:
-  `UserDirectory.active_flights()` returns only currently open flights
-  (`end_time IS NULL`). With zero there is nothing to hand out (404); with exactly
-  one — still the common case — nothing changes for the caller; with more than one
-  the request must include `stream_id` or gets a 409 listing the candidates, rather
-  than silently guessing on the caller's behalf. Verified by 6 assertions against
-  SQLite (`test_schema.py`, including that a landed flight is excluded) and 6 more
-  end-to-end against a real db-writer and PostgreSQL (`run_mediamtx_auth.sh`,
-  27/27 total): the one-flight case still just works, a second concurrent flight
-  makes the plain request 409 rather than pick one, `stream_id` resolves each flight
-  correctly, and a user cannot use `stream_id` to reach another tenant's flight.
-
-### Known weaknesses in what exists
-
-Distinct from the section below: these are live weaknesses on this branch right now, not
-work that has yet to start.
-
-- **The DEM is absent from every deployment here, so the geo stage runs degraded.**
-  `dem/dem.tif` and `dem/dem_mask.tif` are gitignored and not on any machine here, and
-  `open_dem_tifs()` returns `None` for a missing raster, so `danger_detection` runs with
-  slope and no-data analysis skipped. Geofencing and the safety radius do run and are
-  exercised. The harness reports which of the two it got, so a green run is never read
-  as full geo coverage.
-
-  **This entry used to say the code path was untested, and that was too strong.** The
-  slope and no-data analysis was exercised with a real raster during the app's own
-  development, and worked. That is a human observation rather than an assertion — the
-  same standing as "a person watched the annotated video play" below — and it changes
-  what is actually missing:
-
-  - **not** the code: `extract_dem_window` and the window cache have run against real
-    elevation data
-  - **yes** a raster in any deployment or harness here, which is why nothing exercises
-    it now
-  - **yes** any automated coverage at all, so a change to the geo stage would break the
-    DEM path silently and every green run would stay green
-
-  The second is an external ask (§9's list); the third is work, and it only becomes
-  possible once the first lands.
-- **Alert images were full 1920×1080 frames. [fixed]** `image_data` is a `LargeBinary`
-  column, and `output_alert_streamer._process_alert` wrote the whole annotated frame to
-  it unresized. With a **1.0 s** alert cooldown a persisting danger condition wrote up
-  to 3600 full-HD JPEGs an hour into the database, per flight — over a gigabyte for a
-  heavy hour at 400 KB a frame.
-
-  This entry stays as a record rather than being deleted, because the second half of
-  what it cost was found only while fixing the first and is the more interesting one.
-
-  Two things made it a weakness rather than an emergency. PostgreSQL stores a `bytea`
-  over 2 KB out of line in TOAST, so a query that does not name the column does not read
-  it — which is why the `flight_detail` fix above mattered so much and why the remaining
-  cost was disk, backup size and WAL volume rather than query latency. And nothing
-  renders these anywhere near their stored size: the history grid cell is
-  `minmax(260px, 1fr)` and the live aside is a column, so the stored asset was roughly
-  twenty times the linear dimension of any consumer.
-
-  **The cost that was not on this list is memory.** db-writer's `AlertWriter` queue is
-  bounded by **count** — `ALERT_QUEUE_SIZE = 500` — and not by bytes, so a full queue of
-  full-HD frames is a couple of hundred megabytes of resident Python objects against the
-  `512Mi` limit in `configs/k8s/hub/db-writer.yaml`. The queue could reach the pod's
-  memory ceiling before the length ceiling it was sized by, and an OOM kill is `SIGKILL`,
-  so the graceful drain in `AlertWriter.stop()` never runs and the queued alerts are
-  lost. That also relieves the drain timeout: `DB_MANAGER_THREAD_CLOSE_TIMEOUT` is 5 s,
-  which 500 full-HD inserts would not have finished inside.
-
-  **The fix was to downscale before encoding, not to move the bytes**, exactly as this
-  entry predicted. `ALERTS_MAX_IMAGE_EDGE_PX = 960` caps the longest edge, so a
-  1920×1080 frame is stored at 960×540 — a quarter of the pixels, and measured at
-  roughly a third of the bytes on representative imagery. `INTER_AREA`, because this is
-  always a reduction and it is the only interpolation that averages the pixels being
-  discarded rather than sampling past them; annotation boxes and text alias badly
-  otherwise. Setting it to 0 restores the old behaviour.
-
-  The subtle half is that `image_width`/`image_height` are what the history page renders
-  with, and `_process_alert` read them from the *incoming* frame. Downscaling without
-  touching that would have labelled every row with dimensions no stored image has, so
-  `_compress_frame` now returns the encoded size and the caller no longer measures the
-  input. `tests/shared/test_alert_downscale.py` carries the control for it: the same
-  frame with resizing disabled must report different dimensions, which fails against any
-  implementation that resizes and then reports `frame.shape`.
-
-  Object storage remains the eventual answer and is consistent with recordings, but it
-  is the larger change and §11.5 is where it now lives: it needs a holder of storage
-  credentials, and it must not be done by handing out pre-signed URLs to a browser. §4's
-  alert image route checks that the alert belongs to the flight *and* the flight to the
-  caller, in the query that selects the row, because `alert_id` is sequential across
-  every tenant and these are photographs of somebody's land — and a pre-signed URL is a
-  bearer credential that bypasses exactly that check for its lifetime.
-- **The orchestrator holds the Docker socket — under the backend this repo runs.**
-  Anything that can reach its port can start containers on the host. Its port is
-  internal-only, and this was the strongest argument for the Kubernetes backend.
-
-  That backend now exists and the alternative is built: `FLIGHT_RUNTIME=kubernetes` plus
-  `configs/k8s/orchestrator-rbac.yaml` gives a service account that may create Jobs in one
-  namespace and nothing else (§2). **The weakness stays on this list anyway**, because
-  what is deployed here is still docker-compose and still mounts the socket. Having the
-  fix available is not the same as running it, and this section is about what is true on
-  this branch right now.
-
-### Built but not yet wired to anything
-
-The schema and its accessors exist and are tested; **no service consumes them yet**, so
-they change nothing about how the system currently behaves.
-
-- `db_writer/rebuild_schema.py` — destructive drop/create plus optional seeding
-
-`streams`, `stream_key`, `flights.stream_id`, `flights.public_uuid`,
-`generate_stream_key()` and `resolve_stream_key` are no longer in this list: the
-MediaMTX auth hook is their first real consumer. `flights.output_path` also drops off
-this list — it is set inside `open_flight_for_key` the moment a flight opens, and
-`/flight/open` returns it directly to the orchestrator.
-
-`UserDirectory.create_user` and the four stream-management methods have now dropped off
-too: the routes in §4 are their first real consumer, which is what made this section's
-list nearly empty. Everything here that mattered was portal work.
-
-### Designed, not built
-
-- **The cloud L4 load balancer and cert-manager (§7).** Deployment-time pieces with
-  nothing to build locally: the LB is a managed resource, and cert-manager is what
-  automates in-cluster what has now been done once by hand. The manifests
-  already expect both — three `LoadBalancer` Services, and an `agrarian-tls` Secret
-  that `configs/k8s/secrets.README.md` shows as a cert-manager `Certificate` with a
-  hand-made fallback. **That fallback is no longer hypothetical**: the leaf in
-  `certificates/server/` is a real one and can be loaded into the Secret directly, so
-  the first cluster does not have to wait for cert-manager to be working to serve
-  trusted TLS.
-
-The hub manifests have left this list — see *Built and tested*. What they leave behind
-is not manifest work: a registry to push five images to, and the load-balancer
-addresses that only exist once a provider has assigned them.
-
-The ingress tier itself has left this list. Both halves are built and tested — see
-above — which is why §8's port table no longer has a "not configured" cell in it.
-
-The Kubernetes `FlightRuntime` backend has left it too, and it took the *only* piece of
-the cluster migration that was ever a design question with it. What remains above is
-translation work.
-
-### Open
-
-- **Azure GPU vCPU quota has not been requested. [external, longest lead time]** A new
-  subscription carries little or no quota for the NC/ND families, and the request is
-  reviewed rather than granted on the spot — days, not minutes. Everything else on the
-  Azure list is an afternoon once a cluster exists, so this is the item whose start date
-  decides when the first flight can run on rented hardware. It is the Azure-shaped
-  equivalent of §9's DEM ask: not work, and not doable from here.
-- **`MEDIA_HTTP_PUBLIC_HOST` is available and undecided. [built, unset]** The portal can
-  now compose HLS and WHEP from a different host than RTMPS and the ICE candidate, which
-  is what the split-LoadBalancer topology needs; unset, it falls back and every existing
-  deployment is unchanged. **The decision is still owed**, and the two answers are: give
-  Traefik's and MediaMTX's Services one shared address (leave it unset), or set it to the
-  Traefik name. Getting it wrong fails as WHEP answering 201 with a black player, so it
-  wants deciding before the first cluster flight rather than diagnosed after one.
-- **The `/etc/hosts` override on the development machine.** `dev.agrarianlivestock.com`
-  is mapped to `127.0.0.1` locally, which is what makes the name work in a browser while
-  nothing forwards from the router. **It must be removed the day that name points at real
-  infrastructure** — a stale loopback entry outliving the dev stack means the name
-  resolves, something answers, and it is the wrong thing. Same class as the negative DNS
-  cache that stalled the first ACME run, in the opposite direction.
-- **Nothing re-checks the certificate between renewals — [closed 2026-08-10].**
-  `scripts/check_certs.sh` asks the listeners daily from cron. See *Built and tested*.
-- **Upgrades of MediaMTX are now a deliberate act.** The image is pinned to
-  `1.19.3-ffmpeg` rather than tracking `latest-ffmpeg`, which is what stops a default
-  changing underneath this stack the way SRT and MoQ did in v1.19 (§4). The cost is the
-  other direction: a security fix now waits for somebody to bump the tag, and nothing
-  here watches for one.
-- **db-writer's own `/login` is rated — [closed 2026-08-10].** See *Built and tested*.
-
-  Still deliberately not addressed, at either layer: the response time of `/login`
-  distinguishes "no such user" from "wrong password", because bcrypt runs only in the
-  second case. `/register` discloses exactly the same fact outright by design, so a dummy
-  hash on every failed login would cost real time and conceal nothing.
-- **No email verification.** Registration accepts any syntactically valid address
-  without proving the registrant controls it, so an account can be created against
-  somebody else's address. Little is at stake while nothing is emailed — no password
-  reset exists either — and both land together when one is needed.
-- **A user may still fly their cap continuously.** `MAX_STREAMS_PER_USER` (§4) bounds
-  how many flights one account can run *at once*, which was the open hole when open
-  registration met `POST /streams`. What it does not bound is duration or total GPU
-  hours: ten slots flying all day is within the cap. Quota and billing are the answer,
-  and neither exists — this only becomes pressing once the Kubernetes node pool in §2
-  can create machines on demand.
-- **Signing out drops the cookie; it does not revoke the token.** A session token stays
-  valid for its full eight hours whatever the user clicks, because there is no
-  revocation list — that is the price of a stateless session and the reason the lifetime
-  is hours rather than weeks. It covers logging out on a shared machine and does not
-  cover a token already copied. A deny-list in Redis would fix it and would put a
-  server-side lookup back on every request, which is the thing §4 is careful not to do;
-  worth revisiting only if a real reason to force logout appears.
-- **MediaMTX is the one hub component a load balancer cannot scale.** A path lives on
-  exactly one instance — the one the flight's app container published to — so a viewer of
-  `out/<uuid>` must reach *that* instance. Round-robin an L4 load balancer across MediaMTX
-  replicas and viewers land on instances that have never heard of the path. This is the
-  weak point in §2's "the hub scales on load": ws-server was deliberately made stateless
-  through Redis pub/sub and db-writer holds nothing, but MediaMTX is stateful per path and
-  no amount of load balancing changes that. The options when it matters are path-aware
-  routing (the portal already knows which instance holds each flight, since flights are
-  assigned when they open), a relay tree where replicas pull from the origin with
-  `source: whep://…`, or sharding flights across instances by path.
-
-  Not urgent, and worth being clear why: one MediaMTX serves far more concurrent viewers
-  than this system can produce flights, because each flight costs a whole GPU container
-  and each viewer costs a peer connection. **The GPU tier saturates first, by orders of
-  magnitude.** This becomes real only once the node pool in §2 is large.
-- **ICE-TCP does not cover a network that permits only 443.** `webrtcLocalTCPAddress`
-  handles the common case — firewalls that pass TCP but no UDP — in the same WHEP session,
-  with the same token and the same latency, which is why the portal dropped its HLS
-  fallback rather than vendoring a second player. What it does not handle is a network
-  where nothing but 443 leaves at all: port 8189 is as blocked as 8189/udp was. The real
-  answers there are TURN over 443 or HLS proxied through the ingress tier on 443 (§8
-  already routes HLS through it). The ingress tier they were waiting on now exists, so
-  what is left gating them is a reason: neither is worth building before a real user
-  reports being unable to watch.
-- **A recording is a location, not a download.** History reaches every row the system
-  records, but the recordings table stores a blob name or a path on the recordings
-  volume, and the portal shows it as text. Handing the segment over means either the
-  portal holding the deployment's object-storage credentials — which §7 keeps out of the
-  tier facing the internet, for the same reason it keeps `SESSION_JWT_SECRET` out — or
-  db-writer minting pre-signed URLs, which is a small feature and a real decision about
-  which service owns storage credentials. Neither is a history feature, which is why
-  this is here and not in what was built.
-- **A flight's alert list is no longer capped — [closed 2026-08-10].** See
-  *Built and tested*; the cursor paging pattern was applied a second time.
-- **Recorder per-tenant upload prefixes — [closed 2026-08-10].** See *Built and tested*.
-- **The renewal hook is written, has been run for real, and is now scheduled**
-  (weekly renewal at 03:00 Monday, daily check at 06:30, both `cd`-ing into the repo
-  because cron runs from `$HOME`).
-  `scripts/renew_certs.sh` renews and then does the three different things the three
-  terminators need — `touch` Traefik's watched directory, `SIGHUP` Mosquitto, and
-  deliberately nothing to MediaMTX, which rereads per handshake and dies on `SIGHUP`.
-
-  **Rehearsed with `--force` on 2026-08-10, before the deadline rather than on it.** A
-  genuinely new certificate was issued, installed, and all three terminators were then
-  observed serving the **new serial on fresh connections** — the check that matters,
-  since a correct file and a stale listener are indistinguishable from the filesystem.
-  §7's reload table is now confirmed against a real public certificate rather than only
-  against a local CA. Expiry moves to **2026-11-08**.
-
-  **The renewal changed the intermediate, and that is what justified the third file.**
-  The first leaf chained through Let's Encrypt `YR2` and the renewed one through `YR1`.
-  `mosquitto.conf` names `ca.crt` as its `cafile`, so a two-file copy would have left it
-  pointing at an intermediate unrelated to the leaf beside it — on the very first
-  renewal, silently, because `require_certificate false` means nothing verifies against
-  it. The three-file copy stopped being a precaution and became load-bearing within a
-  day of being written.
-
-  **What this run did NOT exercise: DNS-01.** Let's Encrypt reported *"Authorization is
-  already valid; skipping the challenge"* for both names, reusing the authorization from
-  the morning's first issuance. So the Cloudflare token and the propagation path were
-  proven earlier that day but not by this run, and the October renewal — past the
-  authorization's lifetime — will be the first to re-exercise them unattended.
-
-  Two findings about the tool rather than the design. lego v5 has **no `renew`
-  subcommand** — `run` does both, so the obvious spelling fails on every invocation. And
-  `run` against an existing certificate **exits 0 having issued nothing** when renewal is
-  not due, which is correct for a cron job and is exactly the silent no-op that made a
-  staging leaf look like a successful production issuance. The script therefore compares
-  the serial before and after and treats "unchanged" as "nothing to reload" rather than
-  as success. Note also that `run` sleeps a random interval before renewing, to spread
-  load across the CA — harmless from cron, surprising when run by hand.
-
-  **Mosquitto's `SIGHUP` still has no answer under Kubernetes.** cert-manager and the
-  kubelet cover Traefik and MediaMTX there; nothing in the manifests signals Mosquitto,
-  and this script is a compose-side answer only.
-- **Auth-endpoint caching and db-writer replica count.** Every publish and every read
-  now costs one indexed lookup here. A short-TTL cache is the obvious fix and the wrong
-  one to reach for blindly: it delays revocation of a credential that has no expiry.
-  Replicas first, cache only if measurement demands it.
+## 9. Where things stand
+
+Sections 1–8 describe the system as it is. This section says which parts are running,
+what evidence stands behind each, what is known to be wrong, and what to do next.
+
+**It is not a changelog.** How a thing came to be built is in git; what is true now is
+here. Where a finding still teaches something — a trap that will catch the next person —
+it lives in the section it belongs to rather than in a list of past work.
+
+### What backs each claim
+
+Tests are in `tests/comms/`, with a README covering what each guards. The shell runners
+stand up their own containers and clean up after themselves; the `test_*.py` files need
+no stack. Every runner that mounts the real `mediamtx.yaml` or `mosquitto.conf` issues a
+throwaway certificate first, because both terminate their own TLS and MediaMTX exits at
+startup without one.
+
+| Capability | Evidence |
+| --- | --- |
+| Account registration, login, session tokens | `test_schema.py`, `test_session_tokens.py`, `run_portal_auth.sh` — against real PostgreSQL, two replicas |
+| Stream slot CRUD, the per-user cap | `test_schema.py`, `run_portal_auth.sh` — cap proven under 20 simultaneous adds across two replicas |
+| MediaMTX authorization, publish and read | `test_mediamtx_auth.py`, `run_mediamtx_auth.sh` — real publishes and HLS reads, two tenants |
+| Mosquitto authorization and telemetry isolation | `test_mqtt_auth.py`, `run_mqtt_auth.sh` |
+| Per-flight publisher tokens on every write path | `test_tokens.py`, `test_tenancy.py` |
+| ws-server per-flight isolation, Redis fan-out | `test_tenancy.py`, `test_replicas.py`, `run_redis_failure.sh` |
+| db-writer replica safety | `run_db_replication.sh` — two replicas, real PostgreSQL |
+| Flight lifecycle, reconnect, crash recovery | `test_orchestrator.py`, `run_orchestrator.sh`, `run_orchestrator_recovery.sh` |
+| The GPU app in both modes, driven by the orchestrator | `run_orchestrator_real_app.sh` — real GPU |
+| Portal pages, flight history, alert paging | `run_portal.sh` (158), `test_flight_history.py`, `test_alert_paging.py` |
+| Per-slot mode, geofence, camera profile | `test_app_mode.py`, `test_geofence.py`, `test_camera.py`, `run_portal.sh` |
+| Rate limiting, public and internal | `run_portal.sh`; db-writer's own `/login` driven against real Redis |
+| Ingress TLS on all three terminators | `run_traefik_tls.sh`, `run_ingress_tls.sh` |
+| Certificate renewal and reload behaviour | `run_cert_renewal.sh`, plus one real forced renewal |
+| Recording upload and per-tenant prefixes | `run_recording_upload.sh` |
+| Kubernetes `FlightRuntime` and the hub manifests | `run_k8s_runtime.sh`, `run_hub_manifests.sh` — k3s in a container |
+| One media cell's capacity | `run_media_capacity.sh` — 48 concurrent flights, no degradation |
+
+Two claims rest on **human observation rather than assertion**, and nothing re-checks
+either: a person watched the annotated video play in Chrome and Firefox, and every page
+was looked at in a browser at desktop and phone width. A change to `watch.js` or the
+stylesheet can break both silently.
+
+**The habit that matters more than any count above:** properties that could pass
+vacuously are checked by breaking them. Cursor paging is proven by an `OFFSET` control
+that repeats a row; the stream cap by removing the row lock and watching it overshoot;
+tenancy by deleting the `user_id` filter and confirming the assertions fail; `/dev/shm`
+sizing by a control pod that gets 64 MB. A test that cannot fail is not evidence, and
+several here were vacuous until that was checked.
+
+### What to do next
+
+Two external asks, neither of which is work and both of which gate everything after
+them:
+
+1. **A DEM raster** (`dem/dem.tif`, `dem/dem_mask.tif`). Without it `danger_detection`
+   runs with slope and no-data analysis skipped. The code is not the unknown — it ran
+   against real elevation data during the app's development — but nothing here
+   exercises it, and no automated coverage can exist until a raster does.
+2. **Azure GPU vCPU quota.** Reviewed rather than granted on request, so it is days.
+   Everything else Azure-shaped is an afternoon once a cluster exists.
+
+Then, in order:
+
+3. **Decide `MEDIA_HTTP_PUBLIC_HOST`** before the first cluster flight. Either both
+   LoadBalancer Services share one address (leave it unset) or it names Traefik's.
+   Getting it wrong fails as WHEP answering 201 with a black player.
+4. **Push five images to a registry**, fill `configs/k8s/endpoints.env`, and choose a
+   storage class. None of this can be done before a cluster exists.
+5. **Measure a cell properly**, from more than one machine and with WebRTC viewers.
+   The floor is 48 flights; the ceiling is unknown.
+
+### Known weaknesses
+
+Live on this branch right now, as distinct from work not yet started.
+
+- **The DEM is absent everywhere here, so the geo stage runs degraded.**
+  `open_dem_tifs()` returns `None` and slope and no-data analysis are skipped;
+  geofencing and the safety radius still run. The harness reports which of the two it
+  got, so a green run is never mistaken for full geo coverage. What is missing is a
+  raster and then the regression coverage that needs one.
+- **The orchestrator holds the Docker socket under the backend this repo runs.**
+  Anything reaching its port can start containers on the host. The alternative is built
+  — `FLIGHT_RUNTIME=kubernetes` with a ServiceAccount scoped to Jobs in one namespace —
+  but what is deployed here is still compose, and having the fix is not running it.
+- **Nothing re-checks the browser observations.** See above.
+
+### Open questions
+
+Grouped by what each is waiting for, because "open" has meant several different things
+in this document and the difference decides whether anything should be done.
+
+**Waiting on a measurement or a complaint** — building these now would be speculative:
+
+- **MediaMTX cannot be scaled by a load balancer.** A path lives on the instance its
+  publisher connected to, so a viewer must reach *that* one. The options are path-aware
+  routing, a relay tree, or sharding by path. Not urgent, and now for a measured
+  reason: one instance carried 48 concurrent flights while a GPU carries one.
+- **ICE-TCP does not cover a network that permits only 443.** TURN over 443, or HLS
+  proxied through the ingress tier, are the answers. Neither is worth building before a
+  real viewer reports being unable to watch.
+- **Auth-endpoint caching.** Every publish and read costs one indexed lookup. A cache
+  delays revocation of a credential that has no expiry, so: replicas first, cache only
+  if measurement demands it.
+
+**Waiting on a feature that does not exist yet:**
+
+- **No email verification**, and no password reset. Both land together when either is
+  needed.
+- **Quota and billing.** `MAX_STREAMS_PER_USER` bounds concurrency, not duration or
+  total GPU hours. Ten slots flying all day is within the cap.
+- **A recording is a location, not a download.** Handing the segment over means the
+  portal holding storage credentials — which §7 keeps out of the internet-facing tier —
+  or db-writer minting pre-signed URLs. A real decision about which service owns storage
+  credentials, not a history feature.
+
+**Deliberate trades, recorded so they are not mistaken for oversights:**
+
+- **Signing out drops the cookie; it does not revoke the token.** The price of a
+  stateless session, and why the lifetime is hours. A deny-list would put a server-side
+  lookup back on every request.
+- **TLS is optional on the drone side, not compulsory.** Every encrypted listener
+  exists and the portal prints the encrypted URL; the plaintext ones remain as the
+  fallback §7 describes. Turning `optional` into `strict` is a two-line change, gated
+  on knowing whether any drone that will actually fly needs it.
+- **MediaMTX upgrades are now manual**, because the image is pinned. That is what stops
+  a default changing underneath the stack, and it costs a person noticing security
+  fixes.
+
+**Genuine gaps with no blocker but nobody's hand up:**
+
+- **Mosquitto's `SIGHUP` on renewal has no answer under Kubernetes.** cert-manager and
+  the kubelet cover Traefik and MediaMTX there; nothing signals Mosquitto.
+  `scripts/renew_certs.sh` handles it under compose only.
+- **The DEM half of per-tenant configuration is untested**, because §11.4's per-tenant
+  raster is not built and there is no ownership path to break.
 
 ---
 
@@ -2486,15 +1493,9 @@ This is a decided direction, recorded here because it changes three things §3, 
 stops being spawned by the media server, and MediaMTX stops being a single instance.
 Sections above describe what runs today and remain accurate as such.
 
-**Almost none of it is built.** Items land one at a time and are marked here as they
-do, so that this section never reads as more finished than it is:
-
-| Landed | |
-| --- | --- |
-| `RECONNECT_GRACE_S` 30 s → 120 s (§10.2) | **[built]** 2026-08-06 |
-| `recordSegmentDuration` 1 h → 24 h (§10.2) | **[built]** 2026-08-06 |
-
-Everything else below is **[designed]**.
+**Almost none of it is built**, and the two exceptions are settings rather than
+structure: `RECONNECT_GRACE_S` is 120 s and `recordSegmentDuration` is 24 h, both for
+reasons §10.2 gives. Everything else below is a decision, not a description.
 
 The architecture rests on two pillars that were never examined together: a drone
 **arrives unannounced**, and its key is **stable until revoked**. Each forces real
@@ -2881,19 +1882,19 @@ Three consequences, and the third is the one that decided it:
   That cap bounds concurrency, not churn — mint, let expire, mint again. Key creation
   needs a rate limit of its own, in the Redis the portal already uses for `/login` and
   `/register` (§4).
-- **A cell's capacity has a floor under it now, and still no ceiling. [partly closed
-  2026-08-10]** `run_media_capacity.sh` carried **48 concurrent flights (240 flows)
-  with no degradation at all** on one MediaMTX at a ninth of one 24-core host — see
-  *Built and tested*. The standing claim that the GPU tier saturates first is
-  therefore no longer unevidenced: 48 flights is 48 GPUs.
+- **A cell's capacity has a floor but no ceiling.** `run_media_capacity.sh` carried
+  **48 concurrent flights — 240 flows on the model above — with nothing degrading**:
+  every reader received every byte, MediaMTX logged no warning, and it used about a
+  ninth of one 24-core host for a gigabit of combined throughput. That settles the
+  claim the GPU tier saturates first, since 48 flights is 48 GPUs.
 
-  What is still open is the number itself. The ramp stopped because the load
-  generator ran out of host, not because MediaMTX did, so 48 is a floor. And the
-  measurement is an upper bound in the other direction — RTMP readers rather than
-  WebRTC, no TLS, one loopback bridge — so the operating figure sits somewhere below
-  whatever the true ceiling is. Closing this properly needs load driven from more
-  than one machine, and viewers that pay for their own DTLS-SRTP.
-- **Whether the drone controller persists the ingest URL is moot. [closed]** It was
+  The number itself is still open, from both directions. The ramp stopped because the
+  *load generator* ran out of host, not because MediaMTX did, so 48 is a floor. And it
+  is an upper bound on the real thing — RTMP readers rather than WebRTC, no TLS, one
+  loopback bridge — so the operating figure is lower than whatever the true ceiling is.
+  Closing this needs load from more than one machine, with viewers paying for their own
+  DTLS-SRTP.
+- **Whether the drone controller persists the ingest URL is moot.** It was
   asked because per-flight keys would cost a transcription that permanent keys did not,
   *if* the controller remembered the old URL. It does not matter: under §10.1 the key is
   minted per flight, so the operator visits the portal before every takeoff regardless.
@@ -2915,24 +1916,20 @@ Three consequences, and the third is the one that decided it:
 
 ---
 
-## 11. The configuration plane **[designed]**
+## 11. Per-slot configuration — mostly built
 
-Most of §11 depends on §10 and is meaningless without it: the whole of it follows from
-a human being present at the moment a flight is provisioned.
+**Read the split first, because it is not what the section order suggests.**
 
-**One part does not, and it has landed.** Per-slot configuration needs only that
-db-writer can resolve a stream key to its owner when a flight opens, which it has always
-done — so the mode moved without waiting for anything:
-
-| Landed | |
+| | |
 | --- | --- |
-| `APP_MODE` per stream slot (§11.1, §11.7) | **[built]** 2026-08-06 |
-| Geofence per stream slot, named and reusable (§11.1, §11.3) | **[built]** 2026-08-06 |
-| Camera profiles, named and reusable (§11.2) | **[built]** 2026-08-06 |
-| All three driven over real HTTP in `run_portal.sh` (158 assertions) | **[built]** 2026-08-06 |
+| **Built** | `APP_MODE`, geofence and camera profile, all per stream slot; named and reusable rows the user owns; snapshotted onto the flight |
+| **Designed** | the DEM only — §11.4, §11.5, §11.6 — which needs object storage rather than another column |
 
-Everything else below is **[designed]** — which is now only the DEM, and it is the one
-piece that genuinely needs the object-storage work rather than another column.
+The built half was expected to wait on §10 and did not have to. It needs only that
+db-writer can resolve a stream key to its owner when a flight opens, which it always
+could — so per-slot configuration landed without a human being present at provisioning
+time, which is the thing §10 would add. What §10 changes is choosing *per flight*
+rather than per slot.
 
 ### 11.1 The environment has three halves, not two
 
@@ -3269,9 +2266,7 @@ paragraph expires.**
   it (§11.3).
 - **Object-storage tenancy stops being a recorder-only question** and needs deciding
   once, for both rasters and recordings (§11.5).
-- **Per-tenant configuration now has the same falsification the credential side has
-  [built, 2026-08-10].** This entry used to say nothing here was trustworthy until the
-  tests had been shown to fail. They have been.
+- **Per-tenant configuration carries the same falsification the credential side does.**
 
   `UserDirectory` enforces ownership with `user_id=user_id` inside the query that
   selects the row, in **ten places** across geofences and camera profiles. Each was
@@ -3305,5 +2300,5 @@ paragraph expires.**
   properties §11.2 and §11.3 describe separately are entangled in practice, which is an
   argument for both rather than a defect in either.
 
-  **Still not covered: the DEM**, which this entry also asked for. There is no DEM
-  ownership path to break, because §11.4's per-tenant raster is not built.
+  **The DEM is not covered**, because §11.4's per-tenant raster is not built and there
+  is no ownership path to break.
