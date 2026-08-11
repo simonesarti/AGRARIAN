@@ -41,6 +41,7 @@ from db_manager import (
     StreamNotFound,
     UserDirectory,
 )
+import login_rate_limit
 from media_auth import Denied, authorize, credential_from
 from mqtt_auth import Denied as MqttDenied
 from mqtt_auth import authorize as mqtt_authorize
@@ -241,6 +242,9 @@ class AlertRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _writer.start()
+    # Optional and fails open: a deployment with no REDIS_URL keeps working
+    # exactly as it did, with a warning rather than a refusal to start.
+    login_rate_limit.init()
     yield
     _writer.stop()
 
@@ -308,20 +312,38 @@ def login(req: CredentialsRequest):
     password". bcrypt runs only in the second case, so the timing does distinguish
     them — but /register already discloses exactly the same fact outright, by
     design, so hiding it here would cost a dummy hash on every failed login and
-    conceal nothing. What is genuinely missing is rate limiting: this is a password
-    oracle open to whoever can reach it, slowed only by bcrypt's own cost. See §9.
+    conceal nothing.
+
+    RATE LIMITED PER ACCOUNT, and deliberately looser than the portal's limit.
+    §4 bounds the public door; this is the inner one, for the case §9 names — a
+    caller already on the private network. It counts per account only, never per
+    address: every request here arrives from the portal, so an address counter
+    would put every tenant in one bucket. See login_rate_limit for the rest.
     """
+    wait = login_rate_limit.blocked(req.email)
+    if wait is not None:
+        # Checked BEFORE authenticate(), so an over-limit attempt costs no bcrypt
+        # verification — otherwise the limiter becomes the cheapest known way to
+        # load this service with expensive work, which is the same reasoning §4
+        # gives for checking before db-writer is called at all.
+        logger.warning("Login refused: account over its failure budget")
+        raise HTTPException(status_code=429, detail="Too many failed attempts",
+                            headers={"Retry-After": str(wait)})
     try:
         user_id = _directory.authenticate(req.email, req.password)
     except ValueError:
         # Deliberately not echoing the reason: it distinguishes an unknown address
         # from a wrong password to anyone reading the response body.
+        login_rate_limit.record_failure(req.email)
         logger.warning("Login failed")
         raise HTTPException(status_code=401, detail="Invalid credentials")
     except Exception as e:
         logger.error(f"Unexpected error during login: {e}")
         raise HTTPException(status_code=500, detail="Login failed")
 
+    # A correct password clears the budget. There is no second counter that has to
+    # survive here, unlike the portal's per-address one.
+    login_rate_limit.clear(req.email)
     logger.info(f"Login: user_id={user_id}")
     return {"user_id": user_id, "session_token": mint_session_token(user_id)}
 
@@ -913,6 +935,33 @@ def record_upload(req: RecordingRequest):
         logger.warning(f"Recording upload for unknown output path: {req.public_uuid!r}")
         raise HTTPException(status_code=404, detail="Unknown public_uuid")
     return {"flight_id": flight_id}
+
+
+@app.get("/recording/tenant/{public_uuid}")
+def recording_tenant(public_uuid: str):
+    """
+    Which tenant owns out/<public_uuid>. For the recorder, before it uploads.
+
+    §11.5 separates tenants in object storage by key prefix rather than by account,
+    and a prefix has to be chosen before the object is written — there is no
+    retroactive move that is not a copy and a delete. So the recorder asks this
+    first, derives `tenants/<user_id>/recordings/...` itself, and keeps its own
+    credentials, which is the arrangement §11.5 settles on for a component that only
+    ever writes and never reads.
+
+    INTERNAL ONLY, on the same footing as /recording and /auth/mediamtx: the caller
+    is a sidecar on the private network. Note what this does and does not disclose —
+    it maps an output uuid to a user_id, both of which the caller must already hold
+    or have been handed. It is not a lookup a tenant could use to enumerate
+    anything: public_uuid is random (§5), so possession of one is the whole
+    credential-shaped fact here, and the same reasoning already applies to
+    /recording next door.
+    """
+    user_id = _directory.tenant_of_output_path(public_uuid)
+    if user_id is None:
+        logger.warning(f"Tenant lookup for unknown output path: {public_uuid!r}")
+        raise HTTPException(status_code=404, detail="Unknown public_uuid")
+    return {"user_id": user_id}
 
 
 @app.post("/auth/mediamtx")

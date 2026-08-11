@@ -51,6 +51,16 @@ spec:
               value: "43200"
             - name: PUBLISHER_TOKEN_TTL_S
               value: "86400"
+            # Bounds password guessing at db-writer's OWN /login — the inner door,
+            # for a caller already on the cluster network. The portal's limiter
+            # still bounds the public one and is not replaced by this.
+            #
+            # Database 2: the portal's rate limiter owns 1 and ws-server's fan-out
+            # owns 0. It fails open, so an unreachable Redis costs the limit and
+            # not the service — which is also why nothing here waits on Redis
+            # being ready.
+            - name: REDIS_URL
+              value: redis://redis:6379/2
           envFrom:
             # Database host/name and the worker credentials. A managed Postgres
             # is outside the cluster, so this is a connection string rather than

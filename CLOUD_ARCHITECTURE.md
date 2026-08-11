@@ -466,7 +466,7 @@ until it bites:
 | ws-server | Shared, replicated on load | Per-flight JWT (view + publish scopes); Redis pub/sub fan-out | **[built]** |
 | db-writer | Shared, replicated on load | Stateless per request; bcrypt user auth | **[built]** |
 | Redis | Shared | Channel per flight (`flight:{id}`); rate-limit counters on db 1 | **[built]** |
-| Recorder | Shared | Segment → flight_id resolved via `recordings` table | upload **[built]**, per-tenant prefix **[open]** |
+| Recorder | Shared | Segment → flight_id resolved via `recordings` table; `tenants/<user_id>/…` key prefix | **[built]** |
 | Orchestrator | Shared | Spawns/stops app containers | **[built]** |
 | Portal | Shared, replicated on load | Session token → `user_id`, read from the claim not the URL | **[built]** |
 
@@ -1462,6 +1462,92 @@ billing).
 
 ### Built and tested
 
+- **One MediaMTX carries at least 48 concurrent flights, and the ceiling was not
+  found** (§10.8, 2026-08-10). `tests/comms/run_media_capacity.sh` builds §10.6's
+  five-flow model per flight — publish `in/N`, a relay standing in for the GPU app
+  republishing to `out/N`, and two readers — and ramps until readers stop receiving
+  everything the publisher sent.
+
+  | flights | flows | in Mbps | out Mbps | MediaMTX CPU | mem | worst ratio |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 8 | 40 | 66 | 100 | 40% | 29 MB | 1.0000 |
+  | 16 | 80 | 133 | 199 | 80% | 36 MB | 1.0000 |
+  | 32 | 160 | 266 | 400 | 175% | 44 MB | 1.0000 |
+  | 48 | 240 | 400 | 599 | 261% | 60 MB | 1.0000 |
+
+  **Nothing degraded.** At 48 flights every reader received every byte, MediaMTX
+  logged not one warning, and it was using 261% of the 2400% this 24-core host has —
+  about a ninth of the machine — for a gigabit of combined throughput. The ramp then
+  failed at 64, and **that failure was the harness, not the server**: twelve relays
+  never started and only 136 of 192 readers attached, because 320 ffmpeg containers
+  is more than this host will run. The run reports that case separately for exactly
+  that reason; an earlier version of the script called it "degradation at 64", which
+  would have written a host limit into this document as a capacity.
+
+  **So 48 is a floor and the real number is higher.** What it settles is the claim
+  §9 has been making without evidence: *the GPU tier saturates first, by orders of
+  magnitude*. Forty-eight concurrent flights is forty-eight GPUs, and one MediaMTX
+  was at a ninth of one machine. That claim now has a measurement under it, and
+  MediaMTX sharding stays correctly filed as not urgent.
+
+  **Read it as an upper bound on the real deployment**, and the gap is not small.
+  Readers here are RTMP; real viewers arrive over WebRTC, where §10.6 notes every
+  one costs its own DTLS-SRTP encryption. The publisher is plaintext; a real drone
+  uses RTMPS. And both ends sit on one loopback bridge, which removes the jitter,
+  loss and reordering that actually make a reader fall behind. §10.5's headroom
+  formula and §10.6's `total flows ÷ 5` now have a number to work from, but a
+  conservative one is still owed before either becomes a scaling policy.
+
+  Two harness defects were found and fixed before any of the above was believed,
+  and both had inflated capacity rather than deflating it: blind `sleep`s sampled
+  half-built flights, and viewers exited seconds after attaching because ffmpeg was
+  prompting to overwrite `/dev/null` without `-y` — passing the readiness gate and
+  then vanishing, so the ramp measured one reader per flight instead of three.
+- **Per-tenant upload prefixes for recordings** (§4, §11.5, 2026-08-10). Segments now
+  land under `tenants/<user_id>/recordings/<public_uuid>/`, which is §11.5's scheme
+  and the same one the DEM work will use — one storage account, tenants separated by
+  key prefix rather than by holding anybody's cloud credentials.
+
+  **The ordering is the whole of the change.** The recorder used to upload and then
+  report; a prefix has to be chosen *before* the object is written, because there is
+  no retroactive move that is not a copy and a delete. It cannot derive `user_id`
+  itself either — MediaMTX hands it an output path and §5 keeps ownership on
+  `streams`, a join away — so db-writer answers `GET /recording/tenant/{public_uuid}`
+  and the recorder builds the prefix. That keeps this service something that only
+  ever writes, which is the property §11.5 cites for letting it keep its own
+  credentials instead of being moved onto minted URLs.
+
+  **It fails closed**, and that is the assertion worth having: an unresolvable tenant
+  stops the upload rather than falling back to a shared location, the segment stays
+  on the volume, and `DELETE_LOCAL_ON_SUCCESS` cannot fire because nothing succeeded.
+  Verified with a control — `_azure` is called zero times for an unknown uuid and
+  exactly once for a known one, so the refusal is a statement about the tenant rather
+  than about `_upload` being broken for everything. The deployment's own
+  `RECORDING_AZURE_BLOB_PREFIX` now wraps the tenant prefix instead of replacing it.
+  `run_recording_upload.sh` still passes 8/8 on the `local` backend, which is exempt
+  because it moves nothing.
+- **Rate limiting on db-writer's own `/login`** (§9, 2026-08-10). The inner door. §4
+  bounds the public one at the portal; this bounds the case §9 named — a caller
+  already on the private network guessing at bcrypt's pace.
+
+  **One counter, per account, and deliberately not two.** The portal keeps a
+  per-address counter as well because neither bound implies the other. Here that
+  would be actively harmful: every request db-writer sees arrives from the portal, so
+  an address counter would put every tenant on earth in one bucket and the first
+  attacker would lock out everybody — the same failure §8 describes for
+  `TRUSTED_PROXY_HOPS` set too low, reached by a different route. The limit is also
+  an order of magnitude looser than the portal's, because an inner door that rejects
+  what the outer door approved is a fault rather than a defence.
+
+  Driven against real Redis: 100 failures return 401 and the 101st returns **429**
+  with a `Retry-After`, a **correct** password is still refused while blocked (the
+  check runs before `authenticate()`, so an over-limit attempt costs no bcrypt), a
+  different account is unaffected, and a success clears the budget — 60 failures, one
+  success, 60 more failures, still 401. **It fails open**: with Redis stopped a
+  correct sign-in returns 200 and a wrong one 401 rather than 500, and it recovers
+  when Redis returns. `REDIS_URL` is optional here rather than required, so a
+  deployment that has not been updated keeps working, with a warning at startup that
+  says the endpoint is unrated.
 - **Cursor paging over a flight's alerts** (§4, 2026-08-10). The detail page used to
   show the newest fifty and label the truncation honestly, with no way past it. It now
   pages by `alerts_before`, an `alert_id` cursor, in the same keyset scheme
@@ -2288,12 +2374,7 @@ translation work.
   changing underneath this stack the way SRT and MoQ did in v1.19 (§4). The cost is the
   other direction: a security fix now waits for somebody to bump the tag, and nothing
   here watches for one.
-- **db-writer's own `/login` is still unrated.** The public door is now bounded (§4),
-  but the endpoint behind it is not: anything that can reach db-writer directly can still
-  guess passwords at bcrypt's pace. That is internal-only by §8 and so is not currently
-  reachable, which is the whole reason this is a note rather than a hole — it becomes one
-  the moment something else on the private network is compromised, or the day db-writer is
-  routed anywhere it should not be.
+- **db-writer's own `/login` is rated — [closed 2026-08-10].** See *Built and tested*.
 
   Still deliberately not addressed, at either layer: the response time of `/login`
   distinguishes "no such user" from "wrong password", because bcrypt runs only in the
@@ -2350,7 +2431,7 @@ translation work.
   this is here and not in what was built.
 - **A flight's alert list is no longer capped — [closed 2026-08-10].** See
   *Built and tested*; the cursor paging pattern was applied a second time.
-- Recorder per-tenant upload prefixes
+- **Recorder per-tenant upload prefixes — [closed 2026-08-10].** See *Built and tested*.
 - **The renewal hook is written, has been run for real, and is now scheduled**
   (weekly renewal at 03:00 Monday, daily check at 06:30, both `cd`-ing into the repo
   because cron runs from `$HOME`).
@@ -2800,12 +2881,18 @@ Three consequences, and the third is the one that decided it:
   That cap bounds concurrency, not churn — mint, let expire, mint again. Key creation
   needs a rate limit of its own, in the Redis the portal already uses for `/login` and
   `/register` (§4).
-- **Nobody has measured a cell's capacity. [open]** Every number in §10.5 and §10.6
-  depends on what one MediaMTX actually holds, and the figure has never been measured —
-  including the standing claim that the GPU tier saturates first. Publishing N
-  synthetic streams into one instance with viewers attached, and finding where frames
-  start dropping, is the prerequisite that turns this section from a sketch into a
-  configuration. **It is the first thing to do here.**
+- **A cell's capacity has a floor under it now, and still no ceiling. [partly closed
+  2026-08-10]** `run_media_capacity.sh` carried **48 concurrent flights (240 flows)
+  with no degradation at all** on one MediaMTX at a ninth of one 24-core host — see
+  *Built and tested*. The standing claim that the GPU tier saturates first is
+  therefore no longer unevidenced: 48 flights is 48 GPUs.
+
+  What is still open is the number itself. The ramp stopped because the load
+  generator ran out of host, not because MediaMTX did, so 48 is a floor. And the
+  measurement is an upper bound in the other direction — RTMP readers rather than
+  WebRTC, no TLS, one loopback bridge — so the operating figure sits somewhere below
+  whatever the true ceiling is. Closing this properly needs load driven from more
+  than one machine, and viewers that pay for their own DTLS-SRTP.
 - **Whether the drone controller persists the ingest URL is moot. [closed]** It was
   asked because per-flight keys would cost a transcription that permanent keys did not,
   *if* the controller remembered the old URL. It does not matter: under §10.1 the key is

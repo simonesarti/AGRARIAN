@@ -1340,6 +1340,34 @@ class UserDirectory:
             flight = session.query(Flight).filter_by(public_uuid=public_uuid).first()
             return flight.flight_id if flight else None
 
+    def tenant_of_output_path(self, public_uuid: str) -> Optional[int]:
+        """
+        The user_id that owns the flight publishing to out/<public_uuid>, or None.
+
+        Exists for the recorder, which needs a tenant BEFORE it uploads rather than
+        after: §11.5 separates tenants in object storage by key prefix
+        (`tenants/<user_id>/recordings/...`), and a prefix cannot be applied
+        retroactively to an object already written under a shared one.
+
+        record_upload() below resolves the same public_uuid, and the two are
+        deliberately not merged. That one runs *after* a successful upload and its
+        job is to write a row; this one runs *before* and its job is to answer a
+        question. Folding them together would mean either uploading before knowing
+        where to put it, or writing a recording row for an upload that has not
+        happened yet.
+
+        The join goes through streams, because a flight carries no user_id — §5
+        keeps ownership in exactly one place and this is one of the readers that
+        has to walk there.
+        """
+        SessionFactory = sessionmaker(bind=self._engine)
+        with SessionFactory() as session:
+            row = (session.query(Stream.user_id)
+                   .join(Flight, Flight.stream_id == Stream.stream_id)
+                   .filter(Flight.public_uuid == public_uuid)
+                   .first())
+            return row[0] if row else None
+
     def record_upload(
             self,
             public_uuid: str,

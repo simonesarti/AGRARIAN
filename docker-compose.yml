@@ -287,9 +287,23 @@ services:
         # Not `service_started`: db-writer opens a connection pool at import time, so
         # racing an initialising PostgreSQL fails the container rather than retrying.
         condition: service_healthy
+      redis:
+        # Only for /login rate limiting, which fails open — so this is `started`
+        # rather than `healthy`. A Redis that never comes up must not stop db-writer
+        # serving, since everything else here works without it.
+        condition: service_started
     ports:
       - "8002:8000"     # HTTP API — app POSTs alerts here from outside the comms network
     environment:
+      # Database 2: the portal's rate limiter owns 1 and ws-server's fan-out owns 0.
+      # Nothing would collide — these are INCR keys and those are pub/sub channels —
+      # but a FLUSHDB aimed at one should not reach the others.
+      #
+      # This bounds password guessing at db-writer's OWN /login, the inner door §9
+      # describes. The portal's limiter (§4) still bounds the public one and is not
+      # replaced by this; the two count different things, per account here and per
+      # account AND address there.
+      REDIS_URL:          ${DB_WRITER_REDIS_URL:-redis://redis:6379/2}
       DB_SERVICE:         ${DB_SERVICE:-postgresql}
       DB_HOST:            ${DB_HOST}
       DB_PORT:            ${DB_PORT:-5432}

@@ -15,6 +15,17 @@ Storage backends:
 After a successful upload, the segment is reported to db-writer so it lands against
 the flight it belongs to (see _report_upload). This service never sees a flight_id —
 only the output path MediaMTX gave it — so db-writer is what resolves the two.
+
+TENANT SEPARATION IS BY KEY PREFIX (CLOUD_ARCHITECTURE.md §11.5), not by account:
+one storage account for the deployment, and every object written under
+`tenants/<user_id>/recordings/<public_uuid>/`. Holding a customer's own cloud
+credentials would mean encrypting them at rest, rotating them, and a breach that
+hands out other people's storage accounts rather than only this system's data.
+
+That forces the one structural change in this file: the tenant has to be resolved
+BEFORE the upload, because a prefix cannot be applied to an object already written.
+db-writer answers it, this service builds the prefix, and a failure to resolve stops
+the upload rather than falling back to a shared location.
 """
 
 import json
@@ -61,15 +72,64 @@ def on_segment_complete(path: str = Form(...), background_tasks: BackgroundTasks
 
 # ── Upload dispatcher ─────────────────────────────────────────────────────────
 
+def _tenant_prefix(path: str):
+    """
+    `tenants/<user_id>/recordings/<public_uuid>` for this segment, or None.
+
+    §11.5: one storage account, tenants separated by key prefix. The prefix has to
+    be known BEFORE the object is written — there is no retroactive move that is
+    not a copy and a delete — so this runs ahead of the upload rather than beside
+    the report that follows it.
+
+    The recorder cannot derive user_id on its own: it is handed an output path by
+    MediaMTX and nothing else, and §5 keeps ownership on `streams` where only a
+    join can reach it. So it asks db-writer, which is the authority for exactly
+    that question, and then builds the prefix itself — keeping this service a
+    thing that only ever writes, which is why §11.5 lets it keep its own
+    credentials instead of being moved onto minted URLs.
+    """
+    match = _PUBLIC_UUID_RE.search(path)
+    if not match:
+        return None
+    public_uuid = match.group(1)
+    req = urllib.request.Request(f"{DB_WRITER_URL}/recording/tenant/{public_uuid}")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            user_id = json.loads(resp.read())["user_id"]
+    except Exception as e:
+        logger.error(f"Could not resolve the tenant for '{path}': {e}")
+        return None
+    return f"tenants/{user_id}/recordings/{public_uuid}"
+
+
 def _upload(path: str):
     logger.info(f"Uploading '{path}' to '{STORE_SERVICE}'")
+
+    # Resolved before the upload, and a failure here STOPS the upload rather than
+    # falling back to a shared prefix. That is deliberate and it is the whole point
+    # of the feature: an object written outside its tenant's prefix is the tenancy
+    # hole this closes, and it would be invisible afterwards. The segment stays on
+    # the recordings volume — DELETE_LOCAL_ON_SUCCESS cannot fire, since nothing
+    # succeeded — so nothing is lost and the upload can be retried by hand.
+    #
+    # `local` is exempt because it moves nothing: the file is already where it is,
+    # on a volume that belongs to this deployment rather than to a tenant.
+    prefix = None
+    if STORE_SERVICE in ("azure", "aws"):
+        prefix = _tenant_prefix(path)
+        if prefix is None:
+            logger.error(
+                f"Refusing to upload '{path}': no tenant prefix could be derived. "
+                f"The segment is retained locally.")
+            return
+
     try:
         if STORE_SERVICE == "local":
             location = _local(path)
         elif STORE_SERVICE == "azure":
-            location = _azure(path)
+            location = _azure(path, prefix)
         elif STORE_SERVICE == "aws":
-            location = _aws(path)
+            location = _aws(path, prefix)
         else:
             logger.error(f"Unknown RECORDING_STORE_SERVICE '{STORE_SERVICE}' — skipping upload")
             return
@@ -120,13 +180,16 @@ def _local(path: str):
     return None
 
 
-def _azure(path: str):
+def _azure(path: str, tenant_prefix: str):
     from azure.storage.blob import BlobServiceClient
 
     conn_str  = os.environ["RECORDING_AZURE_CONNECTION_STRING"]
     container = os.environ["RECORDING_AZURE_CONTAINER_NAME"]
+    # RECORDING_AZURE_BLOB_PREFIX still applies and sits OUTSIDE the tenant prefix,
+    # so one container can be shared with something else without the two schemes
+    # interleaving. The tenant part is never optional — see _upload.
     prefix    = os.getenv("RECORDING_AZURE_BLOB_PREFIX", "").strip("/")
-    blob_name = f"{prefix}/{Path(path).name}".lstrip("/")
+    blob_name = "/".join(p for p in (prefix, tenant_prefix, Path(path).name) if p)
 
     client = BlobServiceClient.from_connection_string(conn_str)
     with open(path, "rb") as f:
@@ -135,12 +198,13 @@ def _azure(path: str):
     return f"{container}/{blob_name}"
 
 
-def _aws(path: str):
+def _aws(path: str, tenant_prefix: str):
     import boto3
 
     bucket = os.environ["RECORDING_AWS_BUCKET_NAME"]
+    # As with Azure: the deployment's own prefix wraps the tenant's, never replaces it.
     prefix = os.getenv("RECORDING_AWS_KEY_PREFIX", "").strip("/")
-    key    = f"{prefix}/{Path(path).name}".lstrip("/")
+    key    = "/".join(p for p in (prefix, tenant_prefix, Path(path).name) if p)
 
     kwargs = {}
     if key_id := os.getenv("RECORDING_AWS_ACCESS_KEY_ID"):
