@@ -31,6 +31,9 @@ DRONE_SENSOR_HEIGHT_MM,
     VIDEO_OUT_STREAM_HOST,
     VIDEO_OUT_STREAM_PORT,
     VIDEO_OUT_STREAM_STREAM_KEY,
+    VIDEO_OUT_WEBRTC_PATH_SUFFIX,
+    VIDEO_OUT_WEBRTC_PORT,
+    VIDEO_OUT_WEBRTC_SCHEME,
     VIDEO_STREAM_READER_HOST,
     VIDEO_STREAM_READER_PORT,
     VIDEO_STREAM_READER_STREAM_KEY,
@@ -155,6 +158,19 @@ class AppSettings(BaseSettings):
     video_out_stream_username: Optional[str]       = None
     video_out_stream_password: Optional[SecretStr] = None
 
+    # ------------------------------------------------------------------ #
+    # VIDEO STREAM PLAYBACK (media server -> clients, WebRTC/WHEP)
+    # ------------------------------------------------------------------ #
+    # Where clients fetch the annotated stream, as opposed to where the app
+    # publishes it. The host defaults to video_out_stream_host and only needs
+    # setting when the media server is reachable at a different address for
+    # viewers than for the publisher (e.g. an in-cluster service name for the
+    # RTMP hop, a public address for the browser).
+
+    video_out_webrtc_scheme:   Literal["http", "https"] = VIDEO_OUT_WEBRTC_SCHEME
+    video_out_webrtc_host:     Optional[str] = None
+    video_out_webrtc_port:     int           = Field(default=VIDEO_OUT_WEBRTC_PORT, ge=1, le=65535)
+
     # ================================================================== #
     # FIELD VALIDATORS
     # ================================================================== #
@@ -163,6 +179,7 @@ class AppSettings(BaseSettings):
         "video_stream_reader_protocol",
         "telemetry_listener_protocol",
         "video_out_stream_protocol",
+        "video_out_webrtc_scheme",
         mode="before",
     )
     @classmethod
@@ -283,3 +300,20 @@ class AppSettings(BaseSettings):
             assert self.video_out_stream_password is not None  # enforced by model_validator
             return f"{proto}://{self.video_out_stream_username}:{self.video_out_stream_password.get_secret_value()}@{host_key}"
         return f"{proto}://{host_key}"
+
+    @computed_field
+    @property
+    def video_out_webrtc_url(self) -> str:
+        """WHEP URL clients POST to in order to play back the annotated stream.
+
+        Retrieval counterpart of video_out_stream_url: same media server and same
+        stream key, but the WebRTC port and the /whep suffix. This is the URL stored
+        in the flights table, since the RTMP publish URL is of no use to a viewer.
+        """
+        host = self.video_out_webrtc_host or self.video_out_stream_host
+        return (
+            f"{self.video_out_webrtc_scheme}://"
+            f"{host}:{self.video_out_webrtc_port}"
+            f"/{self.video_out_stream_stream_key}"
+            f"/{VIDEO_OUT_WEBRTC_PATH_SUFFIX}"
+        )

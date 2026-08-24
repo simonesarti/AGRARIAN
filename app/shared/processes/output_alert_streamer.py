@@ -60,8 +60,10 @@ class NotificationsStreamWriterConfig(BaseModel):
     db_writer_url: str
     database_username: str = ""
     database_password: str = ""
-    # Video stream URL written to the flights table so the UI can fetch it from the DB.
-    # Should match the media_server_url passed to VideoProducerProcess.
+    # Video stream playback URL written to the flights table so the UI can fetch it
+    # from the DB. This is the media server's WHEP/WebRTC endpoint for the stream the
+    # VideoProducerProcess publishes to media_server_url — the retrieval address, not
+    # the publish one.
     video_stream_url: Optional[str] = None
 
 
@@ -80,8 +82,8 @@ class NotificationsStreamWriter(mp.Process):
     delivers it via any enabled combination of: log file, WebSocket broadcast, and
     SQL database.
 
-    If video_stream_url is set in config and the database is enabled, the URL is
-    written to the current flight record once at startup so the UI can retrieve it.
+    If video_stream_url is set in config and the database is enabled, the playback URL
+    is written to the current flight record once at startup so the UI can retrieve it.
 
     At least one output channel (file, WebSocket, database) must be successfully
     initialised at startup; if none can be started the error_event is set and the

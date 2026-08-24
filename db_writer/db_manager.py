@@ -37,7 +37,7 @@ flights
 flight_id (PK)
 user_id (FK → users.user_id)
 start_time
-stream_url  # Video stream URL, set once the video writer starts
+stream_url  # Video playback URL (media server WHEP endpoint), set once the video writer starts
 
 ------
 alerts

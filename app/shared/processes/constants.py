@@ -230,6 +230,14 @@ VIDEO_OUT_STREAM_HOST = ALL_INTERFACES
 VIDEO_OUT_STREAM_PORT = RTMP_PORT
 VIDEO_OUT_STREAM_STREAM_KEY = "annot"
 
+# Playback (retrieval) endpoint of the same stream, served by the media server.
+# VIDEO_OUT_STREAM_* above is where the app publishes (RTMP); this is what clients
+# open to watch it, and it is what gets written to the flights table.
+# Full URL: SCHEME://HOST:PORT/STREAM_KEY/whep
+VIDEO_OUT_WEBRTC_SCHEME = "http"
+VIDEO_OUT_WEBRTC_PORT = WEBRTC_PORT
+VIDEO_OUT_WEBRTC_PATH_SUFFIX = "whep"
+
 VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT = 0.5               # 0.5 s
 VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT = 8.0              # 8.0 s
 VIDEO_OUT_STREAM_STARTUP_TIMEOUT = 2.0                      # 2.0 s

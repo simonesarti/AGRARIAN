@@ -163,10 +163,14 @@ Read by `docker run --env-file app/.env`. Edit on the app machine before startin
 | `VIDEO_STREAM_READER_HOST` | `localhost` | Comms host IP or hostname (MediaMTX RTSP) |
 | `TELEMETRY_LISTENER_HOST` | `localhost` | Comms host IP or hostname (Mosquitto MQTT) |
 | `VIDEO_OUT_STREAM_HOST` | `localhost` | Comms host IP or hostname (MediaMTX RTMP) |
+| `VIDEO_OUT_WEBRTC_HOST` | *(reuses `VIDEO_OUT_STREAM_HOST`)* | Host viewers use to play the stream (MediaMTX WebRTC) |
+| `VIDEO_OUT_WEBRTC_PORT` | `8889` | MediaMTX WebRTC port |
 | `WS_SERVER_URL` | `http://localhost:8001` | ws-server HTTP API endpoint |
 | `DB_WRITER_URL` | `http://localhost:8002` | db-writer HTTP API endpoint |
 
 All three `HOST` variables and the two URLs must point to the comms machine. For local testing (both stacks on the same machine) the `localhost` defaults work as-is.
+
+The playback URL — `http://VIDEO_OUT_WEBRTC_HOST:VIDEO_OUT_WEBRTC_PORT/VIDEO_OUT_STREAM_STREAM_KEY/whep` — is what gets written to the flights table for the UI to open. Set `VIDEO_OUT_WEBRTC_HOST` only when viewers reach MediaMTX at a different address than the app does when publishing.
 
 Additional groups in `app/.env`:
 
