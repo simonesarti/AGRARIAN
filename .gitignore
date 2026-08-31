@@ -150,6 +150,9 @@ celerybeat.pid
 # Environments
 .env
 .venv
+
+configs/k8s/endpoints.env
+configs/k8s/flight-app.env
 env/
 venv/
 ENV/
