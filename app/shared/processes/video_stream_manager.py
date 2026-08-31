@@ -7,8 +7,8 @@ import numpy as np
 
 from app.shared.processes.constants import (
     FPS,
-    MAX_SIZE_VIDEO_STREAM,
     PIPELINE_QUEUE_TIMEOUT,
+    VIDEO_OUT_STREAM_QUEUE_SIZE,
     VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT,    # 0.5
     VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,    # 8.0
     VIDEO_OUT_STREAM_STARTUP_TIMEOUT,           # 2.0
@@ -60,7 +60,7 @@ class FFmpegSink:
             self,
             logger: logging.Logger,
             fps: int = FPS,
-            queue_max_size: int = MAX_SIZE_VIDEO_STREAM,
+            queue_max_size: int = VIDEO_OUT_STREAM_QUEUE_SIZE,
             queue_get_timeout: float = PIPELINE_QUEUE_TIMEOUT,
             ffmpeg_startup_timeout: float = VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT,
             ffmpeg_shutdown_timeout: float = VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,
@@ -309,7 +309,16 @@ class VideoStreamManager(FFmpegSink):
             '-s', f"{self.width}x{self.height}",
             '-r', str(self.fps),
             '-i', '-',                      # Input from stdin pipe
-            '-vf', f'realtime,fps=fps={self.fps}',
+            # 'realtime' paces consumption to the wall clock. It is doing more than throttling:
+            # it spreads libx264's load evenly instead of letting FFmpeg drain the hand-off queue
+            # in back-to-back bursts that spike CPU and starve the model workers, and it keeps
+            # frames leaving at an even cadence so viewers do not see judder. Measured: removing
+            # it cut output-queue drops 99 -> 15 but drove reader-side frame drops 29 -> 253 and
+            # made the stream visibly choppier. Depth of the hand-off queue is the right knob for
+            # absorbing bursts (VIDEO_OUT_STREAM_QUEUE_SIZE), not removing the pacer.
+            # 'fps' is deliberately not chained here: '-r 30' above already stamps the raw input
+            # at exactly 30 fps, so the filter would be a no-op.
+            '-vf', 'realtime',
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
             '-tune', 'zerolatency',

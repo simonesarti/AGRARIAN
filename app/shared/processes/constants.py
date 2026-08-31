@@ -247,6 +247,13 @@ VIDEO_OUT_WEBRTC_SCHEME = "http"
 VIDEO_OUT_WEBRTC_PORT = WEBRTC_PORT
 VIDEO_OUT_WEBRTC_PATH_SUFFIX = "whep"
 
+# Depth of the in-process hand-off queue between VideoProducerProcess and the FFmpeg
+# writer thread. This is plain heap memory (queue.Queue of numpy frames), NOT shared
+# memory — deliberately kept separate from MAX_SIZE_VIDEO_STREAM, which also sizes the
+# annotation->video FrameBuffer in /dev/shm. It only has to absorb the burst that follows
+# an input stall; at 1080p each slot costs ~5.9 MiB of RSS.
+VIDEO_OUT_STREAM_QUEUE_SIZE = 15                            # 0.5 s at 30 fps
+
 VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT = 0.5               # 0.5 s
 VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT = 8.0              # 8.0 s
 VIDEO_OUT_STREAM_STARTUP_TIMEOUT = 2.0                      # 2.0 s

@@ -15,7 +15,7 @@ from app.shared.processes.messages import AnnotationSlotMetadata
 from app.shared.processes.constants import (
     FPS,
     PIPELINE_QUEUE_TIMEOUT,
-    MAX_SIZE_VIDEO_STREAM,
+    VIDEO_OUT_STREAM_QUEUE_SIZE,
     VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT,
     VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT,
     VIDEO_OUT_STREAM_STARTUP_TIMEOUT,
@@ -45,7 +45,7 @@ class VideoProducerProcessConfig(BaseModel):
 
     # ------- RTMP stream → media server (MediaMTX records on its side) --------
     media_server_url: str
-    stream_manager_queue_max_size: PositiveInt = MAX_SIZE_VIDEO_STREAM
+    stream_manager_queue_max_size: PositiveInt = VIDEO_OUT_STREAM_QUEUE_SIZE
     stream_manager_ffmpeg_startup_timeout: PositiveFloat = VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT
     stream_manager_ffmpeg_shutdown_timeout: PositiveFloat = VIDEO_OUT_STREAM_FFMPEG_SHUTDOWN_TIMEOUT
     stream_manager_startup_timeout: PositiveFloat = VIDEO_OUT_STREAM_STARTUP_TIMEOUT
