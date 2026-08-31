@@ -3,13 +3,13 @@ geopy==2.4.1
 lapx==0.9.4
 matplotlib==3.10.9
 numpy==2.4.6
-onnx==1.21.0
+onnx==1.22.0
 onnxruntime-gpu==1.26.0
 onnxslim==0.1.94
 opencv-python-headless==4.13.0.92
-Pillow==12.2.0
+Pillow==12.3.0
 pydantic==2.13.4
-pydantic-settings==2.14.1
+pydantic-settings==2.14.2
 PyYAML==6.0.3
 rasterio==1.5.0
 requests==2.34.2
