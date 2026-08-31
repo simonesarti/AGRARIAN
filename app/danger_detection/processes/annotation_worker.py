@@ -174,6 +174,12 @@ class AnnotationWorker(mp.Process):
                     meta.timestamp - last_alert_timestamp >= self.config.alerts_cooldown_s
                 )
                 if alert_confirmed:
+                    # Advance the cooldown clock as soon as an alert is due, not only once it has
+                    # been queued: leaving it stale after a failed acquire/put reopens the gate on
+                    # the very next frame, so a brief consumer stall becomes a per-frame retry storm
+                    # against a buffer that is still busy. Advancing here costs the dropped alert
+                    # and nothing more — the next one is considered a full cooldown later.
+                    last_alert_timestamp = meta.timestamp
                     alert_slot = self.alert_output_frame_buffer.acquire()
                     if alert_slot is None:
                         logger.warning(
@@ -190,7 +196,6 @@ class AnnotationWorker(mp.Process):
                         )
                         try:
                             self.alert_output_meta_queue.put(alert_meta, timeout=self.config.queue_timeout)
-                            last_alert_timestamp = meta.timestamp
                             logger.debug(f"Frame {meta.frame_id} → alert slot {alert_slot}. Danger: {meta.alert_msg}.")
                         except QueueFullException:
                             self.alert_output_frame_buffer.release(alert_slot)

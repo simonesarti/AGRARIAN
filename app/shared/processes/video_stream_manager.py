@@ -113,8 +113,13 @@ class FFmpegSink:
             return False
 
     def log_stderr(self, pipe):
+        # Logged at warning, not debug: both sink loggers sit at WARNING, so anything quieter
+        # discards the reason FFmpeg died and leaves a broken pipe with no explanation. The
+        # commands pass -nostats -loglevel warning, so this stays quiet unless something breaks.
         for line in iter(pipe.readline, b''):
-            self.logger.debug(f"FFmpeg: {line.decode().strip()}")
+            decoded = line.decode(errors='replace').strip()
+            if decoded:
+                self.logger.warning(f"FFmpeg: {decoded}")
 
     def get_ffmpeg_command(self) -> list:
         raise NotImplementedError
@@ -146,8 +151,15 @@ class FFmpegSink:
                 if self._ffmpeg_process.poll() is not None:
                     # Process exited immediately
                     _, stderr_data = self._ffmpeg_process.communicate()
-                    self._startup_error = stderr_data.decode().split('\n')[-2] if stderr_data else "Unknown error"
+                    _lines = [
+                        ln.strip() for ln in stderr_data.decode(errors='replace').splitlines() if ln.strip()
+                    ] if stderr_data else []
+                    self._startup_error = _lines[-1] if _lines else "Unknown error"
                     self._start_confirmed.set()
+                    # Clear `running` before leaving: on a re-spawn nothing else would, and
+                    # push_to_queue would keep accepting frames into a queue no thread drains,
+                    # reporting "queue full" forever over a silently dead output.
+                    self.running = False
                     return  # exit the thread on failed startup
 
                 # If we reach here, process is alive
@@ -289,6 +301,9 @@ class VideoStreamManager(FFmpegSink):
         return [
             'ffmpeg',
             '-y',
+            # -nostats/-loglevel keep stdout quiet enough that stderr can be logged at warning
+            '-nostats',
+            '-loglevel', 'warning',
             '-f', 'rawvideo',
             '-pix_fmt', 'bgr24',
             '-s', f"{self.width}x{self.height}",
@@ -340,6 +355,9 @@ class VideoFileWriter(FFmpegSink):
         return [
             'ffmpeg',
             '-y',
+            # -nostats/-loglevel keep stdout quiet enough that stderr can be logged at warning
+            '-nostats',
+            '-loglevel', 'warning',
             '-f', 'rawvideo',
             '-pix_fmt', 'bgr24',
             '-s', f"{self.width}x{self.height}",

@@ -121,9 +121,18 @@ VIDEO_STREAM_READER_CONNECTION_OPEN_TIMEOUT_S = 5.0
 VIDEO_STREAM_READER_RECONNECT_DELAY = 5.0
 VIDEO_STREAM_READER_MAX_CONSECUTIVE_CONNECTION_FAILURES = 5
 
-VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S = 0.05                         # 50 ms
+# NOTE: this is the FFmpeg socket I/O timeout for the whole RTSP session, not a per-frame
+# budget: any gap this long with no bytes arriving kills the demuxer and forces a full
+# reconnect. It must comfortably exceed the link's worst-case jitter (a VPN/WiFi hop can
+# stall for a second), otherwise every hiccup tears the session down.
+VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S = 5.0                          # 5 s
 VIDEO_STREAM_READER_FRAME_RETRY_DELAY = 0.05                            # 50 ms
-VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES = FPS                # 1 second worth of failures
+VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES = 3 * FPS            # ~4.5 s worth of failures
+
+# A fresh RTSP session starts mid-GOP, so the frames decoded before the first keyframe are
+# garbage that still reads as successful. Discard this much video after every connect.
+# Should cover one source GOP (2 s at keyint=60 / 30 fps).
+VIDEO_STREAM_READER_POST_CONNECT_SKIP_S = 2.0                           # 2 s
 
 VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO = 16.0/9.0
 VIDEO_STREAM_READER_PROCESSING_SHAPE = (1280, 720)  # (W,H)

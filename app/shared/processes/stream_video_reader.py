@@ -5,7 +5,7 @@ import logging
 from time import time, sleep
 from queue import Full as QueueFullException
 
-from pydantic import BaseModel, PositiveFloat, PositiveInt, field_validator
+from pydantic import BaseModel, NonNegativeFloat, PositiveFloat, PositiveInt, field_validator
 
 from app.shared.processes.frame_buffer import FrameBuffer
 from app.shared.processes.messages import FrameSlotMetadata
@@ -16,6 +16,7 @@ from app.shared.processes.constants import (
     VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S,
     VIDEO_STREAM_READER_FRAME_RETRY_DELAY,
     VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES,
+    VIDEO_STREAM_READER_POST_CONNECT_SKIP_S,
     VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO,
     VIDEO_STREAM_READER_PROCESSING_SHAPE,
     PIPELINE_QUEUE_TIMEOUT,
@@ -53,6 +54,7 @@ class StreamVideoReaderConfig(BaseModel):
     frame_read_timeout_s: PositiveFloat = VIDEO_STREAM_READER_FRAME_READ_TIMEOUT_S
     frame_read_retry_delay_s: PositiveFloat = VIDEO_STREAM_READER_FRAME_RETRY_DELAY
     frame_read_max_consecutive_failures: PositiveInt = VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES
+    post_connect_skip_s: NonNegativeFloat = VIDEO_STREAM_READER_POST_CONNECT_SKIP_S
 
     # Processing
     expected_aspect_ratio: PositiveFloat = VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO
@@ -110,15 +112,27 @@ class StreamVideoReader(mp.Process):
         Set up video capture with appropriate settings for video streams.
         """
         import os
-        # CAP_PROP_OPEN_TIMEOUT_MSEC / CAP_PROP_READ_TIMEOUT_MSEC are no-ops for the FFmpeg
-        # backend. Pass the timeouts via FFmpeg options instead — stimeout is in microseconds.
-        open_us  = int(self.config.connect_open_timeout_s * 1_000_000)
-        read_us  = int(self.config.frame_read_timeout_s  * 1_000_000)
+        # FFmpeg removed `stimeout` in 5.0. Both the RTSP demuxer and the TCP protocol take
+        # `timeout` (microseconds) as the socket I/O timeout for the entire session — it is not
+        # a per-frame budget, so a value below the link's jitter tears the session down on every
+        # hiccup. `discardcorrupt` drops damaged packets instead of handing us garbage frames
+        # that would still pass the cap.read() success check and reach the models.
+        socket_timeout_us = int(self.config.frame_read_timeout_s * 1_000_000)
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-            f"rtsp_transport;tcp|stimeout;{open_us}|timeout;{read_us}"
+            f"rtsp_transport;tcp|timeout;{socket_timeout_us}|fflags;discardcorrupt"
         )
 
-        cap = cv2.VideoCapture(self.config.video_stream_url, cv2.CAP_FFMPEG)
+        # CAP_PROP_OPEN_TIMEOUT_MSEC / CAP_PROP_READ_TIMEOUT_MSEC drive the FFmpeg backend's
+        # interrupt callback and must be passed at construction time — setting them afterwards
+        # with cap.set() has no effect. This is what bounds the connection attempt itself.
+        cap = cv2.VideoCapture(
+            self.config.video_stream_url,
+            cv2.CAP_FFMPEG,
+            [
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(self.config.connect_open_timeout_s * 1000),
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC, int(self.config.frame_read_timeout_s * 1000),
+            ],
+        )
 
         # CAP_PROP_BUFFERSIZE is a no-op for RTSP/FFmpeg backend; buffer is managed by FFmpeg internally
         # cap.set(cv2.CAP_PROP_BUFFERSIZE, ...)
@@ -214,6 +228,12 @@ class StreamVideoReader(mp.Process):
                 # --------------------------------------------------------------
                 # connection established
                 # --------------------------------------------------------------
+
+                # A fresh RTSP session starts wherever the live stream currently is, which is
+                # almost never an IDR keyframe. Arm a window during which decoded frames are
+                # discarded (see the check further down, before the buffer slot is acquired).
+                skip_until = time() + self.config.post_connect_skip_s
+                frames_skipped_on_connect = 0
 
                 logger.info("Starting video reading loop")
                 while cap.isOpened() and not self.error_event.is_set():
@@ -311,6 +331,22 @@ class StreamVideoReader(mp.Process):
 
                     # Reset failure counter on successful read and checks passed
                     consecutive_read_failures = 0
+
+                    # --------- discard the partial GOP this session started on ---------
+
+                    # Until the first keyframe of a fresh session arrives, every P-frame
+                    # references pictures this decoder never received ("Missing reference
+                    # picture"), and decodes into smeared garbage that still reads as a
+                    # successful frame. Drop those so they never reach the models.
+                    if timestamp < skip_until:
+                        frames_skipped_on_connect += 1
+                        continue
+                    if frames_skipped_on_connect:
+                        logger.info(
+                            f"Discarded {frames_skipped_on_connect} frame(s) decoded before "
+                            "the first keyframe of this session."
+                        )
+                        frames_skipped_on_connect = 0
 
                     # Acquire a free buffer slot. If none is available the consumer is too slow:
                     # drop this frame so the next one can be written when a slot is freed.
