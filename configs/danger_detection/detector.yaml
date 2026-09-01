@@ -17,7 +17,7 @@ imgsz:
 # float: Confidence threshold for detection filtering.
 # Detections with a confidence score below this value will be discarded.
 # Range: (0.0, 1.0]
-conf: 0.22
+conf: 0.23
 
 # float: IoU threshold for Non-Maximum Suppression (NMS).
 # Helps reduce duplicate detections by suppressing overlapping boxes.
@@ -43,7 +43,7 @@ batch: 1
 # int: Maximum number of detections per image.
 # Limits the total number of objects that can be detected in a single image.
 # Range: Any positive integer.
-max_det: 500
+max_det: 450
 
 # int: Frame stride for video inputs.
 # Allows skipping frames to speed up inference. Higher values skip more frames.

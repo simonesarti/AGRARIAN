@@ -77,10 +77,16 @@ class YOLOTracker:
         if boxes is None or boxes.id is None:
             return [], H
 
-        ids    = boxes.id.cpu().numpy().astype(int)
-        bboxes = boxes.xyxy.cpu().numpy()
-        confs  = boxes.conf.cpu().numpy()
-        clss   = boxes.cls.cpu().numpy().astype(int)
+        # Single device->host transfer for all four fields: boxes.id/xyxy/conf/cls each
+        # slice the same underlying tensor, so reading them separately costs four syncs.
+        # Tracking results carry 7 columns (xyxy, track_id, conf, cls); the negative
+        # indices below are the ones ultralytics itself uses, so they stay correct
+        # whether or not the track id column is present.
+        data   = boxes.data.cpu().numpy()
+        bboxes = data[:, :4]
+        ids    = data[:, -3].astype(int)
+        confs  = data[:, -2]
+        clss   = data[:, -1].astype(int)
 
         tracks = [
             TrackState(
