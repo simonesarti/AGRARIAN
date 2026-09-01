@@ -17,7 +17,7 @@ imgsz:
 # float: Confidence threshold for detection filtering.
 # Detections with a confidence score below this value will be discarded.
 # Range: (0.0, 1.0]
-conf: 0.25
+conf: 0.22
 
 # float: IoU threshold for Non-Maximum Suppression (NMS).
 # Helps reduce duplicate detections by suppressing overlapping boxes.

@@ -21,7 +21,7 @@ __all__ = [
     "close_tifs",
     "extract_dem_window",
     "get_window_size_m",
-    "compute_slope_mask_runtime",
+    "get_window_pixel_size_m",
     "compute_slope_mask_horn",
     "create_geofencing_mask_runtime",
     "get_frame_transform",
@@ -48,6 +48,81 @@ def safe_open_raster(path: Optional[Union[str, Path]]) -> Optional[rasterio.Data
         return None
 
 
+def check_geographic_crs(tif: rasterio.DatasetReader, path: Union[str, Path]) -> bool:
+    """
+    Return True if `tif` is georeferenced in lon/lat degrees, False otherwise.
+
+    The geo pipeline works end-to-end in degrees: the drone reports lon/lat, the
+    frame corners are derived in lon/lat, and the frame transform built from them
+    maps pixels to degrees. DEM coordinates are therefore never reprojected, they
+    are looked up directly with lon/lat. A DEM in a projected CRS (UTM metres,
+    say) would index hundreds of kilometres outside the raster and yield an
+    all-nodata window, so it is refused here rather than silently misused.
+
+    A refusal is logged and reported, never raised: like a missing DEM file, it
+    leaves the pipeline running without terrain analysis instead of stopping it.
+    """
+    if tif.crs is None:
+        _logger.error(
+            f"DEM raster '{path}' has no CRS. A geographic lon/lat CRS (EPSG:4326) is required. "
+            "The DEM will be ignored and no slope or nodata analysis will be performed."
+        )
+        return False
+
+    if not tif.crs.is_geographic:
+        _logger.error(
+            f"DEM raster '{path}' is in the projected CRS {tif.crs.to_string()}. "
+            "The geo worker indexes the DEM directly with lon/lat degrees and never reprojects, "
+            "so the DEM must be in a geographic CRS (EPSG:4326). "
+            f"Reproject it first, e.g. `gdalwarp -t_srs EPSG:4326 '{path}' dem_4326.tif`. "
+            "The DEM will be ignored and no slope or nodata analysis will be performed."
+        )
+        return False
+
+    if tif.crs.to_epsg() != 4326:
+        # Any lon/lat CRS is indexable, but the frame corners are WGS84, so a
+        # different geodetic datum introduces a small (metre-level) offset.
+        _logger.warning(
+            f"DEM raster '{path}' uses the geographic CRS {tif.crs.to_string()} rather than "
+            "EPSG:4326. Coordinates are usable but datum differences are not compensated."
+        )
+
+    return True
+
+
+def check_same_grid(
+        dem_tif: rasterio.DatasetReader,
+        dem_mask_tif: rasterio.DatasetReader,
+        dem_path: Union[str, Path],
+        dem_mask_path: Union[str, Path],
+) -> bool:
+    """
+    Return True if the DEM and its validity mask share one raster grid.
+
+    Windows are computed once from the DEM transform and then applied to both
+    rasters, so any difference in CRS, transform or size would silently shift the
+    nodata mask with respect to the elevations it is supposed to describe.
+
+    A mismatch is logged and reported, never raised: like a missing mask file, it
+    leaves the DEM usable with every pixel assumed valid.
+    """
+    if (dem_mask_tif.crs != dem_tif.crs or
+            dem_mask_tif.transform != dem_tif.transform or
+            dem_mask_tif.width != dem_tif.width or
+            dem_mask_tif.height != dem_tif.height):
+        _logger.error(
+            f"DEM mask '{dem_mask_path}' is not on the same grid as DEM '{dem_path}'. "
+            f"DEM: crs={dem_tif.crs}, size={dem_tif.width}x{dem_tif.height}, transform={dem_tif.transform!r}. "
+            f"Mask: crs={dem_mask_tif.crs}, size={dem_mask_tif.width}x{dem_mask_tif.height}, "
+            f"transform={dem_mask_tif.transform!r}. "
+            "Both rasters are read with the same pixel window, so they must be aligned. "
+            "The mask will be ignored and all DEM pixels treated as valid."
+        )
+        return False
+
+    return True
+
+
 def open_dem_tifs(
         dem_path: Optional[Union[str, Path]],
         dem_mask_path: Optional[Union[str, Path]]
@@ -56,10 +131,22 @@ def open_dem_tifs(
     # Open the primary DEM
     dem_tif = safe_open_raster(dem_path)
 
+    # Drop a DEM the rest of the pipeline cannot address (see check_geographic_crs).
+    # Handled exactly like a missing file: the caller gets None and runs without
+    # terrain analysis rather than the application coming down.
+    if dem_tif is not None and not check_geographic_crs(dem_tif, dem_path):
+        dem_tif.close()
+        dem_tif = None
+
     # 2. Open the mask (only if DEM exists and was opened successfully)
     dem_mask_tif = None
     if dem_tif and dem_mask_path:
         dem_mask_tif = safe_open_raster(dem_mask_path)
+        # A mask that is not on the DEM grid is dropped, not fatal: downstream
+        # treats a missing mask as "all DEM data valid".
+        if dem_mask_tif is not None and not check_same_grid(dem_tif, dem_mask_tif, dem_path, dem_mask_path):
+            dem_mask_tif.close()
+            dem_mask_tif = None
 
     return dem_tif, dem_mask_tif
 
@@ -203,7 +290,37 @@ def get_window_size_m(reference_lat, window_bounds):
     return distance_m
 
 
-def compute_slope_mask_horn(elev_array, pixel_size, slope_threshold_deg):
+def get_window_pixel_size_m(reference_lat, window_bounds, window_size):
+    """
+    Return the (east-west, north-south) size in meters of one DEM window pixel.
+
+    The two are equal only if the DEM was written with square ground pixels. On a
+    DEM stored with a constant degree step in both axes -- the usual layout for
+    SRTM/Copernicus tiles -- a degree of longitude is cos(latitude) shorter than a
+    degree of latitude, so the north-south pixel is the larger of the two and the
+    slope must be computed with both values rather than one average.
+
+    Args:
+        reference_lat (float): latitude the east-west extent is measured at (the drone's).
+        window_bounds (tuple): (min_lon, min_lat, max_lon, max_lat) of the window.
+        window_size (int): side of the square pixel window.
+
+    Returns:
+        tuple[float, float]: (pixel_size_x_m, pixel_size_y_m)
+    """
+    (min_lon, min_lat, max_lon, max_lat) = window_bounds
+
+    # East-west extent, measured along the drone's parallel.
+    width_m = get_window_size_m(reference_lat, window_bounds)
+
+    # North-south extent. A meridian arc does not depend on the longitude it is
+    # measured at, so min_lon is used for both endpoints.
+    height_m = geodesic((min_lat, min_lon), (max_lat, min_lon)).meters
+
+    return width_m / window_size, height_m / window_size
+
+
+def compute_slope_mask_horn(elev_array, pixel_size_x, slope_threshold_deg, pixel_size_y=None):
     """
     Compute a mask indicating where the terrain slope is steeper than a given threshold
     using Horn's method with 1-pixel edge padding. The input is a 3D array of elevation values 
@@ -213,11 +330,16 @@ def compute_slope_mask_horn(elev_array, pixel_size, slope_threshold_deg):
     ----------
     elev_array : np.ndarray
         A 3D array (shape (1, H, W)) of elevation values in meters.
-    pixel_size : float
-        The physical size of each pixel in meters.
+    pixel_size_x : float
+        The physical east-west (column) size of each pixel in meters.
     slope_threshold_deg : float
         The slope threshold in degrees. Cells with a slope greater than this threshold
         will be marked with a 1 in the output mask.
+    pixel_size_y : float, optional
+        The physical north-south (row) size of each pixel in meters. Defaults to
+        `pixel_size_x`, i.e. square ground pixels. It differs whenever the DEM is
+        stored on a square grid of degrees, where a degree of longitude is
+        cos(latitude) shorter than a degree of latitude.
 
     Returns
     -------
@@ -225,6 +347,8 @@ def compute_slope_mask_horn(elev_array, pixel_size, slope_threshold_deg):
         A 3D binary array (shape (1, H, W)) with 1 where the computed slope exceeds 
         slope_threshold_deg, and 0 elsewhere.
     """
+    if pixel_size_y is None:
+        pixel_size_y = pixel_size_x
     # Ensure the input has the expected shape and remove the singleton dimension.
     assert elev_array.ndim == 3 and elev_array.shape[0] == 1, "Input must be of shape (1, H, W)"
 
@@ -238,13 +362,16 @@ def compute_slope_mask_horn(elev_array, pixel_size, slope_threshold_deg):
     elev_array = elev_array[0]
 
     # Define Horn's kernels for x and y gradients
+    # Each kernel is normalised by the ground size of the axis it differentiates,
+    # so dx and dy are both dimensionless rise-over-run gradients even when the
+    # pixel is not square on the ground.
     kernel_x = np.array([[-1, 0, 1],
                          [-2, 0, 2],
-                         [-1, 0, 1]], dtype=elev_array.dtype) / (8 * pixel_size)
+                         [-1, 0, 1]], dtype=elev_array.dtype) / (8 * pixel_size_x)
 
     kernel_y = np.array([[-1, -2, -1],
                          [0, 0, 0],
-                         [1, 2, 1]], dtype=elev_array.dtype) / (8 * pixel_size)
+                         [1, 2, 1]], dtype=elev_array.dtype) / (8 * pixel_size_y)
 
     # cv2.filter2D (cross-correlation, BORDER_REPLICATE) is ~2× faster than
     # scipy.ndimage.convolve on float32.  The sign of dx/dy is negated vs scipy

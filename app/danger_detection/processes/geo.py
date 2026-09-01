@@ -18,7 +18,7 @@ from app.danger_detection.utils import (
     extract_dem_window,
     open_dem_tifs,
     get_frame_transform,
-    get_window_size_m,
+    get_window_pixel_size_m,
     map_window_onto_drone_frame,
 )
 from app.danger_detection.processes.messages import SegmentationSlotMetadata, GeoSlotMetadata
@@ -253,7 +253,7 @@ class GeoWorker(mp.Process):
                             )
                     else:
                         safety_radius_pixels = -1
-                        logger.warning(
+                        logger.debug(
                             f"Frame {meta.frame_id}: no telemetry and no detections. "
                             "Safety radius set to -1 — no danger will be reported."
                         )
@@ -344,17 +344,23 @@ class GeoWorker(mp.Process):
                                     buffer_scale=self.config.dem_cache_buffer_scale,
                                 ) # masks shape are (1, window_size, window_size)
 
-                                # find the distance in meters between two points on opposite sides of
-                                # the window at the drone latitude, then derive the DEM pixel size
-                                dem_window_size_m = get_window_size_m(telemetry["latitude"], dem_window_bounds)
-                                dem_pixel_size_m  = dem_window_size_m / dem_window_size
+                                # measure the window extent in meters along both axes -- east-west
+                                # at the drone latitude, north-south along the meridian -- then
+                                # derive the ground size of a DEM pixel on each axis. The two differ
+                                # unless the DEM was written with square ground pixels.
+                                dem_pixel_size_x_m, dem_pixel_size_y_m = get_window_pixel_size_m(
+                                    reference_lat=telemetry["latitude"],
+                                    window_bounds=dem_window_bounds,
+                                    window_size=dem_window_size,
+                                )
 
                                 # ============== COMPUTE SLOPE MASK FROM DEM WINDOW ===================================
                                 # compute the slope mask using the dem window and the resolution of each pixel
                                 slope_mask_window = compute_slope_mask_horn(
                                     elev_array=dem_window,
-                                    pixel_size=dem_pixel_size_m,
+                                    pixel_size_x=dem_pixel_size_x_m,
                                     slope_threshold_deg=self.config.input_args["slope_angle_threshold"],
+                                    pixel_size_y=dem_pixel_size_y_m,
                                 )
 
                                 # stack the dem_nodata and dem_slope masks into a (2, W, W) array and cache
@@ -365,6 +371,9 @@ class GeoWorker(mp.Process):
                             # ============== ROTATE & UPSCALE MASKS USING FRAME TRANSFORM ========================
                             # rotate and resample the cached window masks using the frame corner coordinates
                             # to obtain a (frame_height, frame_width) version that aligns with the drone frame
+                            # Both transforms are in lon/lat degrees -- the DEM is validated as
+                            # geographic when opened, and frame_transform is built from the frame
+                            # corner coordinates -- so source and destination share one CRS.
                             combined = map_window_onto_drone_frame(
                                 window=dem_cache_masks_window,
                                 window_transform=dem_cache_window_transform,
