@@ -19,6 +19,8 @@ from app.shared.processes.constants import (
     VIDEO_STREAM_READER_POST_CONNECT_SKIP_S,
     VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO,
     VIDEO_STREAM_READER_PROCESSING_SHAPE,
+    VIDEO_STREAM_READER_ORIGINAL_SHAPE,
+    VIDEO_STREAM_READER_MACROBLOCK_SIZE,
     PIPELINE_QUEUE_TIMEOUT,
     POISON_PILL,
     POISON_PILL_TIMEOUT,
@@ -38,6 +40,40 @@ if not logger.handlers:
     logger.setLevel(logging.WARNING)
 
 # ================================================================
+
+
+def unpadded_shape(
+        decoded_w: int,
+        decoded_h: int,
+        expected_aspect_ratio: float,
+        macroblock: int = VIDEO_STREAM_READER_MACROBLOCK_SIZE,
+) -> tuple[int, int]:
+    """
+    Recover the true content size of a decoded frame by undoing encoder macroblock padding.
+
+    A decoder that ignores the SPS cropping window returns the padded coded picture, e.g.
+    1920x1088 for 1080p. The padding is added at the bottom and right edges and is always
+    smaller than one macroblock, so the true size is the largest (W, H) within one macroblock
+    of the decoded size whose aspect ratio matches the expected one exactly.
+
+    Returns (decoded_w, decoded_h) unchanged when no such size exists, i.e. when the frame
+    size cannot be explained as padding and must be taken at face value.
+    """
+    best_err = None
+    best_wh = (decoded_w, decoded_h)
+
+    # Descending, so the largest candidate (the least cropping) wins any tie.
+    for w in range(decoded_w, max(decoded_w - macroblock, 0), -1):
+        for h in range(decoded_h, max(decoded_h - macroblock, 0), -1):
+            err = abs(w / h - expected_aspect_ratio)
+            if best_err is None or err < best_err:
+                best_err = err
+                best_wh = (w, h)
+
+    # Only trust an (essentially) exact match: a near miss means this is not padding.
+    if best_err is None or best_err > 1e-6:
+        return decoded_w, decoded_h
+    return best_wh
 
 
 class StreamVideoReaderConfig(BaseModel):
@@ -153,6 +189,12 @@ class StreamVideoReader(mp.Process):
         # read failure counters
         total_read_failures = 0
         consecutive_read_failures = 0
+
+        # Decoded frame size and the content size it unpads to. Derived once and re-derived
+        # only if a reconnection brings a stream at a different resolution, so the padding
+        # search and its logging stay off the per-frame path.
+        decoded_wh = None
+        content_wh = None
 
         # placeholder for videoCapture connection
         cap = None
@@ -293,6 +335,39 @@ class StreamVideoReader(mp.Process):
                         # after break, skip to the end of this inner loop,
                         # enter the outer loop which terminates due to error_event being set,
                         # causing a jump to the final cleanup code.
+
+                    # --------- strip encoder padding ---------
+
+                    # The aspect ratio check above deliberately tolerates a padded frame, but
+                    # everything downstream treats original_wh as the true source resolution:
+                    # the annotation workers upscale back to it and write the result into
+                    # output buffers pre-allocated at VIDEO_STREAM_READER_ORIGINAL_SHAPE.
+                    # Crop the padding away here so that contract holds for the whole pipeline.
+                    if (frame_width, frame_height) != decoded_wh:
+                        decoded_wh = (frame_width, frame_height)
+                        content_wh = unpadded_shape(
+                            frame_width, frame_height, self.config.expected_aspect_ratio
+                        )
+                        if content_wh != decoded_wh:
+                            logger.info(
+                                f"Decoder returned the padded coded picture "
+                                f"W×H = {frame_width}×{frame_height}; "
+                                f"cropping to {content_wh[0]}×{content_wh[1]}."
+                            )
+                        if content_wh != VIDEO_STREAM_READER_ORIGINAL_SHAPE:
+                            logger.warning(
+                                f"Source resolution W×H = {content_wh[0]}×{content_wh[1]} differs from the "
+                                f"expected {VIDEO_STREAM_READER_ORIGINAL_SHAPE[0]}×{VIDEO_STREAM_READER_ORIGINAL_SHAPE[1]} "
+                                "the annotation output buffers are pre-allocated for. "
+                                "The annotation process will fail to write its upscaled frames."
+                            )
+
+                    if content_wh != decoded_wh:
+                        content_w, content_h = content_wh
+                        # Padding sits at the bottom and right edges, so the content is the
+                        # top-left region. This is a view: nothing is copied.
+                        frame = frame[:content_h, :content_w]
+                        frame_width, frame_height = content_w, content_h
 
                     # resize to desired frame size, here (1280, 720) as a compromise between resolution and speed.
                     # failure here can simply cause a warning, and resizing the next frame will be attempted.

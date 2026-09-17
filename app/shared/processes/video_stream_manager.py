@@ -180,12 +180,16 @@ class FFmpegSink:
                         frame = self.frame_queue.get(timeout=self.queue_get_timeout)
                         t0 = time()
                         raw = frame.tobytes()
+                        t_conv = time()
                         self._ffmpeg_process.stdin.write(raw)
                         self._ffmpeg_process.stdin.flush()
-                        self.logger.debug(
-                            f"[TIMING {self.name}] write={(time() - t0) * 1000:.1f}ms | "
-                            f"qdepth={self.frame_queue.qsize()}"
-                        )
+                        if self.logger.isEnabledFor(logging.DEBUG):
+                            t_write = time()
+                            self.logger.debug(
+                                f"[TIMING {self.name}] conv={(t_conv - t0) * 1000:.1f}ms | "
+                                f"write={(t_write - t_conv) * 1000:.1f}ms | "
+                                f"qdepth={self.frame_queue.qsize()}"
+                            )
                     except Empty:
                         continue
                     except BrokenPipeError as e:

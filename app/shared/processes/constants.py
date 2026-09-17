@@ -138,6 +138,12 @@ VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO = 16.0/9.0
 VIDEO_STREAM_READER_PROCESSING_SHAPE = (1280, 720)  # (W,H)
 VIDEO_STREAM_READER_ORIGINAL_SHAPE = (1920, 1080)   # (W,H) expected original resolution for output buffer pre-allocation
 
+# H.264 codes whole 16x16 macroblocks, so a source whose dimensions are not multiples of 16
+# (1080 is not) is encoded padded to the next multiple and carries the true size in the SPS
+# cropping window. Decoders that hand back the padded picture give us 1920x1088 instead of
+# 1920x1080; this is the search window used to undo that padding (see StreamVideoReader).
+VIDEO_STREAM_READER_MACROBLOCK_SIZE = 16
+
 
 
 # -------------------------- TELEMETRY READER --------------------------
