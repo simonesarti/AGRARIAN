@@ -6,6 +6,7 @@ import logging
 
 from app.shared.processes.app_settings import AppSettings
 from app.shared.processes.stream_video_reader import StreamVideoReader, StreamVideoReaderConfig
+from app.shared.processes.frame_telemetry_combiner import FrameTelemetryCombiner, FrameTelemetryCombinerConfig
 from app.health_monitoring.processes.hm_tracking_worker import HMTrackingWorker, HMTrackingWorkerConfig
 from app.health_monitoring.processes.hm_anomaly_worker import HMAnomalyDetectionWorker, HMAnomalyDetectionWorkerConfig
 from app.health_monitoring.processes.hm_interpolator import HMVideoInterpolatorProcess, HMVideoInterpolatorConfig
@@ -30,6 +31,11 @@ from app.shared.processes.constants import (
     VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO,
     VIDEO_STREAM_READER_FRAME_MAX_CONSECUTIVE_FAILURES,
     VIDEO_STREAM_READER_POST_CONNECT_SKIP_S,
+    TELEMETRY_LISTENER_RECONNECT_DELAY,
+    TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT,
+    TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES,
+    FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
+    FRAMETELCOMB_MAX_TIME_DIFF,
     ALERTS_QUEUE_GET_TIMEOUT,
     ALERTS_MAX_CONSECUTIVE_FAILURES,
     VIDEO_OUT_STREAM_FFMPEG_STARTUP_TIMEOUT,
@@ -69,6 +75,7 @@ def main():
     
     output_dir = Path(LOCAL_OUTPUT_DIR)
     output_dir.mkdir(exist_ok=True, parents=True)
+    mqtt_certificates_dir = Path("certificates") / "mqtt"
 
     session_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
 
@@ -98,7 +105,8 @@ def main():
     # plus one slot of headroom to avoid stalling while the interpolator flushes a burst.
     _slot_count = 2 * _frame_skip + 3
 
-    reader_to_tracking_buf         = FrameBuffer(_3ch, n_slots=_slot_count)
+    reader_to_combiner_buf         = FrameBuffer(_3ch, n_slots=_slot_count)
+    combiner_to_tracking_buf       = FrameBuffer(_3ch, n_slots=_slot_count)
     tracking_to_anomaly_buf        = FrameBuffer(_3ch, n_slots=_slot_count)
     anomaly_to_interpolator_buf    = FrameBuffer(_3ch, n_slots=_slot_count)
     interpolator_to_annotation_buf = FrameBuffer(_3ch, n_slots=_slot_count)
@@ -106,7 +114,8 @@ def main():
     annotation_to_video_buf        = FrameBuffer(_ann, n_slots=_slot_count)
 
     frame_buffers = [
-        reader_to_tracking_buf,
+        reader_to_combiner_buf,
+        combiner_to_tracking_buf,
         tracking_to_anomaly_buf,
         anomaly_to_interpolator_buf,
         interpolator_to_annotation_buf,
@@ -116,7 +125,8 @@ def main():
 
     # ============== METADATA QUEUES ==============
 
-    reader_to_tracking_q         = mp.Queue(maxsize=_slot_count)
+    reader_to_combiner_q         = mp.Queue(maxsize=_slot_count)
+    combiner_to_tracking_q       = mp.Queue(maxsize=_slot_count)
     tracking_to_anomaly_q        = mp.Queue(maxsize=_slot_count)
     anomaly_to_interpolator_q    = mp.Queue(maxsize=_slot_count)
     interpolator_to_annotation_q = mp.Queue(maxsize=_slot_count)
@@ -143,6 +153,29 @@ def main():
         post_connect_skip_s=VIDEO_STREAM_READER_POST_CONNECT_SKIP_S,
         expected_aspect_ratio=VIDEO_STREAM_READER_EXPECTED_ASPECT_RATIO,
         processing_shape=VIDEO_STREAM_READER_PROCESSING_SHAPE,
+        queue_timeout=PIPELINE_QUEUE_TIMEOUT,
+        poison_pill_timeout=POISON_PILL_TIMEOUT,
+    )
+
+    # Matches drone telemetry (MQTT) to each frame so alerts can carry the drone position.
+    # MQTT is non-critical: if the broker is unreachable frames flow on with telemetry=None.
+    combiner_config = FrameTelemetryCombinerConfig(
+        mqtt_protocol=s.telemetry_listener_protocol,
+        mqtt_broker_host=s.telemetry_listener_host,
+        mqtt_broker_port=s.telemetry_listener_port,
+        mqtt_username=s.telemetry_listener_username,
+        mqtt_password=s.telemetry_listener_password.get_secret_value() if s.telemetry_listener_password else None,
+        mqtt_qos_level=s.telemetry_listener_qos_level,
+        mqtt_max_msg_wait_s=TELEMETRY_LISTENER_MSG_WAIT_TIMEOUT,
+        mqtt_reconnect_delay_s=TELEMETRY_LISTENER_RECONNECT_DELAY,
+        mqtt_ca_certs_path=(
+            str(mqtt_certificates_dir)
+            if s.telemetry_listener_protocol == "mqtts"
+            else None
+        ),
+        mqtt_max_incoming_messages=TELEMETRY_LISTENER_MAX_INCOMING_MESSAGES,
+        telemetry_buffer_max_size=FRAMETELCOMB_MAX_TELEM_BUFFER_SIZE,
+        max_time_diff_s=FRAMETELCOMB_MAX_TIME_DIFF,
         queue_timeout=PIPELINE_QUEUE_TIMEOUT,
         poison_pill_timeout=POISON_PILL_TIMEOUT,
     )
@@ -215,15 +248,24 @@ def main():
 
     try:
         video_reader_process = StreamVideoReader(
-            output_meta_queue=reader_to_tracking_q,
-            output_frame_buffer=reader_to_tracking_buf,
+            output_meta_queue=reader_to_combiner_q,
+            output_frame_buffer=reader_to_combiner_buf,
             error_event=error_event,
             config=video_reader_config,
         )
 
+        combiner_process = FrameTelemetryCombiner(
+            input_meta_queue=reader_to_combiner_q,
+            input_frame_buffer=reader_to_combiner_buf,
+            output_meta_queue=combiner_to_tracking_q,
+            output_frame_buffer=combiner_to_tracking_buf,
+            error_event=error_event,
+            config=combiner_config,
+        )
+
         tracking_process = HMTrackingWorker(
-            input_meta_queue=reader_to_tracking_q,
-            input_frame_buffer=reader_to_tracking_buf,
+            input_meta_queue=combiner_to_tracking_q,
+            input_frame_buffer=combiner_to_tracking_buf,
             output_meta_queue=tracking_to_anomaly_q,
             output_frame_buffer=tracking_to_anomaly_buf,
             error_event=error_event,
@@ -285,6 +327,7 @@ def main():
 
     processes = [
         video_reader_process,
+        combiner_process,
         tracking_process,
         anomaly_process,
         interpolator_process,

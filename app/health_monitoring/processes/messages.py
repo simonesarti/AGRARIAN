@@ -17,11 +17,13 @@ class HMTrackingSlotMetadata:
     tracks: active TrackState objects (bounding boxes, ids, classes).
     H: 3×3 prev→curr homography from BotSORT's GMC, or None if unavailable.
     is_keyframe: False for frames that were skipped by the tracker (passthrough).
+    telemetry: drone telemetry matched to this frame by the combiner, or None.
     """
     frame_id: int
     timestamp: float
     original_wh: tuple[int, int]
     slot_index: int
+    telemetry: dict | None
     tracks: list               # list[TrackState]
     H: Optional[np.ndarray]    # ego-motion homography, or None
     is_keyframe: bool = True
@@ -38,11 +40,13 @@ class HMAnomalySlotMetadata:
     tracks: active TrackState objects, forwarded for bounding-box drawing.
     anomaly_result: FrameAnomalyResult with per-track scores and classifications.
     is_keyframe: False for frames that bypassed inference (no real tracks/scores).
+    telemetry: drone telemetry matched to this frame by the combiner, or None.
     """
     frame_id: int
     timestamp: float
     original_wh: tuple[int, int]
     slot_index: int
+    telemetry: dict | None
     tracks: list               # list[TrackState]
     anomaly_result: FrameAnomalyResult
     is_keyframe: bool = True

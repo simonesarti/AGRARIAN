@@ -149,7 +149,15 @@ class NotificationsStreamWriter(mp.Process):
         logger.debug(f"Frame compressed in {(time() - compression_start) * 1000:.1f} ms")
         return jpg_as_text, raw_bytes
 
-    def _log_alert(self, frame_id: int, alert_msg: str, timestamp: float, datetime_str: str):
+    def _log_alert(
+            self,
+            frame_id: int,
+            alert_msg: str,
+            timestamp: float,
+            datetime_str: str,
+            latitude: Optional[float],
+            longitude: Optional[float],
+    ):
         """
         Append an alert entry to the log file using the persistent file handle.
 
@@ -158,6 +166,8 @@ class NotificationsStreamWriter(mp.Process):
             alert_msg: Alert message
             timestamp: Alert timestamp
             datetime_str: ISO-formatted alert datetime
+            latitude: Drone latitude (WGS84 degrees), or None if unknown
+            longitude: Drone longitude (WGS84 degrees), or None if unknown
         """
         try:
             log_entry = {
@@ -165,6 +175,8 @@ class NotificationsStreamWriter(mp.Process):
                 'alert_msg': alert_msg,
                 'timestamp': timestamp,
                 'datetime': datetime_str,
+                'latitude': latitude,
+                'longitude': longitude,
             }
             # Writing to a line-buffered handle is highly efficient
             self.log_file.write(json.dumps(log_entry) + '\n')
@@ -178,7 +190,7 @@ class NotificationsStreamWriter(mp.Process):
 
         Args:
             frame: Full-resolution annotated BGR frame read from shared memory.
-            meta: Metadata carrying frame_id, timestamp, and alert_msg.
+            meta: Metadata carrying frame_id, timestamp, alert_msg and drone latitude/longitude.
         """
         logger.info(f"Processing alert: frame_id={meta.frame_id}, msg='{meta.alert_msg}'")
 
@@ -195,6 +207,8 @@ class NotificationsStreamWriter(mp.Process):
             'alert_msg': meta.alert_msg,
             'timestamp': meta.timestamp,
             'datetime': alert_datetime_str,
+            'latitude': meta.latitude,
+            'longitude': meta.longitude,
             'image': jpg_as_text,
             'width': width,
             'height': height,
@@ -207,6 +221,8 @@ class NotificationsStreamWriter(mp.Process):
                 alert_msg=meta.alert_msg,
                 timestamp=meta.timestamp,
                 datetime_str=alert_datetime_str,
+                latitude=meta.latitude,
+                longitude=meta.longitude,
             )
 
         # Send to WebSocket server sidecar for broadcast
@@ -222,6 +238,8 @@ class NotificationsStreamWriter(mp.Process):
                 image_data=compressed_bytes,
                 image_width=width,
                 image_height=height,
+                latitude=meta.latitude,
+                longitude=meta.longitude,
             )
             if not saved:
                 logger.warning(
@@ -406,11 +424,17 @@ if __name__ == "__main__":
 
             now = dtt.now()
 
+            # Simulated drone position: small drift around the default telemetry template point
+            lat = 44.414622942776454 + 0.0001 * frame_id
+            lon = 8.880484631296774 + 0.0001 * frame_id
+
             alert = {
                 "frame_id":    frame_id,
                 "alert_msg":   msg,
                 "timestamp":   now.timestamp(),
                 "datetime":    now.isoformat(),
+                "latitude":    lat,
+                "longitude":   lon,
                 "image":       jpg_b64,
                 "width":       640,
                 "height":      360,
@@ -429,6 +453,8 @@ if __name__ == "__main__":
                     image_data=raw_bytes,
                     image_width=640,
                     image_height=360,
+                    latitude=lat,
+                    longitude=lon,
                 )
 
             status = f"ws={'ok' if ws_ok else 'FAIL'}"

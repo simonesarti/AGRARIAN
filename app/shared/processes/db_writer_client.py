@@ -64,6 +64,8 @@ class DbWriterClient:
         image_data: Optional[bytes],
         image_width: int,
         image_height: int,
+        latitude: Optional[float] = None,
+        longitude: Optional[float] = None,
     ) -> bool:
         if self.flight_id is None:
             return False
@@ -76,6 +78,8 @@ class DbWriterClient:
                 "image_data": base64.b64encode(image_data).decode() if image_data else None,
                 "image_width": image_width,
                 "image_height": image_height,
+                "latitude": latitude,
+                "longitude": longitude,
             }
             resp = requests.post(
                 f"{self._base}/session/{self.flight_id}/alert",

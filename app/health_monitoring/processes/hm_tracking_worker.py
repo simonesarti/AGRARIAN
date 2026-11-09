@@ -9,7 +9,7 @@ from pydantic import BaseModel, NonNegativeInt, PositiveFloat
 
 from app.health_monitoring.tracking.yolo_tracker import YOLOTracker
 from app.health_monitoring.processes.messages import HMTrackingSlotMetadata
-from app.shared.processes.messages import FrameSlotMetadata
+from app.shared.processes.messages import CombinedSlotMetadata
 from app.shared.processes.frame_buffer import FrameBuffer
 from app.shared.processes.constants import (
     PIPELINE_QUEUE_TIMEOUT,
@@ -110,7 +110,7 @@ class HMTrackingWorker(mp.Process):
                     poison_pill_received = True
                     break
 
-                assert isinstance(meta, FrameSlotMetadata)
+                assert isinstance(meta, CombinedSlotMetadata)
 
                 # ---- zero-copy view of input slot ----
                 frame = self.input_frame_buffer.view(meta.slot_index)
@@ -147,6 +147,7 @@ class HMTrackingWorker(mp.Process):
                     timestamp=meta.timestamp,
                     original_wh=meta.original_wh,
                     slot_index=out_slot,
+                    telemetry=meta.telemetry,
                     tracks=tracks,
                     H=H,
                     is_keyframe=is_keyframe,

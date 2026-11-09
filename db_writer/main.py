@@ -62,6 +62,8 @@ class AlertRequest(BaseModel):
     image_data: Optional[str] = None  # base64-encoded JPEG bytes
     image_width: int
     image_height: int
+    latitude: Optional[float] = None    # drone position (WGS84 degrees) at alert time
+    longitude: Optional[float] = None
 
 # ------------------------------------------------------------------ #
 # API
@@ -125,6 +127,8 @@ def save_alert(flight_id: int, req: AlertRequest):
         image_data=image_bytes,
         image_width=req.image_width,
         image_height=req.image_height,
+        latitude=req.latitude,
+        longitude=req.longitude,
     )
     if not queued:
         raise HTTPException(status_code=503, detail="Alert queue full — DB may be unavailable")

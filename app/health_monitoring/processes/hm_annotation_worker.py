@@ -11,7 +11,7 @@ from pydantic import BaseModel, PositiveFloat
 
 from app.health_monitoring.processes.messages import HMAnomalySlotMetadata
 from app.health_monitoring.anomaly_detection.detector import FrameAnomalyResult
-from app.shared.processes.messages import AnnotationSlotMetadata
+from app.shared.processes.messages import AnnotationSlotMetadata, drone_position
 from app.shared.processes.frame_buffer import FrameBuffer
 from app.shared.processes.constants import (
     ALERTS_COOLDOWN_SECONDS,
@@ -222,6 +222,9 @@ class HMAnnotationWorker(mp.Process):
                 # ---- fan-out: write annotated frame to both consumers independently ----
                 append_start = time()
 
+                # Drone position for this frame (None if no telemetry was matched)
+                drone_lat, drone_lon = drone_position(meta.telemetry)
+
                 # -- Alert output: only forward confirmed alerts that pass the cooldown --
                 alert_confirmed = bool(alert_msg) and (
                     meta.timestamp - last_alert_timestamp >= self.config.alerts_cooldown_s
@@ -246,6 +249,8 @@ class HMAnnotationWorker(mp.Process):
                             timestamp=meta.timestamp,
                             slot_index=alert_slot,
                             alert_msg=alert_msg,
+                            latitude=drone_lat,
+                            longitude=drone_lon,
                         )
                         try:
                             self.alert_output_meta_queue.put(alert_meta, timeout=self.config.queue_timeout)
@@ -271,6 +276,8 @@ class HMAnnotationWorker(mp.Process):
                         timestamp=meta.timestamp,
                         slot_index=video_slot,
                         alert_msg=alert_msg,
+                        latitude=drone_lat,
+                        longitude=drone_lon,
                     )
                     try:
                         self.video_output_meta_queue.put(video_meta, timeout=self.config.queue_timeout)

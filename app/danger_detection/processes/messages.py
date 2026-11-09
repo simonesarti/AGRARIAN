@@ -97,6 +97,7 @@ class DangerSlotMetadata:
     timestamp: float
     original_wh: tuple[int, int]
     slot_index: int
+    telemetry: dict | None
     classes_names: dict
     num_classes: int
     classes: np.ndarray

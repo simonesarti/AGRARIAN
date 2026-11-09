@@ -251,6 +251,7 @@ class HMVideoInterpolatorProcess(mp.Process):
                         timestamp=pf.meta.timestamp,
                         original_wh=pf.meta.original_wh,
                         slot_index=-1,           # filled in by _emit
+                        telemetry=pf.meta.telemetry,
                         tracks=interp_tracks,
                         anomaly_result=interp_result,
                         is_keyframe=True,
@@ -278,6 +279,7 @@ class HMVideoInterpolatorProcess(mp.Process):
             timestamp=meta.timestamp,
             original_wh=meta.original_wh,
             slot_index=out_slot,
+            telemetry=meta.telemetry,
             tracks=meta.tracks,
             anomaly_result=meta.anomaly_result,
             is_keyframe=True,

@@ -16,7 +16,7 @@ from app.danger_detection.output.frames import (
     get_danger_intersect_colored_frames,
 )
 from app.danger_detection.processes.messages import DangerSlotMetadata
-from app.shared.processes.messages import AnnotationSlotMetadata
+from app.shared.processes.messages import AnnotationSlotMetadata, drone_position
 from app.shared.processes.frame_buffer import FrameBuffer, MultiFrameBuffer
 from app.shared.processes.constants import (
     ALERTS_COOLDOWN_SECONDS,
@@ -167,7 +167,9 @@ class AnnotationWorker(mp.Process):
                 self.input_frame_buffer.release(meta.slot_index)
 
                 # ---- fan-out: write annotated frame to both consumers independently----
-                
+
+                # Drone position for this frame (None if no telemetry was matched)
+                drone_lat, drone_lon = drone_position(meta.telemetry)
 
                 # -- Alert output: only forward confirmed alerts that pass the cooldown --
                 alert_confirmed = bool(meta.alert_msg) and (
@@ -193,6 +195,8 @@ class AnnotationWorker(mp.Process):
                             timestamp=meta.timestamp,
                             slot_index=alert_slot,
                             alert_msg=meta.alert_msg,
+                            latitude=drone_lat,
+                            longitude=drone_lon,
                         )
                         try:
                             self.alert_output_meta_queue.put(alert_meta, timeout=self.config.queue_timeout)
@@ -218,6 +222,8 @@ class AnnotationWorker(mp.Process):
                         timestamp=meta.timestamp,
                         slot_index=video_slot,
                         alert_msg=meta.alert_msg,
+                        latitude=drone_lat,
+                        longitude=drone_lon,
                     )
                     try:
                         self.video_output_meta_queue.put(video_meta, timeout=self.config.queue_timeout)

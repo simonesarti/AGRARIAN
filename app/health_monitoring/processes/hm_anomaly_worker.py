@@ -194,6 +194,7 @@ class HMAnomalyDetectionWorker(mp.Process):
                     timestamp=meta.timestamp,
                     original_wh=meta.original_wh,
                     slot_index=out_slot,
+                    telemetry=meta.telemetry,
                     tracks=tracks,
                     anomaly_result=anomaly_result,
                     is_keyframe=meta.is_keyframe,

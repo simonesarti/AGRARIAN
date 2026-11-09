@@ -54,8 +54,27 @@ class AnnotationSlotMetadata:
     alert_msg is an empty string when no danger was detected, or a human-readable
     description of the active danger types (e.g. "Roads & Steep slope") when danger exists.
     The alert writer uses this field to decide whether and what to notify.
+
+    latitude / longitude are the drone position (WGS84 degrees) from the telemetry matched
+    to this frame, or None when no telemetry was available for it.
     """
     frame_id: int
     timestamp: float
     slot_index: int
     alert_msg: str
+    latitude: float | None = None
+    longitude: float | None = None
+
+
+def drone_position(telemetry: dict | None) -> tuple[float | None, float | None]:
+    """
+    Extract the drone (latitude, longitude) from a telemetry dict.
+    Returns (None, None) when telemetry is missing or lacks either coordinate.
+    """
+    if not telemetry:
+        return None, None
+    lat = telemetry.get("latitude")
+    lon = telemetry.get("longitude")
+    if lat is None or lon is None:
+        return None, None
+    return float(lat), float(lon)

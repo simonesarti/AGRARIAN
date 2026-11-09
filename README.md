@@ -65,6 +65,10 @@ Segmentation and geo inference use TensorRT. Both the YOLO detection process and
           │
          FB
           │
+       Combiner  ◄── MQTT telemetry
+          │
+         FB
+          │
        Tracking
           │
          FB

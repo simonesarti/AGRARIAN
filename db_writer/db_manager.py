@@ -51,6 +51,8 @@ datetime
 image_data  # Compressed JPEG
 image_width
 image_height
+latitude    # Drone latitude (WGS84 degrees) at alert time, NULL if no telemetry
+longitude   # Drone longitude (WGS84 degrees) at alert time, NULL if no telemetry
 """
 
 Base = declarative_base()
@@ -109,6 +111,8 @@ class Alert(Base):
     image_data = Column(LargeBinary)
     image_width = Column(Integer)
     image_height = Column(Integer)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
 
     flight = relationship("Flight", back_populates="alerts")
 

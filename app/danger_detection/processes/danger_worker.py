@@ -180,6 +180,7 @@ class DangerWorker(mp.Process):
                     timestamp=meta.timestamp,
                     original_wh=meta.original_wh,
                     slot_index=out_slot,
+                    telemetry=meta.telemetry,
                     classes_names=meta.classes_names,
                     num_classes=meta.num_classes,
                     classes=meta.classes,
