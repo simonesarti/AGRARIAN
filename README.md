@@ -163,14 +163,14 @@ Read by `docker run --env-file app/.env`. Edit on the app machine before startin
 | `VIDEO_STREAM_READER_HOST` | `localhost` | Comms host IP or hostname (MediaMTX RTSP) |
 | `TELEMETRY_LISTENER_HOST` | `localhost` | Comms host IP or hostname (Mosquitto MQTT) |
 | `VIDEO_OUT_STREAM_HOST` | `localhost` | Comms host IP or hostname (MediaMTX RTMP) |
-| `VIDEO_OUT_WEBRTC_HOST` | *(reuses `VIDEO_OUT_STREAM_HOST`)* | Host viewers use to play the stream (MediaMTX WebRTC) |
-| `VIDEO_OUT_WEBRTC_PORT` | `8889` | MediaMTX WebRTC port |
+| `VIDEO_OUT_HLS_HOST` | *(reuses `VIDEO_OUT_STREAM_HOST`)* | Host viewers use to play the stream (MediaMTX HLS) |
+| `VIDEO_OUT_HLS_PORT` | `8888` | MediaMTX HLS port |
 | `WS_SERVER_URL` | `http://localhost:8001` | ws-server HTTP API endpoint |
 | `DB_WRITER_URL` | `http://localhost:8002` | db-writer HTTP API endpoint |
 
 All three `HOST` variables and the two URLs must point to the comms machine. For local testing (both stacks on the same machine) the `localhost` defaults work as-is.
 
-The playback URL — `http://VIDEO_OUT_WEBRTC_HOST:VIDEO_OUT_WEBRTC_PORT/VIDEO_OUT_STREAM_STREAM_KEY/whep` — is what gets written to the flights table for the UI to open. Set `VIDEO_OUT_WEBRTC_HOST` only when viewers reach MediaMTX at a different address than the app does when publishing.
+The playback URL — `http://VIDEO_OUT_HLS_HOST:VIDEO_OUT_HLS_PORT/VIDEO_OUT_STREAM_STREAM_KEY/index.m3u8` — is what gets written to the flights table for the UI to open. Set `VIDEO_OUT_HLS_HOST` only when viewers reach MediaMTX at a different address than the app does when publishing.
 
 Additional groups in `app/.env`:
 
@@ -258,6 +258,7 @@ The app detects engine files at startup and switches to engine mode automaticall
 | 8080 | HTTP | inbound | Traefik dashboard (development only) |
 | 8554 | RTSP | inbound | MediaMTX: drone video publish + app raw stream pull |
 | 1935 | RTMP | inbound | MediaMTX: app annotated stream push |
+| 8888 | HTTP | inbound | MediaMTX: viewer HLS playback (URL stored in the flights table) |
 | 8889 | WebRTC | inbound | MediaMTX: viewer WebRTC playback |
 | 1883 | MQTT | inbound | Mosquitto: drone telemetry + app subscription |
 | `WS_PORT` | WS | inbound | WebSocket alert stream (direct, without Traefik) |

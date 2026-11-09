@@ -61,7 +61,7 @@ class NotificationsStreamWriterConfig(BaseModel):
     database_username: str = ""
     database_password: str = ""
     # Video stream playback URL written to the flights table so the UI can fetch it
-    # from the DB. This is the media server's WHEP/WebRTC endpoint for the stream the
+    # from the DB. This is the media server's HLS playlist endpoint for the stream the
     # VideoProducerProcess publishes to media_server_url — the retrieval address, not
     # the publish one.
     video_stream_url: Optional[str] = None

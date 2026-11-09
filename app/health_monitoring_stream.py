@@ -197,7 +197,7 @@ def main():
         db_writer_url=s.db_writer_url,
         database_username=s.db_username,
         database_password=s.db_password.get_secret_value(),
-        video_stream_url=s.video_out_webrtc_url,
+        video_stream_url=s.video_out_hls_url,
     )
 
     video_producer_config = VideoProducerProcessConfig(

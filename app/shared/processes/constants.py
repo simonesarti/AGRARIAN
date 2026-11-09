@@ -89,6 +89,7 @@ RTMPS_PORT = 8443
 RTSP_PORT = 8554
 RTSPS_PORT = 441
 WEBRTC_PORT = 8889
+HLS_PORT = 8888
 WS_PORT = 80
 WSS_PORT = 8443
 WS_COMMON_PORT = 8765
@@ -248,10 +249,10 @@ VIDEO_OUT_STREAM_STREAM_KEY = "annot"
 # Playback (retrieval) endpoint of the same stream, served by the media server.
 # VIDEO_OUT_STREAM_* above is where the app publishes (RTMP); this is what clients
 # open to watch it, and it is what gets written to the flights table.
-# Full URL: SCHEME://HOST:PORT/STREAM_KEY/whep
-VIDEO_OUT_WEBRTC_SCHEME = "http"
-VIDEO_OUT_WEBRTC_PORT = WEBRTC_PORT
-VIDEO_OUT_WEBRTC_PATH_SUFFIX = "whep"
+# Full URL: SCHEME://HOST:PORT/STREAM_KEY/index.m3u8
+VIDEO_OUT_HLS_SCHEME = "http"
+VIDEO_OUT_HLS_PORT = HLS_PORT
+VIDEO_OUT_HLS_PATH_SUFFIX = "index.m3u8"
 
 # Depth of the in-process hand-off queue between VideoProducerProcess and the FFmpeg
 # writer thread. This is plain heap memory (queue.Queue of numpy frames), NOT shared
